@@ -59,6 +59,9 @@
 
 #define DRV260X_GO_BIT				0x01
 
+/* Status register */
+#define DRV260X_STATUS_DIAG_RESULT	(1 << 3)
+
 /* Library Selection */
 #define DRV260X_LIB_SEL_MASK		0x07
 #define DRV260X_LIB_SEL_RAM			0x0
@@ -422,6 +425,17 @@ static int drv260x_init(struct drv260x_data *haptics)
 			return -ETIMEDOUT;
 		}
 	} while (cal_buf == DRV260X_GO_BIT);
+
+	error = regmap_read(haptics->regmap, DRV260X_STATUS, &cal_buf);
+	if (error) {
+		dev_err(&haptics->client->dev,
+			"Failed to read status register: %d\n", error);
+		return error;
+	}
+
+	if (cal_buf & DRV260X_STATUS_DIAG_RESULT)
+		dev_warn(&haptics->client->dev,
+			 "Auto-calibration failed, check actuator mode and voltages\n");
 
 	return 0;
 }
