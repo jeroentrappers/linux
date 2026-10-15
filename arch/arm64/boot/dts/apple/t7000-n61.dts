@@ -7,8 +7,24 @@
 /dts-v1/;
 
 #include "t7000-6.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/ti-drv260x.h>
 
 / {
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
+};
+
+&i2c1 {
+	status = "okay";
+
+	haptics@5a {
+		compatible = "ti,drv2604";
+		reg = <0x5a>;
+		enable-gpios = <&pinctrl 76 GPIO_ACTIVE_HIGH>;
+		mode = <DRV260X_LRA_MODE>;
+		library-sel = <DRV260X_LIB_LRA>;
+		vib-rated-mv = <2140>;
+		vib-overdrive-mv = <3320>;
+	};
 };
