@@ -40,6 +40,14 @@ struct cs35l33_pdata {
 
 	/* H/G algo configuration */
 	struct cs35l33_hg hg_config;
+
+	/* CS35L19 only: boost slew step, boost loop coefficients, trim */
+	bool set_bst_slew;
+	unsigned int bst_slew;
+	bool set_bst_coeff;
+	u8 bst_coeff[4];
+	bool set_trim;
+	u8 trim[3];
 };
 
 #endif /* __CS35L33_H */

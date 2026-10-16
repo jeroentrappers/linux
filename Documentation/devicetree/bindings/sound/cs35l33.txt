@@ -1,8 +1,8 @@
-CS35L33 Speaker Amplifier
+CS35L33 / CS35L19 Speaker Amplifier
 
 Required properties:
 
-  - compatible : "cirrus,cs35l33"
+  - compatible : "cirrus,cs35l33" or "cirrus,cs35l19"
 
   - reg : the I2C address of the device for I2C
 
@@ -38,6 +38,16 @@ Optional properties:
   - cirrus,imon-adc-scale : Configures the scaling of data bits from the IMON
     ADC data word. This property can be set as a value of 0 for bits 15 down
     to 0, 6 for 21 down to 6, 7, for 22 down to 7, 8 for 23 down to 8.
+
+Optional properties, "cirrus,cs35l19" only:
+
+  - cirrus,boost-slew-step : Boost converter VBST slew step, 0 to 3.
+
+  - cirrus,boost-coeffs : Four bytes for the boost loop coefficient
+    registers 0x3A to 0x3D.
+
+  - cirrus,trim : Three bytes of board specific trim, written to the
+    registers 0x46, 0x54 and 0x66.
 
 
 Optional H/G Algorithm sub-node:

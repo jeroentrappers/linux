@@ -11,6 +11,7 @@
 #define __CS35L33_H__
 
 #define CS35L33_CHIP_ID		0x00035A33
+#define CS35L19_CHIP_ID		0x00035A19
 #define CS35L33_DEVID_AB	0x01	/* Device ID A & B [RO] */
 #define CS35L33_DEVID_CD	0x02	/* Device ID C & D [RO] */
 #define CS35L33_DEVID_E		0x03	/* Device ID E [RO] */
@@ -56,6 +57,12 @@
 #define CS35L33_BST_CTL4	0x39	/* Boost Converter Control 4 */
 #define CS35L33_HG_STATUS	0x3F	/* H/G Status */
 #define CS35L33_MAX_REGISTER	0x59
+
+/* CS35L19 only */
+#define CS35L19_BST_COEFF1	0x3A	/* Boost Loop Coefficients 1-4 */
+#define CS35L19_BST_COEFF4	0x3D
+#define CS35L19_MAX_REGISTER	0x6B
+#define CS35L19_TRIM_REV	0xB0	/* first revision needing the trim */
 
 #define CS35L33_MCLK_5644	5644800
 #define CS35L33_MCLK_6144	6144000
