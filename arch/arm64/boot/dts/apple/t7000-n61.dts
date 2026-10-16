@@ -27,4 +27,33 @@
 		vib-rated-mv = <2140>;
 		vib-overdrive-mv = <3320>;
 	};
+
+	/*
+	 * Values from the "speaker-config" property of the iOS device tree.
+	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
+	 * come from the PMU and are not described yet.
+	 */
+	speaker-amp@40 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x40>;
+		reset-gpios = <&pinctrl 49 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Speaker";
+
+		cirrus,boost-ctl = <43>;		/* 7.5 V */
+		cirrus,boost-ipk = <2756250>;
+		cirrus,boost-slew-step = <2>;
+		cirrus,boost-coeffs = /bits/ 8 <0x8a 0x10 0x73 0x03>;
+		cirrus,trim = /bits/ 8 <0x05 0x04 0xd0>;
+
+		cirrus,hg-algo {
+			cirrus,mem-depth = <3>;
+			cirrus,release-rate = <128>;
+			cirrus,hd-rm = <20>;
+			cirrus,ldo-thld = <5>;
+			cirrus,ldo-entry-delay = <4>;
+			cirrus,vp-hg = <9>;
+			cirrus,vp-hg-va = <1>;
+		};
+	};
 };
