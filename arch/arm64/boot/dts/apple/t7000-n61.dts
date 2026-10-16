@@ -33,6 +33,13 @@
 	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
 	 * come from the PMU and are not described yet.
 	 */
+	charger@75 {
+		compatible = "ti,sn2400";
+		reg = <0x75>;
+		input-current-limit-microamp = <500000>;
+		constant-charge-current-max-microamp = <1000000>;
+	};
+
 	speaker-amp@40 {
 		compatible = "cirrus,cs35l19";
 		reg = <0x40>;
