@@ -936,6 +936,8 @@ static int cs35l33_get_hg_data(const struct device_node *np,
 		if (of_property_read_u32(hg, "cirrus,release-rate",
 				&val32) >= 0)
 			hg_config->release_rate = val32;
+		if (of_property_read_u32(hg, "cirrus,hd-rm", &val32) >= 0)
+			hg_config->hd_rm = val32;
 		if (of_property_read_u32(hg, "cirrus,ldo-thld", &val32) >= 0)
 			hg_config->ldo_thld = val32;
 		if (of_property_read_u32(hg, "cirrus,ldo-path-disable",

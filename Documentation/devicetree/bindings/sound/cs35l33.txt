@@ -58,6 +58,9 @@ Optional properties for the "cirrus,hg-algo" sub-node:
     allowing release condition tracking updates. The number of LRCLK periods
     start at 3 to a maximum of 255.
 
+  - cirrus,hd-rm : Class H/G headroom, 0 to 0x7F. Defaults to 0 when the
+    sub-node is present.
+
   - cirrus,ldo-thld : Configures the signal threshold at which the PWM output
     stage enters LDO operation. Starts as a default value of 50mV for a value
     of 1 and increases with a step size of 50mV to a maximum of 750mV (value of
