@@ -795,6 +795,14 @@ config CHARGER_BQ24257
 	  Say Y to enable support for the TI BQ24250, BQ24251, and BQ24257 battery
 	  chargers.
 
+config CHARGER_SN2400
+	tristate "TI SN2400 charger driver"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y to enable support for the TI SN2400 USB charger found in the
+	  Apple iPhone 6.
+
 config CHARGER_BQ24735
 	tristate "TI BQ24735 battery charger support"
 	depends on I2C
