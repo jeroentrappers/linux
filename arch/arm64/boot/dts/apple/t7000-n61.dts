@@ -13,6 +13,28 @@
 / {
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "iPhone 6";
+		simple-audio-card,format = "dsp_a";
+		simple-audio-card,bitclock-master = <&speaker_cpu>;
+		simple-audio-card,frame-master = <&speaker_cpu>;
+
+		speaker_cpu: simple-audio-card,cpu {
+			sound-dai = <&mca2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&speaker_amp>;
+			/* MCLK pad = 24 MHz nclk / 2 */
+			system-clock-frequency = <12000000>;
+		};
+	};
+};
+
+&mca2 {
+	status = "okay";
 };
 
 &i2c1 {
@@ -28,11 +50,6 @@
 		vib-overdrive-mv = <3320>;
 	};
 
-	/*
-	 * Values from the "speaker-config" property of the iOS device tree.
-	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
-	 * come from the PMU and are not described yet.
-	 */
 	charger@75 {
 		compatible = "ti,sn2400";
 		reg = <0x75>;
@@ -40,7 +57,12 @@
 		constant-charge-current-max-microamp = <1000000>;
 	};
 
-	speaker-amp@40 {
+	/*
+	 * Values from the "speaker-config" property of the iOS device tree.
+	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
+	 * come from the PMU and are not described yet.
+	 */
+	speaker_amp: speaker-amp@40 {
 		compatible = "cirrus,cs35l19";
 		reg = <0x40>;
 		reset-gpios = <&pinctrl 49 GPIO_ACTIVE_HIGH>;
