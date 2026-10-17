@@ -26,6 +26,17 @@
 		clock-output-names = "clkref";
 	};
 
+	/*
+	 * SPI reference: arm-io "clock-frequencies"[id - 256] for the SPI
+	 * clock-ids 301-303 is 60 MHz in the iOS device tree.
+	 */
+	clk_spi: clock-spi {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "clk_spi";
+	};
+
 	/* 2.4 GHz / 7, per the iOS device tree and AppleS5L8960XNCO */
 	nco_clkref: clock-ref-nco {
 		compatible = "fixed-clock";
@@ -125,6 +136,45 @@
 			compatible = "apple,t7000-cluster-cpufreq", "apple,s5l8960x-cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;
 			#performance-domain-cells = <0>;
+		};
+
+		spi1: spi@20a084000 {
+			compatible = "apple,t7000-spi";
+			reg = <0x2 0x0a084000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 153 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_spi>;
+			/* TODO: pinctrl; the pins are muxed by iBoot for now */
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi2: spi@20a088000 {
+			compatible = "apple,t7000-spi";
+			reg = <0x2 0x0a088000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 154 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_spi>;
+			/* TODO: pinctrl; the pins are muxed by iBoot for now */
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,t7000-spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_spi>;
+			/* TODO: pinctrl; the pins are muxed by iBoot for now */
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
 		};
 
 		ans: block@208040000 {
