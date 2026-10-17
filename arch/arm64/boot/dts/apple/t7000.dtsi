@@ -26,6 +26,14 @@
 		clock-output-names = "clkref";
 	};
 
+	/* 2.4 GHz / 7, per the iOS device tree and AppleS5L8960XNCO */
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <342857142>;
+		clock-output-names = "nco_ref";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -168,6 +176,20 @@
 			status = "disabled";
 		};
 
+		mca2: i2s@20a0a8000 {
+			compatible = "apple,t7000-mca";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a000000 0x0 0x4000>,
+			      <0x2 0x0a100000 0x0 0x1000>;
+			reg-names = "mca", "wrapper", "shim1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&nco 2>;
+			power-domains = <&ps_mca2>;
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@20a110000 {
 			compatible = "apple,t7000-i2c", "apple,i2c";
 			reg = <0x2 0x0a110000 0x0 0x1000>;
@@ -284,6 +306,13 @@
 				power-domains = <&ps_usb2host2>;
 			};
 #endif
+		};
+
+		nco: clock-controller@20e011000 {
+			compatible = "apple,t7000-nco";
+			reg = <0x2 0x0e011000 0x0 0x4014>;
+			clocks = <&nco_clkref>;
+			#clock-cells = <1>;
 		};
 
 		pmgr: power-management@20e000000 {
