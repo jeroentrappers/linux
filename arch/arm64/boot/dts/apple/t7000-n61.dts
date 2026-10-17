@@ -14,6 +14,23 @@
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
 
+	/* PMU rails, not described yet (no driver for the PMU's regulators) */
+	vreg_1v8: regulator-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "PP1V8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	vreg_vbat: regulator-vbat {
+		compatible = "regulator-fixed";
+		regulator-name = "VBAT";
+		regulator-min-microvolt = <3800000>;
+		regulator-max-microvolt = <3800000>;
+		regulator-always-on;
+	};
+
 	sound {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "iPhone 6";
@@ -59,13 +76,14 @@
 
 	/*
 	 * Values from the "speaker-config" property of the iOS device tree.
-	 * The IRQ (GPIO 47) is left out until its polarity is known; VA/VP
-	 * come from the PMU and are not described yet.
+	 * The IRQ (GPIO 47) is left out until its polarity is known.
 	 */
 	speaker_amp: speaker-amp@40 {
 		compatible = "cirrus,cs35l19";
 		reg = <0x40>;
 		reset-gpios = <&pinctrl 49 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&vreg_1v8>;
+		VP-supply = <&vreg_vbat>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Speaker";
 
