@@ -9,4 +9,12 @@ config SND_SOC_APPLE_MCA
 	  This option enables an ASoC platform driver for MCA peripherals found
 	  on Apple Silicon SoCs.
 
+config SND_SOC_APPLE_MCA_T7000
+	tristate "Apple A8 (t7000) MCA driver"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on COMMON_CLK
+	help
+	  This option enables an ASoC driver for the version 1 MCA found on
+	  the Apple A8 SoC (iPhone 6). Playback is fed by the CPU (no DMA).
+
 endmenu

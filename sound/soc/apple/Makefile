@@ -2,3 +2,6 @@
 snd-soc-apple-mca-y	:= mca.o
 
 obj-$(CONFIG_SND_SOC_APPLE_MCA)	+= snd-soc-apple-mca.o
+snd-soc-apple-mca-t7000-y	:= mca-t7000.o
+
+obj-$(CONFIG_SND_SOC_APPLE_MCA_T7000)	+= snd-soc-apple-mca-t7000.o
