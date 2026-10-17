@@ -15,9 +15,10 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/spinlock.h>
 
-#define NCO_CHANNEL_STRIDE	0x4000
+#define NCO_CHANNEL_STRIDE	0x4000	/* default; t7000 uses 0x1000 */
 #define NCO_CHANNEL_REGSIZE	20
 
 #define REG_CTRL	0
@@ -263,8 +264,12 @@ static int applnco_probe(struct platform_device *pdev)
 	void __iomem *base;
 	struct resource *res;
 	struct applnco_tables *tbl;
-	unsigned int nchannels;
+	unsigned int nchannels, stride;
 	int ret, i;
+
+	stride = (uintptr_t)device_get_match_data(&pdev->dev);
+	if (!stride)
+		stride = NCO_CHANNEL_STRIDE;
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
@@ -273,7 +278,7 @@ static int applnco_probe(struct platform_device *pdev)
 	if (resource_size(res) < NCO_CHANNEL_REGSIZE)
 		return -EINVAL;
 	nchannels = (resource_size(res) - NCO_CHANNEL_REGSIZE)
-			/ NCO_CHANNEL_STRIDE + 1;
+			/ stride + 1;
 
 	onecell_data = devm_kzalloc(&pdev->dev, struct_size(onecell_data, hws,
 							nchannels), GFP_KERNEL);
@@ -292,7 +297,7 @@ static int applnco_probe(struct platform_device *pdev)
 		chan = devm_kzalloc(&pdev->dev, sizeof(*chan), GFP_KERNEL);
 		if (!chan)
 			return -ENOMEM;
-		chan->base = base + NCO_CHANNEL_STRIDE * i;
+		chan->base = base + stride * i;
 		chan->tbl = tbl;
 		spin_lock_init(&chan->lock);
 
@@ -320,6 +325,7 @@ static int applnco_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id applnco_ids[] = {
+	{ .compatible = "apple,t7000-nco", .data = (void *)0x1000 },
 	{ .compatible = "apple,t8103-nco" },
 	{ .compatible = "apple,nco" },
 	{ }
