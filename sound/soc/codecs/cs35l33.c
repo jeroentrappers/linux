@@ -1258,6 +1258,16 @@ static int cs35l33_of_get_pdata(struct device *dev,
  * firmware; the registers are undocumented. Registers 0x46, 0x54 and 0x66
  * are board specific and only written when "cirrus,trim" is present.
  */
+static const struct reg_sequence cs35l19_unused_slots[] = {
+	{ CS35L33_TX_VMON, 0x80 },
+	{ CS35L33_TX_IMON, 0x80 },
+	{ CS35L33_TX_VPMON, 0x80 },
+	{ CS35L33_TX_VBSTMON, 0x80 },
+	{ CS35L33_TX_FLAG, 0x80 },
+	{ CS35L33_RX_SPLY, 0x80 },
+	{ CS35L33_RX_ALIVE, 0x80 },
+};
+
 static int cs35l19_apply_patch(struct cs35l33_private *cs35l33,
 			       unsigned int rev)
 {
@@ -1412,6 +1422,16 @@ static int cs35l33_i2c_probe(struct i2c_client *i2c_client)
 	if (cs35l33->variant->clk_sdout_3st)
 		reg |= CS35L33_SDOUT_3ST_TDM;
 	regmap_update_bits(cs35l33->regmap, CS35L33_CLK_CTL, reg, reg);
+
+	/*
+	 * The CS35L19 comes out of reset with the monitor TX streams and the
+	 * VP/alive RX streams assigned to slots, and flags ALIVE_ERR when no
+	 * alive data arrives. Unassign them (0x80) like iOS; set_tdm_slot()
+	 * can still route the monitors.
+	 */
+	if (cs35l33->variant->devid == CS35L19_CHIP_ID)
+		regmap_multi_reg_write(cs35l33->regmap, cs35l19_unused_slots,
+				       ARRAY_SIZE(cs35l19_unused_slots));
 
 	pm_runtime_set_autosuspend_delay(&i2c_client->dev, 100);
 	pm_runtime_use_autosuspend(&i2c_client->dev);
