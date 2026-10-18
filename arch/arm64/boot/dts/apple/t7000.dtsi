@@ -466,6 +466,70 @@
 					 <APPLE_PINMUX(86, 1)>;
 			};
 		};
+
+		pcie: pcie@610000000 {
+			compatible = "apple,t7000-pcie";
+			device_type = "pci";
+
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x2000>,
+			      <0x6 0x01004000 0x0 0x1000>,
+			      <0x6 0x02004000 0x0 0x1000>,
+			      <0x6 0x01005000 0x0 0x1000>;
+			reg-names = "config", "rc", "port0", "port1", "phy0";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 212 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 215 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&pcie>;
+			/* The doorbell is hardwired at 0xbffff000 */
+			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
+
+			/* Only port 1 has a DART; port 0 is the unused NVMe port */
+			iommu-map = <0x100 &dart_apcie1 0 1>;
+			iommu-map-mask = <0xff00>;
+
+			bus-range = <0 8>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x1 0xa0000000>,
+				 <0x02000000 0x0 0xc0000000 0x7 0xc0000000 0x0 0x40000000>;
+
+			/* Chained to PCIE_AUX and PCIE in t7000-pmgr.dtsi */
+			power-domains = <&ps_pcie_ref>;
+			status = "disabled";
+
+			port01: pci@1,0 {
+				device_type = "pci";
+				reg = <0x800 0x0 0x0 0x0 0x0>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port01 0 0 0 0>,
+						<0 0 0 2 &port01 0 0 0 1>,
+						<0 0 0 3 &port01 0 0 0 2>,
+						<0 0 0 4 &port01 0 0 0 3>;
+				status = "disabled";
+			};
+		};
+
+		dart_apcie1: iommu@602002000 {
+			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x02002000 0x0 0x2000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie_ref>;
+			status = "disabled";
+		};
 	};
 
 	timer {

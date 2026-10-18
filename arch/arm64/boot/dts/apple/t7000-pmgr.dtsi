@@ -427,6 +427,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pcie_ref";
+		/* iOS order: PCIE, then PCIE_AUX, then PCIE_REF */
+		power-domains = <&ps_pcie_aux>;
 	};
 
 	ps_hsic0_phy: power-controller@20200 {
@@ -593,6 +595,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pcie_aux";
+		power-domains = <&ps_pcie>;
 	};
 
 	ps_gfx: power-controller@20320 {
