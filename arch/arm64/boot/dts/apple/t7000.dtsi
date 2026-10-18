@@ -487,8 +487,13 @@
 			/* The doorbell is hardwired at 0xbffff000 */
 			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
 
-			/* Only port 1 has a DART; port 0 is the unused NVMe port */
-			iommu-map = <0x100 &dart_apcie1 0 1>;
+			/*
+			 * Only port 1 has a DART; port 0 is the unused NVMe port.
+			 * The DART only sees DMA to 0x80000000..0xbfffefff, offset
+			 * from 0x80000000 (iOS uses the same window); the doorbell
+			 * page above it is not translated.
+			 */
+			iommu-map = <0x100 &dart_apcie1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
 			iommu-map-mask = <0xff00>;
 
 			bus-range = <0 8>;
@@ -524,7 +529,7 @@
 		dart_apcie1: iommu@602002000 {
 			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
 			reg = <0x6 0x02002000 0x0 0x2000>;
-			#iommu-cells = <1>;
+			#iommu-cells = <5>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_pcie_ref>;
