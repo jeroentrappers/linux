@@ -1348,6 +1348,19 @@ config GPIO_ALTERA_A10SR
 	  includes reads of pushbuttons and DIP switches as well
 	  as writes to LEDs.
 
+config GPIO_APPLE_PMIC
+	tristate "Apple PMIC GPIO support"
+	depends on I2C
+	depends on ARCH_APPLE || COMPILE_TEST
+	select MFD_SIMPLE_MFD_I2C
+	help
+	  This driver supports the general purpose pins of the Dialog based
+	  PMICs of Apple A8 devices. On the iPhone 6 they switch the power of
+	  the Wi-Fi/Bluetooth chip.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called gpio-apple-pmic.
+
 config GPIO_ARIZONA
 	tristate "Wolfson Microelectronics Arizona class devices"
 	depends on MFD_ARIZONA
