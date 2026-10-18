@@ -29,6 +29,10 @@
 					 NXP_NCI_FW_FRAME_LEN_MASK + \
 					 NXP_NCI_FW_CRC_LEN)
 
+static bool debug;
+module_param(debug, bool, 0644);
+MODULE_PARM_DESC(debug, "Log every frame sent and received");
+
 struct nxp_nci_uart_phy {
 	struct serdev_device *serdev;
 	struct nci_dev *ndev;
@@ -65,6 +69,9 @@ static int nxp_nci_uart_write(void *phy_id, struct sk_buff *skb)
 	struct nxp_nci_uart_phy *phy = phy_id;
 	int r;
 
+	if (debug)
+		print_hex_dump(KERN_INFO, "nfc tx: ", DUMP_PREFIX_NONE, 32, 1,
+			       skb->data, skb->len, false);
 	r = serdev_device_write(phy->serdev, skb->data, skb->len,
 				MAX_SCHEDULE_TIMEOUT);
 	if (r < 0)
@@ -135,6 +142,10 @@ static size_t nxp_nci_uart_receive_buf(struct serdev_device *serdev,
 		if (nxp_nci_uart_missing(phy->recv_skb, info->mode))
 			continue;
 
+		if (debug)
+			print_hex_dump(KERN_INFO, "nfc rx: ", DUMP_PREFIX_NONE,
+				       32, 1, phy->recv_skb->data,
+				       phy->recv_skb->len, false);
 		if (info->mode == NXP_NCI_MODE_FW)
 			nxp_nci_fw_recv_frame(phy->ndev, phy->recv_skb);
 		else
