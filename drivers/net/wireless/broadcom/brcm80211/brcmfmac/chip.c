@@ -711,6 +711,10 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 {
 	switch (ci->pub.chip) {
 	case BRCM_CC_4345_CHIP_ID:
+		/* Before C0 (e.g. the PCIe B1 in the iPhone 6) */
+		if (ci->pub.chiprev < 6)
+			return 0x1b0000;
+		return 0x198000;
 	case BRCM_CC_43454_CHIP_ID:
 		return 0x198000;
 	case BRCM_CC_4335_CHIP_ID:
