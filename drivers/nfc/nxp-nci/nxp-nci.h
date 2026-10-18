@@ -58,6 +58,12 @@ struct nxp_nci_info {
 
 	const struct nxp_nci_phy_ops *phy_ops;
 	unsigned int max_payload;
+	/*
+	 * Keep the controller out of standby. Needed when a standby
+	 * controller can't be woken by the transport (UART with flow
+	 * control: it deasserts RTS while asleep).
+	 */
+	bool disable_standby;
 
 	struct mutex info_lock;
 

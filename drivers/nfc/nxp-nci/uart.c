@@ -72,8 +72,8 @@ static int nxp_nci_uart_write(void *phy_id, struct sk_buff *skb)
 	if (debug)
 		print_hex_dump(KERN_INFO, "nfc tx: ", DUMP_PREFIX_NONE, 32, 1,
 			       skb->data, skb->len, false);
-	r = serdev_device_write(phy->serdev, skb->data, skb->len,
-				MAX_SCHEDULE_TIMEOUT);
+	/* Bounded: a controller that holds RTS deasserted must not hang us */
+	r = serdev_device_write(phy->serdev, skb->data, skb->len, HZ);
 	if (r < 0)
 		return r;
 
@@ -203,6 +203,7 @@ static int nxp_nci_uart_probe(struct serdev_device *serdev)
 	if (r < 0)
 		goto err_close;
 
+	((struct nxp_nci_info *)nci_get_drvdata(phy->ndev))->disable_standby = true;
 	return 0;
 
 err_close:

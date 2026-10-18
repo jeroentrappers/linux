@@ -123,11 +123,42 @@ static const struct nci_driver_ops nxp_nci_core_ops[] = {
 	},
 };
 
+#define NXP_NCI_PROP_SET_POWER_MODE	0x00
+#define NXP_NCI_POWER_MODE_NO_STANDBY	0x00
+
+static int nxp_nci_post_setup(struct nci_dev *ndev)
+{
+	struct nxp_nci_info *info = nci_get_drvdata(ndev);
+	static const u8 mode = NXP_NCI_POWER_MODE_NO_STANDBY;
+
+	if (!info->disable_standby)
+		return 0;
+
+	return nci_prop_cmd(ndev, NXP_NCI_PROP_SET_POWER_MODE, 1, &mode);
+}
+
+static int nxp_nci_prop_rsp(struct nci_dev *ndev, struct sk_buff *skb)
+{
+	nci_req_complete(ndev, skb->len ? skb->data[0] : NCI_STATUS_SYNTAX_ERROR);
+	return 0;
+}
+
+static const struct nci_driver_ops nxp_nci_prop_ops[] = {
+	{
+		.opcode = nci_opcode_pack(NCI_GID_PROPRIETARY,
+					  NXP_NCI_PROP_SET_POWER_MODE),
+		.rsp = nxp_nci_prop_rsp,
+	},
+};
+
 static const struct nci_ops nxp_nci_ops = {
 	.open = nxp_nci_open,
 	.close = nxp_nci_close,
 	.send = nxp_nci_send,
+	.post_setup = nxp_nci_post_setup,
 	.fw_download = nxp_nci_fw_download,
+	.prop_ops = nxp_nci_prop_ops,
+	.n_prop_ops = ARRAY_SIZE(nxp_nci_prop_ops),
 	.core_ops = nxp_nci_core_ops,
 	.n_core_ops = ARRAY_SIZE(nxp_nci_core_ops),
 };
