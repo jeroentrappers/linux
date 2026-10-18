@@ -1024,7 +1024,7 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
  * a module to 6, so the bring-up only ever runs on an explicit insmod.
  */
 static unsigned int t7000_stage = IS_MODULE(CONFIG_PCIE_APPLE) ? 6 : 0;
-module_param(t7000_stage, uint, 0444);
+module_param(t7000_stage, uint, 0644);
 MODULE_PARM_DESC(t7000_stage,
 		 "T7000: last bring-up stage to run (0 = none ... 6 = all)");
 
