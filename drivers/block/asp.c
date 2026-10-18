@@ -258,6 +258,32 @@ static bool allow_write;
 module_param(allow_write, bool, 0444);
 MODULE_PARM_DESC(allow_write, "Unlock writes to the user area (default: read-only)");
 
+/*
+ * With allow_write, user-area writes are only accepted inside these windows
+ * (byte offsets on the whole user-area disk), e.g. the extents of a file iOS
+ * preallocated for Linux. No windows = every write is rejected.
+ */
+#define ASP_MAX_WRITE_WINDOWS	8
+static unsigned long long write_start[ASP_MAX_WRITE_WINDOWS];
+static unsigned long long write_len[ASP_MAX_WRITE_WINDOWS];
+static int nr_write_start, nr_write_len;
+module_param_array(write_start, ullong, &nr_write_start, 0444);
+MODULE_PARM_DESC(write_start, "User-area write window starts, in bytes");
+module_param_array(write_len, ullong, &nr_write_len, 0444);
+MODULE_PARM_DESC(write_len, "User-area write window lengths, in bytes");
+
+static bool asp_write_allowed(struct request *req)
+{
+	u64 start = (u64)blk_rq_pos(req) << SECTOR_SHIFT;
+	u64 end = start + blk_rq_bytes(req);
+	int i;
+
+	for (i = 0; i < min(nr_write_start, nr_write_len); i++)
+		if (start >= write_start[i] && end <= write_start[i] + write_len[i])
+			return true;
+	return false;
+}
+
 //static int asp_major;
 static DEFINE_IDA(asp_instance_ida);
 
@@ -375,6 +401,12 @@ static blk_status_t asp_setup_rw(struct asp_queue *qd, struct request *req,
 		case ASP_QUEUE_TYPE_ADMIN:
 			BUG();
 		case ASP_QUEUE_TYPE_USERAREA:
+			if (write && !asp_write_allowed(req)) {
+				dev_err_ratelimited(asp->dev,
+					"write outside window rejected: sector %llu, %u bytes",
+					(u64)blk_rq_pos(req), blk_rq_bytes(req));
+				return BLK_STS_PROTECTION;
+			}
 			cmd->op = 0x10 | write;
 			break;
 		case ASP_QUEUE_TYPE_LLB:
@@ -830,7 +862,8 @@ static int apple_asp_start_disk(struct apple_asp *asp)
 			goto out_free_cmd;
 		}
 
-		dev_dbg(asp->dev, "Write enable OK");
+		dev_info(asp->dev, "user area writable in %d window(s)",
+			 min(nr_write_start, nr_write_len));
 	}
 
 	struct queue_limits lim = {
