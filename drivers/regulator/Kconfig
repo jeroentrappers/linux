@@ -217,6 +217,18 @@ config REGULATOR_APPLE_CHESTNUT
 	  This driver can also be built as a module. If so, the module
 	  will be called apple-chestnut-regulator.
 
+config REGULATOR_APPLE_PMIC
+	tristate "Apple PMIC regulators"
+	depends on I2C
+	depends on ARCH_APPLE || COMPILE_TEST
+	select MFD_SIMPLE_MFD_I2C
+	help
+	  This driver supports the enable-only LDO switches of the Dialog
+	  based PMICs found in Apple A8 iPhones.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called apple-pmic-regulator.
+
 config REGULATOR_AW37503
 	tristate "Awinic AW37503 Dual Output Power regulators"
 	depends on I2C && GPIOLIB
