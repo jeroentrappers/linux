@@ -20,6 +20,7 @@ properties:
     enum:
       - apple,j293-touchbar
       - apple,j493-touchbar
+      - apple,n61-touchscreen
 
   interrupts:
     maxItems: 1
@@ -36,6 +37,22 @@ properties:
     description:
       Calibration blob supplied by the bootloader
 
+  apple,z2-prox-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    maxItems: 4096
+    description:
+      Proximity sensor calibration blob supplied by the bootloader
+
+  vdd-supply:
+    description: Digital supply
+
+  vdd-ana-supply:
+    description: Analog supply
+
+  clocks:
+    maxItems: 1
+    description: 32 kHz reference clock
+
 required:
   - compatible
   - interrupts
@@ -43,6 +60,19 @@ required:
   - firmware-name
   - touchscreen-size-x
   - touchscreen-size-y
+
+if:
+  not:
+    properties:
+      compatible:
+        contains:
+          const: apple,n61-touchscreen
+then:
+  properties:
+    apple,z2-prox-cal-blob: false
+    vdd-supply: false
+    vdd-ana-supply: false
+    clocks: false
 
 unevaluatedProperties: false
 
