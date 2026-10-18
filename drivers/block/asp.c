@@ -223,6 +223,7 @@ struct apple_asp {
 	sector_t capacity;
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	struct completion rtk_ready;	/* asp->rtk is set: RTKit callbacks may fire before devm_apple_rtkit_init() returns */
 	struct completion init_done;
 	int init_ret;
 	int instance;
@@ -1174,6 +1175,12 @@ static void apple_asp_rtkit_epmap_done(void *cookie)
 	int ret;
 	u16 major_ver, minor_ver;
 
+	/* an IOP left running by iBoot can finish the EP map before probe has stored asp->rtk */
+	if (!wait_for_completion_timeout(&asp->rtk_ready, msecs_to_jiffies(2000))) {
+		dev_err(asp->dev, "RTKit handle not ready");
+		return;
+	}
+
 	apple_rtkit_protocol_version(asp->rtk, &major_ver, &minor_ver);
 
 	if (major_ver == 10 && minor_ver < 2)
@@ -1228,12 +1235,14 @@ static int apple_asp_probe(struct platform_device *pdev)
 	if (ret < 0)
 		return ret;
 
- 	asp->rtk = devm_apple_rtkit_init(dev, asp, NULL, 0, &apple_asp_rtkit_ops);
+ 	init_completion(&asp->rtk_ready);
+	asp->rtk = devm_apple_rtkit_init(dev, asp, NULL, 0, &apple_asp_rtkit_ops);
 	if (IS_ERR(asp->rtk)) {
 		ret = dev_err_probe(dev, PTR_ERR(asp->rtk),
 				    "Failed to initialize RTKit");
 		goto out_stop_iop;
 	}
+	complete_all(&asp->rtk_ready);
 
 	init_completion(&asp->init_done);
 
