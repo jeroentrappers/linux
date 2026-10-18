@@ -54,6 +54,20 @@
 	status = "okay";
 };
 
+&i2c0 {
+	/* Display PMU, only the touch analog supply switch is described */
+	display-pmu@27 {
+		compatible = "apple,chestnut";
+		reg = <0x27>;
+
+		regulators {
+			chestnut_ldo2: ldo2 {
+				regulator-name = "chestnut-ldo2";
+			};
+		};
+	};
+};
+
 &i2c1 {
 	status = "okay";
 
@@ -102,5 +116,34 @@
 			cirrus,vp-hg = <9>;
 			cirrus,vp-hg-va = <1>;
 		};
+	};
+};
+
+&spi2 {
+	status = "okay";
+	/* ADT spi2 function-spi_cs0 = GPIO(0xb9, 0x10001): pin 185, active-low */
+	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
+
+	/* ADT /arm-io/spi2/multi-touch (multi-touch,n61): an N1 (Z2 family) */
+	touchscreen@0 {
+		compatible = "apple,n61-touchscreen";
+		reg = <0>;
+		/* iOS runs the link at ~12 MHz; plenty for 56-byte frames */
+		spi-max-frequency = <4000000>;
+		/* Held low while a frame is pending */
+		interrupts-extended = <&pinctrl 3 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pinctrl 2 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&pmic_ldo15>;
+		vdd-ana-supply = <&chestnut_ldo2>;
+		clocks = <&touch_clk>;
+		firmware-name = "apple/dfrmtfw-n61.bin";
+		/* 58.50 x 104.05 mm in 0.01 mm units, origin bottom left */
+		touchscreen-size-x = <5850>;
+		touchscreen-size-y = <10405>;
+		touchscreen-inverted-y;
+		/*
+		 * apple,z2-cal-blob and apple,z2-prox-cal-blob are filled in
+		 * by the bootloader from the ADT.
+		 */
 	};
 };
