@@ -61,6 +61,12 @@ patternProperties:
     type: object
     $ref: /schemas/power/apple,pmgr-pwrstate.yaml#
 
+  "^clock-controller@[0-9a-f]+$":
+    description:
+      Clock gates and dividers within this controller
+    type: object
+    $ref: /schemas/clock/apple,t7000-touch-clk.yaml#
+
 required:
   - compatible
   - reg
