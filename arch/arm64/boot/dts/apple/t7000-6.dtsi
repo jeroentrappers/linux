@@ -66,6 +66,12 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		/* Enable bit 1 of reg 0x85: touch controller VDD */
+		pmic_ldo15: ldo15@85 {
+			compatible = "apple,adi-pmic-ldo15";
+			reg = <0x85 0x1>;
+		};
+
 		rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
 			reg = <0x5c0 0x10>;
