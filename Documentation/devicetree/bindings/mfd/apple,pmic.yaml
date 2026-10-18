@@ -64,6 +64,9 @@ patternProperties:
   "^nvmem(@[0-9a-f]+)?$":
     $ref: /schemas/nvmem/apple,pmic-nvmem.yaml
 
+  "^ldo[0-9]+(@[0-9a-f]+)?$":
+    $ref: /schemas/regulator/apple,adi-pmic-ldo.yaml
+
 required:
   - compatible
   - reg
