@@ -263,7 +263,7 @@ MODULE_PARM_DESC(allow_write, "Unlock writes to the user area (default: read-onl
  * (byte offsets on the whole user-area disk), e.g. the extents of a file iOS
  * preallocated for Linux. No windows = every write is rejected.
  */
-#define ASP_MAX_WRITE_WINDOWS	8
+#define ASP_MAX_WRITE_WINDOWS	128
 static unsigned long long write_start[ASP_MAX_WRITE_WINDOWS];
 static unsigned long long write_len[ASP_MAX_WRITE_WINDOWS];
 static int nr_write_start, nr_write_len;
