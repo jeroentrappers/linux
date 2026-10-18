@@ -36,9 +36,14 @@ config PCIE_ALTERA_MSI
 	  This MSI driver supports Altera MSI to GIC controller IP.
 
 config PCIE_APPLE_MSI_DOORBELL_ADDR
-	hex
+	hex "Apple PCIe MSI doorbell address"
 	default 0xfffff000
 	depends on PCIE_APPLE
+	help
+	  Bus address the Apple PCIe controller decodes as MSI writes. It is
+	  also reserved in the IOVA space by the DART driver. The M1 and later
+	  controllers can use any address (0xfffff000 matches macOS); the A8
+	  (T7000) one has the doorbell hardwired at 0xbffff000.
 
 config PCIE_APPLE
 	tristate "Apple PCIe controller"
@@ -50,7 +55,8 @@ config PCIE_APPLE
 	help
 	  Say Y here if you want to enable PCIe controller support on Apple
 	  system-on-chips, like the Apple M1. This is required for the USB
-	  type-A ports, Ethernet, Wi-Fi, and Bluetooth.
+	  type-A ports, Ethernet, Wi-Fi, and Bluetooth. The A8 (T7000)
+	  controller, which carries the iPhone 6 Wi-Fi, is supported too.
 
 	  If unsure, say Y if you have an Apple Silicon system.
 
