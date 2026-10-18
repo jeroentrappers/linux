@@ -188,6 +188,11 @@
 	};
 };
 
+/* ADT /arm-io/uart3/stockholm: NXP PN548-class NFC controller */
+&serial3 {
+	status = "okay";
+};
+
 &serial1 {
 	status = "okay";
 

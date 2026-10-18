@@ -15,6 +15,7 @@
 		asp = &ans;
 		serial0 = &serial0;
 		serial1 = &serial1;
+		serial3 = &serial3;
 		serial6 = &serial6;
 	};
 
