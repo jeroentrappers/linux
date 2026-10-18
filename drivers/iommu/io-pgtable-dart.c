@@ -18,6 +18,7 @@
 #include <linux/bitops.h>
 #include <linux/io-pgtable.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -63,6 +64,18 @@
 /* marks PTE as valid */
 #define APPLE_DART_PTE_VALID		BIT(0)
 
+/*
+ * S5L8960X-style DARTs (A7/A8) walk ARM-like descriptors: both table entries
+ * and leaves need bits 1:0 = 0b11, and a leaf with the T8020 subpage range in
+ * bits 63:40 is rejected ("NO PTE"). Verified on the A8 apcie DART.
+ * Debug override: bit 0 = tables get bit 1, bit 1 = leaves without bit 1,
+ * bit 2 = leaves without the subpage range.
+ */
+#define APPLE_DART0_PTE_TABLE		BIT(1)
+static unsigned int s5l_fmt = 0x5;
+module_param(s5l_fmt, uint, 0644);
+MODULE_PARM_DESC(s5l_fmt, "S5L8960X DART descriptor format (debug)");
+
 /* IOPTE accessors */
 #define iopte_deref(pte, d) __va(iopte_to_paddr(pte, d))
 
@@ -77,6 +90,11 @@ struct dart_io_pgtable {
 };
 
 typedef u64 dart_iopte;
+
+static bool dart_is_s5l(struct dart_io_pgtable *data)
+{
+	return data->iop.cfg.quirks & IO_PGTABLE_QUIRK_APPLE_DART_S5L;
+}
 
 
 static dart_iopte paddr_to_iopte(phys_addr_t paddr,
@@ -126,8 +144,10 @@ static int dart_init_pte(struct dart_io_pgtable *data,
 		}
 
 	/* subpage protection: always allow access to the entire page */
-	pte |= FIELD_PREP(APPLE_DART_PTE_SUBPAGE_START, 0);
-	pte |= FIELD_PREP(APPLE_DART_PTE_SUBPAGE_END, 0xfff);
+	if (!dart_is_s5l(data) || !(s5l_fmt & 4)) {
+		pte |= FIELD_PREP(APPLE_DART_PTE_SUBPAGE_START, 0);
+		pte |= FIELD_PREP(APPLE_DART_PTE_SUBPAGE_END, 0xfff);
+	}
 
 	pte |= APPLE_DART_PTE_VALID;
 
@@ -145,6 +165,8 @@ static dart_iopte dart_install_table(dart_iopte *table,
 	dart_iopte old, new;
 
 	new = paddr_to_iopte(__pa(table), data) | APPLE_DART_PTE_VALID;
+	if (dart_is_s5l(data) && (s5l_fmt & 1))
+		new |= APPLE_DART0_PTE_TABLE;
 
 	/*
 	 * Ensure the table itself is visible before its PTE can be.
@@ -205,7 +227,8 @@ static dart_iopte dart_prot_to_pte(struct dart_io_pgtable *data,
 	dart_iopte pte = 0;
 
 	if (data->iop.fmt == APPLE_DART) {
-		pte |= APPLE_DART1_PTE_PROT_SP_DIS;
+		if (!dart_is_s5l(data) || !(s5l_fmt & 2))
+			pte |= APPLE_DART1_PTE_PROT_SP_DIS;
 		if (!(prot & IOMMU_WRITE))
 			pte |= APPLE_DART1_PTE_PROT_NO_WRITE;
 		if (!(prot & IOMMU_READ))
