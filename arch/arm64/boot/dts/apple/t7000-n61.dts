@@ -191,6 +191,13 @@
 /* ADT /arm-io/uart3/stockholm: NXP PN548-class NFC controller */
 &serial3 {
 	status = "okay";
+
+	nfc {
+		compatible = "nxp,pn548-uart";
+		/* ADT function-enable / function-download_request */
+		enable-gpios = <&pinctrl 177 GPIO_ACTIVE_HIGH>;
+		firmware-gpios = <&pinctrl 192 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &serial1 {
