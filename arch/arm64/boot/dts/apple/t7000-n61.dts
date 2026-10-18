@@ -147,3 +147,21 @@
 		 */
 	};
 };
+
+&serial1 {
+	status = "okay";
+
+	/* ADT /arm-io/uart1/bluetooth: the BT half of a BCM4345 module */
+	bluetooth {
+		compatible = "brcm,bcm4345c5";
+		/*
+		 * iOS runs 3 Mbaud with extra divider bits; the S5L divider
+		 * alone tops out at 1.5 Mbaud from the 24 MHz clock.
+		 */
+		max-speed = <1500000>;
+		/* ADT function-power_enable: PMU GPIO 8 = BT_REG_ON */
+		shutdown-gpios = <&pmic_gpio 8 GPIO_ACTIVE_HIGH>;
+		/* ADT function-bt_wake: GPIO 50 */
+		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
+	};
+};
