@@ -8,7 +8,9 @@
  * same framing as on I2C, so only the transport differs.
  */
 
+#include <linux/ctype.h>
 #include <linux/delay.h>
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/nfc.h>
 #include <linux/gpio/consumer.h>
@@ -32,6 +34,13 @@
 static bool debug;
 module_param(debug, bool, 0644);
 MODULE_PARM_DESC(debug, "Log every frame sent and received");
+
+static struct nxp_nci_uart_phy *debug_phy;
+
+/* Debug: echo "2f 02 00" > /sys/module/nxp_nci_uart/parameters/raw sends raw bytes */
+static int nxp_nci_uart_raw_set(const char *val, struct kernel_param const *kp);
+static const struct kernel_param_ops raw_ops = { .set = nxp_nci_uart_raw_set };
+module_param_cb(raw, &raw_ops, NULL, 0200);
 
 struct nxp_nci_uart_phy {
 	struct serdev_device *serdev;
@@ -78,6 +87,28 @@ static int nxp_nci_uart_write(void *phy_id, struct sk_buff *skb)
 		return r;
 
 	return r == skb->len ? 0 : -EIO;
+}
+
+static int nxp_nci_uart_raw_set(const char *val, struct kernel_param const *kp)
+{
+	u8 b[64];
+	int n = 0, r;
+
+	while (*val && n < (int)sizeof(b)) {
+		while (*val == ' ')
+			val++;
+		if (!isxdigit(val[0]) || !isxdigit(val[1]))
+			break;
+		r = hex2bin(&b[n++], val, 1);
+		if (r)
+			return r;
+		val += 2;
+	}
+	if (!debug_phy || !n)
+		return -EINVAL;
+	print_hex_dump(KERN_INFO, "nfc raw tx: ", DUMP_PREFIX_NONE, 32, 1, b, n, false);
+	r = serdev_device_write(debug_phy->serdev, b, n, HZ);
+	return r < 0 ? r : 0;
 }
 
 static const struct nxp_nci_phy_ops uart_phy_ops = {
@@ -204,6 +235,7 @@ static int nxp_nci_uart_probe(struct serdev_device *serdev)
 		goto err_close;
 
 	((struct nxp_nci_info *)nci_get_drvdata(phy->ndev))->disable_standby = true;
+	debug_phy = phy;
 	return 0;
 
 err_close:
@@ -215,6 +247,7 @@ static void nxp_nci_uart_remove(struct serdev_device *serdev)
 {
 	struct nxp_nci_uart_phy *phy = serdev_device_get_drvdata(serdev);
 
+	debug_phy = NULL;
 	nxp_nci_remove(phy->ndev);
 	serdev_device_close(serdev);
 	kfree_skb(phy->recv_skb);
