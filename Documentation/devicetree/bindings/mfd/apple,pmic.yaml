@@ -67,6 +67,9 @@ patternProperties:
   "^ldo[0-9]+(@[0-9a-f]+)?$":
     $ref: /schemas/regulator/apple,adi-pmic-ldo.yaml
 
+  "^gpio(@[0-9a-f]+)?$":
+    $ref: /schemas/gpio/apple,adi-pmic-gpio.yaml
+
 required:
   - compatible
   - reg
