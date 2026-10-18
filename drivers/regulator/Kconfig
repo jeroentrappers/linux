@@ -205,6 +205,18 @@ config REGULATOR_ATC260X
 	  ATC260x PMICs. This will enable support for all the software
 	  controllable DCDC/LDO regulators.
 
+config REGULATOR_APPLE_CHESTNUT
+	tristate "Apple Chestnut display PMU regulator"
+	depends on I2C
+	depends on ARCH_APPLE || COMPILE_TEST
+	select REGMAP_I2C
+	help
+	  This driver supports the touch controller analog supply switch of
+	  the Chestnut display PMU found in the Apple iPhone 6.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called apple-chestnut-regulator.
+
 config REGULATOR_AW37503
 	tristate "Awinic AW37503 Dual Output Power regulators"
 	depends on I2C && GPIOLIB
