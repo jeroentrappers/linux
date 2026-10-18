@@ -66,6 +66,15 @@ config COMMON_CLK_APPLE_NCO
 	  found on Apple SoCs such as t8103 (M1). The blocks are typically
 	  generators of audio clocks.
 
+config COMMON_CLK_APPLE_TOUCH
+	tristate "Clock driver for the Apple A8 touch clock"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select MFD_SYSCON
+	help
+	  This driver supports the TOUCH_CTL clock gate and divider in the
+	  PMGR of the Apple A8 (t7000), which generates the 32.768 kHz clock for
+	  the multi-touch controller from the 24 MHz reference clock.
+
 config COMMON_CLK_MAX77686
 	tristate "Clock driver for Maxim 77620/77686/77802 MFD"
 	depends on MFD_MAX77686 || MFD_MAX77620 || COMPILE_TEST
