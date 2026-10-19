@@ -75,6 +75,7 @@
 #define PIPE(p)			(0x4000 + 0x2000 * (p))
 #define PIPE_PIX_FMT		0x2c
 #define PIPE_PIX_FMT_XRGB32	0x53e4001
+#define PIPE_PIX_FMT_XRGB32_N61	0x52e4001	/* what iBoot leaves on n61 (bit 20 differs; same pixels on hw) */
 #define PIPE_BASE		0x30
 #define PIPE_STRIDE		0x38
 #define PIPE_SRC_SIZE		0x48
@@ -809,7 +810,7 @@ static int adpt_probe(struct platform_device *pdev)
 	drm_info(&adp->drm, "iBoot pipe0: base %08x stride %u fmt %08x src %08x, ADBE size %08x, mask %08x\n",
 		 adp->boot.base, adp->boot.stride, fmt, readl(adp->adp + PIPE(0) + PIPE_SRC_SIZE), size,
 		 adp->irq_en_orig);
-	if (fmt != PIPE_PIX_FMT_XRGB32 && !force)
+	if (fmt != PIPE_PIX_FMT_XRGB32 && fmt != PIPE_PIX_FMT_XRGB32_N61 && !force)
 		return dev_err_probe(dev, -ENODEV, "unexpected pipe0 format %08x (force=1 to ignore)\n", fmt);
 
 	adp->vram_iova = iova_base ?: adp->boot.base;
