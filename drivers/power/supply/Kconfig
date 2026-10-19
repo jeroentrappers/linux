@@ -345,6 +345,15 @@ config BATTERY_BQ27XXX_DT_UPDATES_NVM
 	  general-purpose kernels, as this can cause misconfiguration of a
 	  smart battery with embedded NVM/flash.
 
+config BATTERY_APPLE_SWI
+	tristate "Apple SWI battery gauge"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on BATTERY_BQ27XXX && I2C
+	help
+	  Say Y here to read the bq27540 gas gauge of the iPhone 6 battery.
+	  The gauge speaks HDQ over a single wire that one of the SoC UARTs
+	  drives, after the SN2400 charger has handed the wire over.
+
 config BATTERY_DA9030
 	tristate "DA9030 battery driver"
 	depends on PMIC_DA903X
