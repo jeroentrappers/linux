@@ -243,6 +243,15 @@
 			status = "disabled";
 		};
 
+		swi: battery-gauge@20a0d4000 {
+			compatible = "apple,t7000-swi-gauge";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			pinctrl-0 = <&uart5_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_uart5>;
+			status = "disabled";
+		};
+
 		serial6: serial@20a0d8000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0d8000 0x0 0x4000>;
@@ -471,6 +480,10 @@
 					 <APPLE_PINMUX(179, 1)>,
 					 <APPLE_PINMUX(180, 1)>,
 					 <APPLE_PINMUX(181, 1)>;
+			};
+
+			uart5_pins: uart5-pins {
+				pinmux = <APPLE_PINMUX(57, 1)>;
 			};
 
 			i2c1_pins: i2c1-pins {

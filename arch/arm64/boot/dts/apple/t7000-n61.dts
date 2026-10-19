@@ -121,7 +121,7 @@
 		vib-overdrive-mv = <3320>;
 	};
 
-	charger@75 {
+	charger: charger@75 {
 		compatible = "ti,sn2400";
 		reg = <0x75>;
 		input-current-limit-microamp = <500000>;
@@ -189,6 +189,13 @@
 };
 
 /* ADT /arm-io/uart3/stockholm: NXP PN548-class NFC controller */
+/* The battery's bq27540 gauge, reached over UART5 through the charger */
+&swi {
+	apple,swi-master = <&charger>;
+	power-supplies = <&charger>;
+	status = "okay";
+};
+
 &serial3 {
 	status = "okay";
 
