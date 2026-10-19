@@ -15,3 +15,17 @@ config DRM_ADP
 	  Chose this option if you have an Apple Arm laptop with a touchbar.
 
 	  If M is selected, this module will be called adpdrm.
+
+config DRM_ADP_T7000
+	tristate "DRM Support for the Apple A8 (T7000) display pipe"
+	depends on DRM && OF && ARM64
+	depends on ARCH_APPLE || COMPILE_TEST
+	select DRM_KMS_HELPER
+	select GENERIC_ALLOCATOR
+	help
+	  Choose this option for the internal display of Apple A8 devices
+	  (iPhone 6, iPad mini 4, iPod touch 6). The driver takes over the
+	  display pipe that iBoot set up and scans out buffers from the boot
+	  framebuffer carveout.
+
+	  If M is selected, this module will be called adp-t7000.
