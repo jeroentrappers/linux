@@ -688,6 +688,20 @@ static size_t adpt_dart_usable(struct adpt *adp)
 
 	if (!dart)
 		return 0;
+	/*
+	 * n61: iBoot leaves stream 0 untranslated (TCR byte 0 without bit 7, TTBRs hold junk that must
+	 * never be followed): the pipe fetches PA = 0x800000000 + its 32-bit address, so all of vram is usable.
+	 */
+	if (!(readl(dart + DART_TCR) & 0x80)) {
+		iounmap(dart);
+		if ((phys_addr_t)adp->vram_iova + 0x800000000ULL != adp->vram_phys) {
+			drm_err(&adp->drm, "DART bypass but vram iova %#x doesn't match pa %pa\n", adp->vram_iova,
+				&adp->vram_phys);
+			return 0;
+		}
+		drm_info(&adp->drm, "dart-disp0 in bypass: all %zu KB of vram usable\n", adp->vram_size >> 10);
+		return adp->vram_size;
+	}
 	for (off = 0; off < adp->vram_size; off += SZ_4K) {
 		u32 iova = adp->vram_iova + off;
 		u32 ttbr = readl(dart + DART_TTBR(0, iova >> 30));
