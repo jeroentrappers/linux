@@ -13,6 +13,9 @@
 	aliases {
 		ausbphy0 = &ausbphy0; /* Used by loader */
 		asp = &ans;
+		i2c0 = &i2c0;
+		i2c1 = &i2c1;
+		i2c2 = &i2c2;
 		serial0 = &serial0;
 		serial1 = &serial1;
 		serial3 = &serial3;

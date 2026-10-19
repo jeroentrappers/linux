@@ -108,6 +108,18 @@
 	};
 };
 
+&i2c2 {
+	status = "okay";
+
+	/* ADT /arm-io/i2c2/als: "als,ct819", command-compatible with the TAOS TSL2581 */
+	light-sensor@29 {
+		compatible = "amstaos,tsl2581";
+		reg = <0x29>;
+		/* ADT interrupts [34 1] = level-low; the driver polls, the line is only described */
+		interrupts-extended = <&pinctrl 34 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
 &i2c1 {
 	status = "okay";
 
