@@ -103,6 +103,7 @@ struct isp_surf {
 	u32 size;		/* multiple of PAGE_SIZE */
 	u32 tag;		/* 4cc, for logs */
 	bool sm;		/* allocated by a SHAREDMALLOC request */
+	bool sm_freed;		/* fw freed it: kept mapped until teardown */
 	unsigned int npages;
 	struct page **pages;
 	dma_addr_t *dma;

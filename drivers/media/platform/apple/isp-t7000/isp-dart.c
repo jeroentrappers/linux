@@ -158,21 +158,27 @@ static void dart_unmap_page(struct t7000_isp *isp, u32 iova)
 		isp->l2[i1][i2] = 0;
 }
 
+/*
+ * Two passes: clear every PTE and flush the DART TLB first, only then give the
+ * pages back, so the ISP can never reach a page the kernel already reuses.
+ * At runtime only the alloc-failure path gets here; fw frees are ack-only.
+ */
 void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s)
 {
 	unsigned int i;
 
 	if (s->virt)
 		vunmap(s->virt);
+	for (i = 0; s->pages && i < s->npages; i++)
+		dart_unmap_page(isp, s->iova + i * PAGE_SIZE);
+	isp_dart_flush(isp);
 	for (i = 0; s->pages && s->dma && i < s->npages; i++) {
 		if (!s->pages[i])
 			continue;
-		dart_unmap_page(isp, s->iova + i * PAGE_SIZE);
 		if (!dma_mapping_error(isp->dev, s->dma[i]))
 			dma_unmap_page(isp->dev, s->dma[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
 		__free_page(s->pages[i]);
 	}
-	isp_dart_flush(isp);
 	isp->shared_bytes -= s->size;
 	list_del(&s->list);
 	kfree(s->pages);

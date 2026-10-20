@@ -72,8 +72,8 @@ static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
 
 /*
  * SHAREDMALLOC request: word0 == 0 -> alloc (word1 size, min 0x1000, word2 4cc
- * tag), reply word0 = fw-rel address | 1. word0 != 0 -> free that address,
- * reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
+ * tag), reply word0 = fw-rel address | 1. word0 != 0 -> free (ack only, see
+ * below), reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
  * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
  */
 static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
@@ -99,13 +99,19 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
 		return isp_rel(s->iova) | 1;
 	}
 	s = isp_surf_find(isp, isp_fw_iova + rel);
-	if (!s || !s->sm || s->iova != isp_fw_iova + rel) {
-		dev_warn(isp->dev, "SHAREDMALLOC: free of unknown fw-rel 0x%08x ignored\n", rel);
+	if (!s || !s->sm || s->sm_freed || s->iova != isp_fw_iova + rel) {
+		dev_warn(isp->dev, "SHAREDMALLOC: free of unknown/already freed fw-rel 0x%08x ignored\n",
+			 rel);
 		return 1;
 	}
-	dev_info(isp->dev, "SHAREDMALLOC: free fw-rel 0x%08x (0x%x '%4.4s')\n", rel, s->size,
-		 (char *)&s->tag);
-	isp_surf_free(isp, s);
+	/*
+	 * Ack only. Asahi: the fw keeps using surfaces after freeing them, so
+	 * they stay mapped and are released by isp_surf_free_all() after the
+	 * ISP is powered off.
+	 */
+	s->sm_freed = true;
+	dev_info(isp->dev, "SHAREDMALLOC: free fw-rel 0x%08x (0x%x '%4.4s'): acked, kept mapped until teardown\n",
+		 rel, s->size, (char *)&s->tag);
 	return 1;
 }
 
