@@ -93,7 +93,11 @@ int isp_power_on(struct t7000_isp *isp)
 		 isp->version, isp->version >> 16,
 		 (isp->version >> 16) == 4 ? "" : " (only rev 4 is implemented; stage 2+ will refuse)");
 	isp->version >>= 16;
-	isp_log_window(isp, "after power-on");
+	/*
+	 * Nothing else in the window until stage 2 has written the clock enable
+	 * +0x20080 (iOS power_on_hardware, Asahi stage 1): only +0xa0000 is read
+	 * before it, like the kext's start().
+	 */
 	return 0;
 }
 
@@ -165,15 +169,17 @@ int isp_stage_clocks(struct t7000_isp *isp)
 	return 0;
 }
 
-/* dry_run: reads only. The window is read only if media + isp are already on. */
+/*
+ * dry_run: reads only. If media + isp are already on, only the version reg is
+ * read (the rest of the window may be clock-gated: we do not know whether
+ * +0x20080 was written by whoever powered it).
+ */
 void isp_dry_read(struct t7000_isp *isp)
 {
 	if (ps_is_on(ps_rd(isp, PMGR_PS_MEDIA)) && ps_is_on(ps_rd(isp, PMGR_PS_ISP))) {
 		isp->version = isp_rd(isp, ISP_VERSION);
-		dev_info(isp->dev, "dry_run: version reg 0x%08x (rev %u)\n",
+		dev_info(isp->dev, "dry_run: version reg 0x%08x (rev %u); not reading the rest of the window\n",
 			 isp->version, isp->version >> 16);
-		isp_log_window(isp, "dry_run");
-		isp_dart_log(isp, "dry_run");
 	} else {
 		dev_info(isp->dev, "dry_run: ps_media/ps_isp not both on: not reading the ISP window\n");
 	}
