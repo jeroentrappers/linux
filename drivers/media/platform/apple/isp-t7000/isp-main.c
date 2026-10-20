@@ -29,9 +29,9 @@ MODULE_PARM_DESC(dry_run, "1 = only read + log registers (ISP window only if alr
 int isp_irq_en;
 module_param_named(irq, isp_irq_en, int, 0444);
 MODULE_PARM_DESC(irq, "1 = use AIC IRQ 91 for the mailbox (default: poll)");
-int isp_sens;
+int isp_sens = 1;
 module_param_named(sens, isp_sens, int, 0444);
-MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 (iOS does; default off)");
+MODULE_PARM_DESC(sens, "1 = also power ps_ispsens0/1 like the kext EnableISPClocksAndPower (default); 0 = ISP only");
 int isp_smmu_en;
 module_param_named(smmu_en, isp_smmu_en, int, 0444);
 MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (default: SMMU read-only)");
