@@ -6,6 +6,7 @@
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
