@@ -163,7 +163,10 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
 	return done;
 }
 
-/* One service pass: ack the mailbox, drain all fw->host rings, check the DART. */
+/*
+ * One service pass: ack the mailbox, drain all fw->host rings. The DART error
+ * is checked (and acked) by the callers, so a fault is seen exactly once.
+ */
 int isp_service(struct t7000_isp *isp)
 {
 	u32 pending, i;
@@ -179,7 +182,6 @@ int isp_service(struct t7000_isp *isp)
 			continue;
 		n += isp_drain(isp, c);
 	}
-	isp_dart_fault(isp);
 	return n;
 }
 
@@ -293,6 +295,7 @@ static irqreturn_t isp_irq_thread(int irq, void *data)
 
 	mutex_lock(&isp->lock);
 	isp_service(isp);
+	isp_dart_fault(isp);
 	mutex_unlock(&isp->lock);
 	return IRQ_HANDLED;
 }
@@ -342,8 +345,10 @@ static void isp_poll_fn(struct work_struct *work)
 	int n = 0;
 
 	mutex_lock(&isp->lock);
-	if (READ_ONCE(isp->poll_on))
+	if (READ_ONCE(isp->poll_on)) {
 		n = isp_service(isp);
+		isp_dart_fault(isp);
+	}
 	mutex_unlock(&isp->lock);
 	if (n && isp->irq >= 0)
 		dev_info_ratelimited(isp->dev, "safety poll handled %d message(s) the IRQ did not (irqs so far: %d)\n",
@@ -437,6 +442,7 @@ int isp_stage_mbox(struct t7000_isp *isp)
 	isp->poll_init = true;
 	WRITE_ONCE(isp->poll_on, true);
 	n = isp_service(isp);
+	isp_dart_fault(isp);
 	dev_info(isp->dev, "initial service pass: %d message(s); %s, poll every %u ms\n", n,
 		 isp->irq >= 0 ? "IRQ mode" : "poll mode", isp_poll_interval(isp));
 	schedule_delayed_work(&isp->poll_work, msecs_to_jiffies(isp_poll_interval(isp)));
@@ -605,6 +611,7 @@ void isp_fw_shutdown(struct t7000_isp *isp)
 			break;
 		}
 		isp_service(isp);
+		isp_dart_fault(isp);	/* log + ack only: keep waiting */
 		if (time_after(jiffies, end)) {
 			dev_err(isp->dev, "TIMEOUT (1 s) waiting for gpio0 == 0x8042006 after POWER_DOWN, gpio0 0x%08x\n",
 				v);

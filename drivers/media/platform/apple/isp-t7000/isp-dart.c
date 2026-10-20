@@ -47,6 +47,8 @@ bool isp_dart_fault(struct t7000_isp *isp)
 		dev_err(isp->dev, "DART fault: error 0x%08x (stream %lu code 0x%02x) addr 0x%08x\n",
 			err, (unsigned long)((err >> 24) & 3), err & 0xff,
 			dart_rd(isp, DART_ERROR_ADDR));
+	/* W1C ack (mainline apple_dart_s5l8960x_irq): only new faults count from here on */
+	dart_wr(isp, DART_ERROR, err);
 	return true;
 }
 
