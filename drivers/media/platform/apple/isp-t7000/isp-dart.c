@@ -129,6 +129,7 @@ void isp_dart_fini(struct t7000_isp *isp)
 		if (isp_dart_sids & BIT(sid))
 			for (i = 0; i < 4; i++)
 				dart_wr(isp, DART_TTBR(sid, i), 0);
+	isp_dart_flush(isp);	/* still dart_on: drop any cached translation */
 	isp->dart_on = false;
 	dev_info(isp->dev, "dart: translation disabled\n");
 }

@@ -92,8 +92,20 @@ static void isp_teardown(struct t7000_isp *isp)
 		isp_cpu_stop(isp);
 	if (isp->dart_on)
 		isp_dart_fini(isp);
-	isp_power_off(isp);
-	isp_surf_free_all(isp);
+	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
+		/*
+		 * ps_isp did not gate: the ISP (and its DART) may still be live, so
+		 * every page it could reach stays allocated. Leaked on purpose.
+		 */
+		dev_err(isp->dev, "!!! ps_isp power-off TIMED OUT: LEAKING all ISP surfaces + DART tables (%llu bytes) so the ISP cannot DMA into reused memory; reboot before the next test !!!\n",
+			isp->shared_bytes);
+		INIT_LIST_HEAD(&isp->surfs);
+		isp->fw = isp->ipc = isp->heap = NULL;
+		isp->l1 = NULL;
+		memset(isp->l2, 0, sizeof(isp->l2));
+	} else {
+		isp_surf_free_all(isp);
+	}
 	isp->done = 0;
 	mutex_unlock(&isp->lock);
 	isp_pmgr_log(isp, "after teardown");

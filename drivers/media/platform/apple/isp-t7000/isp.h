@@ -182,7 +182,7 @@ static inline u32 isp_rel(u32 iova)
 /* isp-pwr.c */
 void isp_pmgr_log(struct t7000_isp *isp, const char *when);
 int isp_power_on(struct t7000_isp *isp);
-void isp_power_off(struct t7000_isp *isp);
+int isp_power_off(struct t7000_isp *isp);
 void isp_log_window(struct t7000_isp *isp, const char *when);
 int isp_stage_clocks(struct t7000_isp *isp);
 void isp_dry_read(struct t7000_isp *isp);

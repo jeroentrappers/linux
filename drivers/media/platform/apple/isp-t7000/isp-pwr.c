@@ -101,8 +101,11 @@ int isp_power_on(struct t7000_isp *isp)
 	return 0;
 }
 
-void isp_power_off(struct t7000_isp *isp)
+/* Returns -ETIMEDOUT if a ps_isp we powered on did not reach ACTUAL == 0. */
+int isp_power_off(struct t7000_isp *isp)
 {
+	int ret = 0;
+
 	if (isp->on_sens1) {
 		ps_set(isp, PMGR_PS_ISPSENS1, "ispsens1", PS_PWRGATE);
 		isp->on_sens1 = false;
@@ -112,13 +115,14 @@ void isp_power_off(struct t7000_isp *isp)
 		isp->on_sens0 = false;
 	}
 	if (isp->on_isp) {
-		ps_set(isp, PMGR_PS_ISP, "isp", PS_PWRGATE);
+		ret = ps_set(isp, PMGR_PS_ISP, "isp", PS_PWRGATE);
 		isp->on_isp = false;
 	}
 	if (isp->on_media) {
 		ps_set(isp, PMGR_PS_MEDIA, "media", PS_PWRGATE);
 		isp->on_media = false;
 	}
+	return ret;
 }
 
 void isp_log_window(struct t7000_isp *isp, const char *when)
