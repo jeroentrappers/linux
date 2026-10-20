@@ -115,7 +115,6 @@ struct isp_chan {
 	u8 *ring;		/* CPU view of num * 0x40 bytes */
 	u32 idx;		/* next slot to send (cmd) or to look at (reply/report) */
 	unsigned long msgs;
-	bool skip;		/* ring looked uninitialised at stage 7: not serviced */
 };
 
 struct t7000_isp {
