@@ -88,6 +88,29 @@
 #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
 
 #define BRCMF_PS_MAX_TIMEOUT_MS		2000
+#define BRCMF_PS_MIN_TIMEOUT_MS		10
+
+/*
+ * Power save tuning. cfg80211 passes ps_timeout = -1 unless userspace set one, which made
+ * pm2_sleep_ret the 2000 ms maximum: the radio then stays awake for 2 s after every packet.
+ */
+static int brcmf_pm_mode = PM_FAST;
+module_param_named(pm_mode, brcmf_pm_mode, int, 0644);
+MODULE_PARM_DESC(pm_mode, "mode used when power save is on: 1 = PM_MAX (PS-Poll), 2 = PM_FAST (default)");
+
+static int brcmf_pm2_sleep_ret = 200;
+module_param_named(pm2_sleep_ret, brcmf_pm2_sleep_ret, int, 0644);
+MODULE_PARM_DESC(pm2_sleep_ret, "PM_FAST: ms awake after the last packet (10-2000, default 200; -1 = the cfg80211 timeout, 2000 ms unless set)");
+
+static int brcmf_bcn_li_dtim;
+module_param_named(bcn_li_dtim, brcmf_bcn_li_dtim, int, 0644);
+MODULE_PARM_DESC(bcn_li_dtim, "power save: listen to every Nth DTIM beacon only (0 = firmware default)");
+
+/* the PM mode for power save on: PM_FAST unless pm_mode asks for PM_MAX */
+static s32 brcmf_ps_pm_mode(void)
+{
+	return READ_ONCE(brcmf_pm_mode) == PM_MAX ? PM_MAX : PM_FAST;
+}
 
 /* Dump obss definitions */
 #define ACS_MSRMNT_DELAY		80
@@ -3327,7 +3350,7 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 		goto done;
 	}
 
-	pm = enabled ? PM_FAST : PM_OFF;
+	pm = enabled ? brcmf_ps_pm_mode() : PM_OFF;
 	/* Do not enable the power save after assoc if it is a p2p interface */
 	if (ifp->vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT) {
 		brcmf_dbg(INFO, "Do not enable power save for P2P clients\n");
@@ -3343,10 +3366,23 @@ brcmf_cfg80211_set_power_mgmt(struct wiphy *wiphy, struct net_device *ndev,
 			bphy_err(drvr, "error (%d)\n", err);
 	}
 
+	if (READ_ONCE(brcmf_pm2_sleep_ret) >= 0)
+		timeout = clamp(READ_ONCE(brcmf_pm2_sleep_ret), BRCMF_PS_MIN_TIMEOUT_MS,
+				BRCMF_PS_MAX_TIMEOUT_MS);
 	err = brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
 				min_t(u32, timeout, BRCMF_PS_MAX_TIMEOUT_MS));
 	if (err)
 		bphy_err(drvr, "Unable to set pm timeout, (%d)\n", err);
+
+	/* only touch bcn_li_dtim when asked to, so the firmware default stays otherwise */
+	if (READ_ONCE(brcmf_bcn_li_dtim) > 0 || ifp->bcn_li_dtim_set) {
+		u32 dtim = pm ? max(READ_ONCE(brcmf_bcn_li_dtim), 0) : 0;
+
+		if (brcmf_fil_iovar_int_set(ifp, "bcn_li_dtim", dtim))
+			bphy_err(drvr, "Unable to set bcn_li_dtim %u\n", dtim);
+		else
+			ifp->bcn_li_dtim_set = dtim;
+	}
 
 done:
 	brcmf_dbg(TRACE, "Exit\n");
@@ -7821,7 +7857,7 @@ static s32 brcmf_config_dongle(struct brcmf_cfg80211_info *cfg)
 
 	brcmf_dongle_scantime(ifp);
 
-	power_mode = cfg->pwr_save ? PM_FAST : PM_OFF;
+	power_mode = cfg->pwr_save ? brcmf_ps_pm_mode() : PM_OFF;
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, power_mode);
 	if (err)
 		goto default_conf_out;

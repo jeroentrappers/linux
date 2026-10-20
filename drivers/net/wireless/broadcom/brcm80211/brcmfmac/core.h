@@ -184,6 +184,7 @@ enum brcmf_netif_stop_reason {
  * @pend_8021x_cnt: tracks outstanding number of 802.1x frames.
  * @pend_8021x_wait: used for signalling change in count.
  * @fwil_fwerr: flag indicating fwil layer should return firmware error codes.
+ * @bcn_li_dtim_set: bcn_li_dtim last written to the firmware (0: its default).
  */
 struct brcmf_if {
 	struct brcmf_pub *drvr;
@@ -202,6 +203,7 @@ struct brcmf_if {
 	struct in6_addr ipv6_addr_tbl[NDOL_MAX_ENTRIES];
 	u8 ipv6addr_idx;
 	bool fwil_fwerr;
+	u32 bcn_li_dtim_set;
 };
 
 int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp);
