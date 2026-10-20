@@ -43,6 +43,16 @@ config ARM_PSCI_CPUIDLE_DOMAIN
 	  which is needed to support the hierarchical DT based layout of the
 	  idle states.
 
+config ARM_APPLE_CPUIDLE
+	tristate "CPU idle driver for Apple A7-A11 cores"
+	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
+	help
+	  Select this to register a WFI-only CPU idle driver on Apple A7-A11
+	  cores. On A8 (Typhoon) it applies the iOS workaround around WFI
+	  (HID2 MMU prefetch disable). It also gives per-state idle statistics.
+	  Deeper states are not supported: these cores lose their state when
+	  powered down in idle.
+
 config ARM_BIG_LITTLE_CPUIDLE
 	bool "Support for ARM big.LITTLE processors"
 	depends on ARCH_VEXPRESS_TC2_PM || ARCH_EXYNOS || COMPILE_TEST
