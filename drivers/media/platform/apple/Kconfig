@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "Apple media platform drivers"
+
+config VIDEO_APPLE_ISP_T7000
+	tristate "Apple A8 (T7000) ISP bring-up test driver"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && ARM64
+	help
+	  Standalone bring-up/test module for the camera ISP of the Apple
+	  A8 (T7000, iPhone 6). It powers the ISP through direct PMGR
+	  writes, programs the ISP DART itself, loads apple/isp-t7000.bin
+	  and boots the ISP firmware stage by stage (module parameter
+	  "stage"). No V4L2 interface yet.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-isp.
