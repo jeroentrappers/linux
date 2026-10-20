@@ -102,6 +102,7 @@ struct isp_surf {
 	u32 iova;		/* absolute DART IOVA */
 	u32 size;		/* multiple of PAGE_SIZE */
 	u32 tag;		/* 4cc, for logs */
+	bool sm;		/* allocated by a SHAREDMALLOC request */
 	unsigned int npages;
 	struct page **pages;
 	dma_addr_t *dma;
@@ -114,6 +115,7 @@ struct isp_chan {
 	u8 *ring;		/* CPU view of num * 0x40 bytes */
 	u32 idx;		/* next slot to send (cmd) or to look at (reply/report) */
 	unsigned long msgs;
+	bool skip;		/* ring looked uninitialised at stage 7: not serviced */
 };
 
 struct t7000_isp {
@@ -148,7 +150,10 @@ struct t7000_isp {
 
 	/* runtime */
 	struct delayed_work poll_work;
-	bool poll_on;
+	bool poll_init, poll_on;
+	bool started;		/* START acked */
+	bool io_dead;		/* an IO command timed out: fw not answering */
+	u32 cmd_seq;
 	int irq;
 	atomic_t irq_count;
 	unsigned long dart_err_logged;
@@ -204,6 +209,9 @@ int isp_stage_chans(struct t7000_isp *isp);
 void isp_cpu_stop(struct t7000_isp *isp);
 
 /* isp-ipc.c */
+int isp_service(struct t7000_isp *isp);
+int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
+		 bool wait, u16 *status);
 int isp_stage_mbox(struct t7000_isp *isp);
 int isp_stage_start(struct t7000_isp *isp);
 int isp_stage_query(struct t7000_isp *isp);
