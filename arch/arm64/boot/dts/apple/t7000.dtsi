@@ -265,6 +265,21 @@
 			status = "disabled";
 		};
 
+		serial8: serial@20a0e0000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x2 0x0a0e0000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 166 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			pinctrl-0 = <&uart8_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_uart8>;
+			status = "disabled";
+		};
+
 		mca2: i2s@20a0a8000 {
 			compatible = "apple,t7000-mca";
 			reg = <0x2 0x0a0a8000 0x0 0x4000>,
@@ -486,6 +501,11 @@
 
 			uart5_pins: uart5-pins {
 				pinmux = <APPLE_PINMUX(57, 1)>;
+			};
+
+			uart8_pins: uart8-pins {
+				pinmux = <APPLE_PINMUX(58, 1)>,
+					 <APPLE_PINMUX(59, 1)>;
 			};
 
 			i2c1_pins: i2c1-pins {

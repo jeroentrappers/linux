@@ -308,3 +308,61 @@
 		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
 	};
 };
+
+/*
+ * ADT /arm-io/uart8/oscar: the M8 motion coprocessor. Phase 1 of its
+ * bring-up only exposes the UART, the rails and the reset line to userspace
+ * (tools/oscar/oscartest); the rails are read-only unless
+ * apple_pmic_regulator.oscar_rails=1.
+ */
+&i2c0 {
+	pmic@74 {
+		/* ADT function-sensor_power: PP3V0_IMU */
+		pmic_ldo4: ldo4@82 {
+			compatible = "apple,adi-pmic-ldo4";
+			reg = <0x82 0x1>;
+			regulator-name = "PP3V0_IMU";
+		};
+
+		/* ADT function-oscar_power1: PP1V2_OSCAR (VddCore) */
+		pmic_ldo16: ldo16@85 {
+			compatible = "apple,adi-pmic-ldo16";
+			reg = <0x85 0x1>;
+			regulator-name = "PP1V2_OSCAR";
+		};
+
+		/* ADT function-oscar_power2: PP1V8_OSCAR (VddIO) */
+		pmic_ldo18: ldo18@85 {
+			compatible = "apple,adi-pmic-ldo18";
+			reg = <0x85 0x1>;
+			regulator-name = "PP1V8_OSCAR";
+		};
+	};
+};
+
+&pmic_gpio {
+	/* ADT oscar function-reset: PMU GPIO 5, active low */
+	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
+			  "", "", "BT_REG_ON", "", "WL_REG_ON";
+};
+
+&serial8 {
+	status = "okay";
+};
+
+/ {
+	oscar-vdd-core {
+		compatible = "regulator-output";
+		vout-supply = <&pmic_ldo16>;
+	};
+
+	oscar-vddio {
+		compatible = "regulator-output";
+		vout-supply = <&pmic_ldo18>;
+	};
+
+	oscar-vdd-imu {
+		compatible = "regulator-output";
+		vout-supply = <&pmic_ldo4>;
+	};
+};

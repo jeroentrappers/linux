@@ -16,7 +16,10 @@ description:
 properties:
   compatible:
     enum:
+      - apple,adi-pmic-ldo4
       - apple,adi-pmic-ldo15
+      - apple,adi-pmic-ldo16
+      - apple,adi-pmic-ldo18
 
   reg:
     maxItems: 1
