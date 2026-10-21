@@ -6,6 +6,7 @@
  */
 #include <linux/firmware.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -47,6 +48,74 @@ static u16 rd16(const u8 *p, u32 off)
 static u32 rd32(const u8 *p, u32 off)
 {
 	return *(const u32 *)(p + off);
+}
+
+/*
+ * Optional pre-CH_START commands (one knob each, all off by default) to bisect why the fw
+ * returns every buffer empty. Opcodes are in the fw 13.42 dispatcher (re/isp/fw-cmd-table.txt);
+ * layouts from iOS 12 H6ISP.mediacapture (H6ISPDevice::*) and Asahi isp-cmd.c:
+ *  - iOS H6ISPFrameReceiver::startReceive, right before StartCamera (CH_START):
+ *    ALS_ENABLE 0xa1c (+0xc method, iOS 1), AE_FRAME_RATE_MAX/MIN_SET 0x208/0x20a (+0xc u16
+ *    fps * 256), EnableTNR = TEMPORAL_FILTER_START 0xc100 (+ MOTION_HISTORY_START 0xc102),
+ *    then CH_START, then the buffers (ISP_SendBuffers) -> bufs_after_start=1.
+ *  - Asahi isp_ch_configure_capture: CNR_START 0xa2f, AE_METERING_MODE_SET 0x8206 (3),
+ *    AE_STABILITY_SET 0x21a (32), AE_STABILITY_TO_STABLE_SET 0x229 (20), TEMPORAL_FILTER_ENABLE
+ *    0xc113. AE_START 0x200 (iOS EnableAE) is in neither start path but exists here.
+ * SBS_ENABLE 0x13b / MBNR 0xa3a do not exist in this fw.
+ */
+static uint isp_fps_max;	/* 0 = off; 7680 = 30 fps (Asahi ISP_FRAME_RATE_DEN) */
+module_param_named(fps_max, isp_fps_max, uint, 0644);
+static uint isp_fps_min;	/* 0 = off; 3840 = 15 fps (Asahi ISP_FRAME_RATE_DEN2) */
+module_param_named(fps_min, isp_fps_min, uint, 0644);
+static int isp_als = -1;	/* -1 = off; iOS startReceive sends method 1 */
+module_param_named(als, isp_als, int, 0644);
+static uint isp_tnr;		/* bit0 TF_START 0xc100, bit1 MH_START 0xc102, bit2 TF_ENABLE 0xc113 */
+module_param_named(tnr, isp_tnr, uint, 0644);
+static bool isp_cnr;		/* CNR_START 0xa2f */
+module_param_named(cnr, isp_cnr, bool, 0644);
+static int isp_ae_meter = -1;	/* AE_METERING_MODE_SET 0x8206; Asahi 3 */
+module_param_named(ae_meter, isp_ae_meter, int, 0644);
+static int isp_ae_stab = -1;	/* AE_STABILITY_SET 0x21a; Asahi 32 */
+module_param_named(ae_stab, isp_ae_stab, int, 0644);
+static int isp_ae_stab2 = -1;	/* AE_STABILITY_TO_STABLE_SET 0x229; Asahi 20 */
+module_param_named(ae_stab2, isp_ae_stab2, int, 0644);
+static bool isp_ae_start;	/* AE_START 0x200 */
+module_param_named(ae_start, isp_ae_start, bool, 0644);
+static bool isp_bufs_after_start;	/* iOS order: CH_START first, then post the buffers */
+module_param_named(bufs_after_start, isp_bufs_after_start, bool, 0644);
+
+/* Asahi-style tuning, after PREVIEW_STREAM_SET / SIF; never fatal (status logged). */
+static void isp_extra_cfg(struct t7000_isp *isp, u32 ch)
+{
+	if (READ_ONCE(isp_cnr))
+		isp_ch_simple(isp, "CNR_START", 0xa2f, ch, 0xc, 0, 0, false);
+	if (READ_ONCE(isp_ae_meter) >= 0)
+		isp_ch_simple(isp, "AE_METERING_MODE_SET", 0x8206, ch, 0x10, isp_ae_meter, 0, false);
+	if (READ_ONCE(isp_ae_stab) >= 0)
+		isp_ch_simple(isp, "AE_STABILITY_SET", 0x21a, ch, 0x10, isp_ae_stab, 0, false);
+	if (READ_ONCE(isp_ae_stab2) >= 0)
+		isp_ch_simple(isp, "AE_STABILITY_TO_STABLE_SET", 0x229, ch, 0x10, isp_ae_stab2, 0, false);
+}
+
+/* iOS startReceive order, right before CH_START; never fatal. */
+static void isp_extra_prestart(struct t7000_isp *isp, u32 ch)
+{
+	uint tnr = READ_ONCE(isp_tnr);
+
+	if (READ_ONCE(isp_ae_start))
+		isp_ch_simple(isp, "AE_START", 0x200, ch, 0xc, 0, 0, false);
+	if (READ_ONCE(isp_als) >= 0)
+		isp_ch_simple(isp, "ALS_ENABLE", 0xa1c, ch, 0x10, isp_als, 0, false);
+	if (READ_ONCE(isp_fps_max))
+		isp_ch_simple(isp, "AE_FRAME_RATE_MAX_SET", 0x208, ch, 0x10, isp_fps_max, 0, false);
+	if (READ_ONCE(isp_fps_min))
+		isp_ch_simple(isp, "AE_FRAME_RATE_MIN_SET", 0x20a, ch, 0x10, isp_fps_min, 0, false);
+	if (tnr & 1)
+		isp_ch_simple(isp, "TEMPORAL_FILTER_START", 0xc100, ch, 0xc, 0, 0, false);
+	if (tnr & 2)
+		isp_ch_simple(isp, "MOTION_HISTORY_START", 0xc102, ch, 0xc, 0, 0, false);
+	if (tnr & 4)
+		isp_ch_simple(isp, "TEMPORAL_FILTER_ENABLE", 0xc113, ch, 0xc, 0, 0, false);
 }
 
 /* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream. */
@@ -342,6 +411,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 		goto out;
 	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
 		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
+	isp_extra_cfg(isp, st->ch);
 	isp_config_meta(isp, buf);
 	ret = isp_alloc_bufs(isp, want);
 	if (ret)
@@ -354,7 +424,9 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 		dev_info(isp->dev, "stream_nostart=1: configured, no buffers posted, no CH_START\n");
 		goto out;
 	}
-	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
+	isp_extra_prestart(isp, st->ch);
+	if (!READ_ONCE(isp_bufs_after_start))
+		isp_stream_kick(isp);	/* every buffer is FREE: one or two lists on BUF_H2T */
 	if (READ_ONCE(isp_stream_nobufs))
 		dev_info(isp->dev, "stream_nobufs=1: CH_START with no buffer posted (only fw-allocated DMA, e.g. 'RAW0')\n");
 	isp_canary_arm(isp);		/* canary=1: before CH_START, so it is logged even if the SoC wedges */
@@ -362,6 +434,8 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	isp->skip_final_service = quiet != 0;
 	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
 	isp->skip_final_service = false;
+	if (!ret && READ_ONCE(isp_bufs_after_start))
+		isp_stream_kick(isp);
 	if (!ret && quiet)
 		isp_quiet_window(isp, quiet);
 	if (ret) {
