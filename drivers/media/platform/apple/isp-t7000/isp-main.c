@@ -63,7 +63,7 @@ MODULE_PARM_DESC(boot_timeout_ms, "timeout of each boot handshake (iOS: 10 s)");
 uint isp_cmd_timeout_ms = 2000;
 module_param_named(cmd_timeout_ms, isp_cmd_timeout_ms, uint, 0444);
 MODULE_PARM_DESC(cmd_timeout_ms, "timeout of one fw command (iOS: 2 s)");
-uint isp_max_shared_mb = 64;
+uint isp_max_shared_mb = 256;	/* full-res stills: 4 x 11.4 MB NV12 + the fw's 48 MB RAW */
 module_param_named(max_shared_mb, isp_max_shared_mb, uint, 0444);
 MODULE_PARM_DESC(max_shared_mb, "cap on SHAREDMALLOC memory");
 

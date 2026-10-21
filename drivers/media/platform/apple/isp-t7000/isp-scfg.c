@@ -11,6 +11,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 
+#include <uapi/linux/apple-isp-t7000.h>
 #include "isp.h"
 
 #define ISP_INFO_SIZE		0xc4	/* kext ISP_InitialSensorDetection */
@@ -81,6 +82,21 @@ static int isp_ae_stab2 = -1;	/* AE_STABILITY_TO_STABLE_SET 0x229; Asahi 20 */
 module_param_named(ae_stab2, isp_ae_stab2, int, 0644);
 static bool isp_ae_start;	/* AE_START 0x200 */
 module_param_named(ae_start, isp_ae_start, bool, 0644);
+/*
+ * Full-resolution presets (no binning) make the fw run the back end from a RAW frame in
+ * memory: CH_START asserts "CImageFlowH6.cpp, 2185: chEntryApple->icRawBufferOut != 0"
+ * (hw, 2026-10-21) unless it may use its own RAW buffer ('0WAR', SHAREDMALLOC at boot).
+ * iOS H6ISPCaptureStreamStart sends EnableLocalRawBufferMode(ch, 1) = 0x125 for that.
+ * -1 = for ISP_START_STILL only, 0 = never, 1 = every START.
+ */
+static int isp_raw_local;
+module_param_named(raw_local, isp_raw_local, int, 0644);
+MODULE_PARM_DESC(raw_local, "LOCAL_RAW_BUFFER_MODE 0x125 before CH_START (-1 = STILL starts only; accepted but not what the assert wants)");
+
+/* host RAW pool (fw type 3) buffers for STILL starts: not needed (the fw's RAW is a SHAREDMALLOC) */
+static bool isp_raw_pool;
+module_param_named(raw_pool, isp_raw_pool, bool, 0644);
+
 static bool isp_bufs_after_start;	/* iOS order: CH_START first, then post the buffers */
 module_param_named(bufs_after_start, isp_bufs_after_start, bool, 0644);
 
@@ -118,12 +134,37 @@ static void isp_extra_prestart(struct t7000_isp *isp, u32 ch)
 		isp_ch_simple(isp, "TEMPORAL_FILTER_ENABLE", 0xc113, ch, 0xc, 0, 0, false);
 }
 
-/* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream. */
+/*
+ * Preset choice for st->mode (ISP_START_*): the explicit index; the largest output (STILL);
+ * the smallest output >= 640x480 (default, PHOTO_VIEW). PHOTO_VIEW also wants the aspect
+ * ratio of the largest preset (st->full_w x st->full_h, set by the first pass) within 8 %.
+ */
+static bool isp_preset_ok(struct isp_stream *st, u32 p, u32 ow, u32 oh, u32 best_area)
+{
+	u64 a, b;
+
+	if (st->mode & ISP_START_PRESET)
+		return p == ((st->mode >> ISP_START_PRESET_SHIFT) & 0xff);
+	if (st->mode & ISP_START_STILL)
+		return ow == st->full_w && oh == st->full_h && best_area == U32_MAX;
+	if (!(st->mode & ISP_START_PHOTO_VIEW) && isp_preset >= 0)
+		return p == isp_preset;
+	if (ow < 640 || oh < 480 || ow * oh >= best_area)
+		return false;
+	if (!(st->mode & ISP_START_PHOTO_VIEW) || !st->full_w)
+		return true;
+	a = (u64)ow * st->full_h * 100;		/* ow/oh vs full_w/full_h, cross-multiplied */
+	b = (u64)st->full_w * oh;
+	return a <= b * 108 && a * 108 >= b * 100 * 100;
+}
+
+/* CH_INFO_GET + CAMERA_CONFIG_GET per preset; picks the preset to stream (isp_preset_ok). */
 static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
 {
 	struct isp_stream *st = &isp->st;
-	u32 p, best = U32_MAX, best_area = U32_MAX, ow, oh, small = U32_MAX, small_area = U32_MAX;
-	u16 small_dim[4] = {};
+	u32 p, n, best = U32_MAX, best_area = U32_MAX, small = U32_MAX, small_area = U32_MAX;
+	u32 full_area = 0;
+	u16 dim[ISP_MAX_PRESETS][4] = {};	/* in w, in h, out w, out h */
 	int ret;
 
 	memset(buf, 0, ISP_INFO_SIZE);
@@ -145,8 +186,9 @@ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
 	snprintf(st->sensor_name, sizeof(st->sensor_name), "%s",
 		 st->sensor_id == 0x237 ? "IMX237 rear" :
 		 st->sensor_id == 0x190 ? "IMX190 front" : "unknown");
-
-	for (p = 0; p < min_t(u32, st->npresets, ISP_MAX_PRESETS); p++) {
+	n = min_t(u32, st->npresets, ISP_MAX_PRESETS);
+	st->full_w = st->full_h = 0;
+	for (p = 0; p < n; p++) {
 		memset(buf, 0, ISP_CAMCFG_SIZE);
 		((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_CAMERA_CONFIG_GET;
 		*(u32 *)(buf + 8) = st->ch;
@@ -154,47 +196,60 @@ static int isp_pick_preset(struct t7000_isp *isp, u8 *buf)
 		ret = isp_ch_cmd(isp, "CAMERA_CONFIG_GET", buf, ISP_CAMCFG_SIZE, true);
 		if (ret)
 			return ret;
-		ow = rd16(buf, 0x14);
-		oh = rd16(buf, 0x16);
-		dev_info(isp->dev, "ch %u preset %u: in %ux%u out %ux%u, +0x18 %04x %04x +0x1c %04x %04x\n",
-			 st->ch, p, rd16(buf, 0x10), rd16(buf, 0x12), ow, oh, rd16(buf, 0x18),
-			 rd16(buf, 0x1a), rd16(buf, 0x1c), rd16(buf, 0x1e));
-		if (!ow || !oh || ow > 4096 || oh > 4096)
+		dev_dbg(isp->dev, "ch %u preset %u: in %ux%u out %ux%u, +0x18 %04x %04x +0x1c %04x %04x\n",
+			st->ch, p, rd16(buf, 0x10), rd16(buf, 0x12), rd16(buf, 0x14), rd16(buf, 0x16),
+			rd16(buf, 0x18), rd16(buf, 0x1a), rd16(buf, 0x1c), rd16(buf, 0x1e));
+		if (!rd16(buf, 0x14) || !rd16(buf, 0x16) || rd16(buf, 0x14) > 4096 || rd16(buf, 0x16) > 4096)
 			continue;
-		if (ow * oh < small_area) {	/* fallback when nothing is >= 640x480 */
+		dim[p][0] = rd16(buf, 0x10);
+		dim[p][1] = rd16(buf, 0x12);
+		dim[p][2] = rd16(buf, 0x14);
+		dim[p][3] = rd16(buf, 0x16);
+		/*
+		 * IMX190 (front, 1.2 MP) preset 3 claims 2592x1936: CH_START takes it, but no
+		 * frame ever comes and the fw stops answering (CH_STOP times out; hw
+		 * 2026-10-21). Its real full resolution is 1376x968 (presets 0-2).
+		 */
+		if (st->sensor_id == 0x190 && (u32)dim[p][2] * dim[p][3] > SZ_2M) {
+			dim[p][2] = dim[p][3] = 0;
+			continue;
+		}
+		if ((u32)dim[p][2] * dim[p][3] > full_area) {	/* the full-resolution preset */
+			full_area = (u32)dim[p][2] * dim[p][3];
+			st->full_w = dim[p][2];
+			st->full_h = dim[p][3];
+		}
+	}
+	for (p = 0; p < n; p++) {
+		u32 area = (u32)dim[p][2] * dim[p][3];
+
+		if (!area)
+			continue;
+		if (area < small_area) {	/* fallback when nothing is >= 640x480 */
 			small = p;
-			small_area = ow * oh;
-			small_dim[0] = rd16(buf, 0x10);
-			small_dim[1] = rd16(buf, 0x12);
-			small_dim[2] = ow;
-			small_dim[3] = oh;
+			small_area = area;
 		}
-		if (isp_preset >= 0 ? p == isp_preset :
-		    ow >= 640 && oh >= 480 && ow * oh < best_area) {
+		if (isp_preset_ok(st, p, dim[p][2], dim[p][3], best_area)) {
 			best = p;
-			best_area = ow * oh;
-			st->in_w = rd16(buf, 0x10);
-			st->in_h = rd16(buf, 0x12);
-			st->width = ow;
-			st->height = oh;
+			best_area = area;
 		}
 	}
-	if (best == U32_MAX && isp_preset < 0 && small != U32_MAX) {
+	if (best == U32_MAX && !(st->mode & ISP_START_PRESET) && (st->mode || isp_preset < 0))
 		best = small;
-		st->in_w = small_dim[0];
-		st->in_h = small_dim[1];
-		st->width = small_dim[2];
-		st->height = small_dim[3];
-	}
 	if (best == U32_MAX) {
-		dev_err(isp->dev, "ch %u: no usable preset (preset=%d)\n", st->ch, isp_preset);
+		dev_err(isp->dev, "ch %u: no usable preset (mode 0x%x, preset=%d)\n", st->ch, st->mode,
+			isp_preset);
 		return -EINVAL;
 	}
 	st->preset = best;
+	st->in_w = dim[best][0];
+	st->in_h = dim[best][1];
+	st->width = dim[best][2];
+	st->height = dim[best][3];
 	st->stride = ALIGN(st->width, 64);
 	st->bufsize = PAGE_ALIGN(st->stride * st->height * 3 / 2);
-	dev_info(isp->dev, "ch %u: streaming preset %u: %ux%u NV12, stride %u, buffer 0x%x\n",
-		 st->ch, best, st->width, st->height, st->stride, st->bufsize);
+	dev_info(isp->dev, "ch %u: streaming preset %u (mode 0x%x): %ux%u NV12, stride %u, buffer 0x%x\n",
+		 st->ch, best, st->mode, st->width, st->height, st->stride, st->bufsize);
 	return 0;
 }
 
@@ -246,6 +301,8 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 	st->meta_size = 0;
 	st->pool_id[ISP_POOL_META] = 1;		/* ch 0 ids seen on hw: META 1; fw: id = ch * n + index + 1 */
 	st->pool_id[ISP_POOL_RENDERED] = 2;
+	st->pool_id[ISP_POOL_RAW] = 4;
+	st->raw_size = 0;
 	if (isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_GET", buf, ISP_POOLGET_SIZE, true))
 		return;
 	for (i = 0; i < 15; i++) {
@@ -260,6 +317,10 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 			st->meta_size = rd32(buf, off + 8);
 		if (rd16(buf, off) <= ISP_POOL_RENDERED)	/* type 0 META, 1 RENDERED */
 			st->pool_id[rd16(buf, off)] = rd16(buf, off + 2);
+		if (rd16(buf, off) == ISP_FW_POOL_RAW && rd32(buf, off + 8) <= SZ_32M) {
+			st->pool_id[ISP_POOL_RAW] = rd16(buf, off + 2);
+			st->raw_size = rd32(buf, off + 8);
+		}
 	}
 	if (isp_pool_meta >= 0)
 		st->pool_id[ISP_POOL_META] = isp_pool_meta;
@@ -280,6 +341,18 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 	*(u32 *)(buf + 0x10) = st->meta_size;
 	*(u32 *)(buf + 0x14) = st->meta_size;
 	isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_SET(META)", buf, 0x9c, false);
+	if (!(st->mode & ISP_START_STILL) || !st->raw_size || !READ_ONCE(isp_raw_pool)) {
+		st->raw_size = 0;	/* binned presets stream without host RAW buffers */
+		return;
+	}
+	memset(buf, 0, 0x9c);
+	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_SET;
+	*(u32 *)(buf + 8) = st->ch;
+	*(u16 *)(buf + 0xc) = ISP_FW_POOL_RAW;
+	*(u16 *)(buf + 0xe) = ISP_MAX_RAW;
+	*(u32 *)(buf + 0x10) = st->raw_size;
+	*(u32 *)(buf + 0x14) = st->raw_size;
+	isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_SET(RAW)", buf, 0x9c, false);
 }
 
 /*
@@ -325,6 +398,17 @@ static int isp_alloc_bufs(struct t7000_isp *isp, u32 want)
 	}
 	st->nbufs = n;
 	st->bufsize = st->buf[0].surf->size;
+	st->nraw = 0;
+	for (i = 0; st->raw_size && i < ISP_MAX_RAW; i++) {
+		if (!st->raw[i].surf || st->raw[i].surf->size < st->raw_size)
+			st->raw[i].surf = isp_surf_alloc(isp, st->raw_size, 0x30574152 + (i << 24));
+		if (!st->raw[i].surf)
+			return -ENOMEM;
+		if (st->raw[i].state != BUF_FW)	/* (still held after a timed-out STOP) */
+			st->raw[i].state = BUF_FREE;
+	}
+	if (st->raw_size)
+		st->nraw = ISP_MAX_RAW;
 	return 0;
 }
 
@@ -337,8 +421,9 @@ struct isp_cmd_output_config {
 static_assert(sizeof(struct isp_cmd_output_config) == 0x38);
 
 /* ISP_IOC_START: camera 0 = rear = fw channel 0, 1 = front = channel 1 (kext row 0x2a). */
-int isp_stream_start(struct t7000_isp *isp, u32 camera)
+int isp_stream_start(struct t7000_isp *isp, u32 arg)
 {
+	u32 camera = arg & ISP_START_CAMERA_MASK, mode = arg & ~ISP_START_CAMERA_MASK;
 	struct isp_stream *st = &isp->st;
 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
 	u32 want;
@@ -346,7 +431,10 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	u8 *buf;
 	int ret;
 
-	if (camera > 1)
+	if (camera > 1 || hweight32(mode & (ISP_START_PHOTO_VIEW | ISP_START_STILL | ISP_START_PRESET)) > 1 ||
+	    (mode & ~(ISP_START_PHOTO_VIEW | ISP_START_STILL | ISP_START_PRESET |
+		      0xffu << ISP_START_PRESET_SHIFT)) ||
+	    (!(mode & ISP_START_PRESET) && (mode >> ISP_START_PRESET_SHIFT)))
 		return -EINVAL;
 	if (st->on)
 		return -EBUSY;
@@ -362,6 +450,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	 * rear <-> front switch on the same fd reuses them (no new allocation).
 	 */
 	want = 0;
+	st->mode = mode & ISP_START_PRESET ? 0 : mode;	/* (an index is per camera) */
 	if (!st->nbufs) {
 		st->ch = !camera;
 		if (!isp_pick_preset(isp, buf))
@@ -371,6 +460,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 				 !camera, camera);
 	}
 	st->ch = camera;
+	st->mode = mode;
 	ret = isp_pick_preset(isp, buf);
 	if (ret)
 		goto out;
@@ -411,6 +501,15 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 		goto out;
 	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
 		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
+	{
+		int rl = READ_ONCE(isp_raw_local);
+		bool on = rl > 0 || (rl < 0 && (st->mode & ISP_START_STILL));
+
+		if (on || st->raw_local[st->ch]) {	/* (switched off again for the next preview) */
+			isp_ch_simple(isp, "LOCAL_RAW_BUFFER_MODE", 0x125, st->ch, 0x10, on, 0, false);
+			st->raw_local[st->ch] = on;
+		}
+	}
 	isp_extra_cfg(isp, st->ch);
 	isp_config_meta(isp, buf);
 	ret = isp_alloc_bufs(isp, want);
@@ -442,9 +541,9 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 		isp_stream_stop(isp);
 		goto out;
 	}
-	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), %ux%u, %u buffer(s)%s\n", camera,
-		 st->sensor_name, st->sensor_id, st->width, st->height, st->nbufs,
-		 st->meta_size ? " + meta" : "");
+	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), preset %u, %ux%u, %u buffer(s)%s, %u raw\n",
+		 camera, st->sensor_name, st->sensor_id, st->preset, st->width, st->height, st->nbufs,
+		 st->meta_size ? " + meta" : "", st->nraw);
 out:
 	kfree(buf);
 	return ret;

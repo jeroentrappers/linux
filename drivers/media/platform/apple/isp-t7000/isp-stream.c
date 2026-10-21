@@ -57,8 +57,8 @@ static void isp_fill_entry(struct t7000_isp *isp, struct isp_bl_entry *e, u32 po
 	memset(e, 0, sizeof(*e));
 	e->pool = st->pool_id[pool];	/* fw pool id; the tag keeps our kind */
 	e->tag = ISP_TAG(pool, i);
-	if (pool == ISP_POOL_META) {
-		e->addr[0] = isp_rel(st->meta[i].surf->iova);
+	if (pool == ISP_POOL_META || pool == ISP_POOL_RAW) {
+		e->addr[0] = isp_rel((pool == ISP_POOL_RAW ? st->raw : st->meta)[i].surf->iova);
 		e->flags[0] = ISP_BUF_FILLED;
 		e->nplanes = 1;
 	} else {
@@ -109,6 +109,11 @@ static int isp_h2t_post(struct t7000_isp *isp, u32 n, const u32 *pool, const u32
 }
 
 /* Hand every FREE frame/meta buffer back to the fw, one list per H2T slot. isp->lock held. */
+static struct isp_sbuf *isp_sbuf_of(struct isp_stream *st, u32 pool, u32 i)
+{
+	return pool == ISP_POOL_META ? &st->meta[i] : pool == ISP_POOL_RAW ? &st->raw[i] : &st->buf[i];
+}
+
 void isp_stream_kick(struct t7000_isp *isp)
 {
 	struct isp_stream *st = &isp->st;
@@ -121,6 +126,12 @@ void isp_stream_kick(struct t7000_isp *isp)
 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
 		n = 0;
 		spin_lock(&st->frame_lock);
+		for (i = 0; i < st->nraw && n < ISP_BUFLIST_MAX; i++) {
+			if (st->raw[i].state == BUF_FREE) {
+				pool[n] = ISP_POOL_RAW;
+				idx[n++] = i;
+			}
+		}
 		for (i = 0; i < st->nbufs && n < ISP_BUFLIST_MAX; i++) {
 			/* meta only when this START configured a META pool (stale surfaces stay idle) */
 			if (st->meta_size && st->meta[i].surf && st->meta[i].state == BUF_FREE) {
@@ -134,10 +145,7 @@ void isp_stream_kick(struct t7000_isp *isp)
 		}
 		/* claim them before posting: a T2H for them cannot come earlier than the post */
 		for (i = 0; i < n; i++) {
-			if (pool[i] == ISP_POOL_META)
-				st->meta[idx[i]].state = BUF_FW;
-			else
-				st->buf[idx[i]].state = BUF_FW;
+			isp_sbuf_of(st, pool[i], idx[i])->state = BUF_FW;
 		}
 		spin_unlock(&st->frame_lock);
 		if (!n)
@@ -145,10 +153,7 @@ void isp_stream_kick(struct t7000_isp *isp)
 		if (isp_h2t_post(isp, n, pool, idx)) {
 			spin_lock(&st->frame_lock);	/* slot busy: give them back, retry later */
 			for (i = 0; i < n; i++) {
-				if (pool[i] == ISP_POOL_META)
-					st->meta[idx[i]].state = BUF_FREE;
-				else
-					st->buf[idx[i]].state = BUF_FREE;
+				isp_sbuf_of(st, pool[i], idx[i])->state = BUF_FREE;
 			}
 			spin_unlock(&st->frame_lock);
 			return;
@@ -192,15 +197,15 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, b
 	struct isp_sbuf *b;
 	bool filled;
 
-	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
-	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
+	if ((e->tag >> 32) != ISP_TAG_MAGIC || pool >= ISP_POOL_KINDS ||
+	    i >= (pool == ISP_POOL_RAW ? st->nraw : st->nbufs) ||
 	    (e->pool & 0x0fffffff) != st->pool_id[pool]) {
 		st->errors++;
 		dev_warn_ratelimited(isp->dev, "T2H: unknown buffer: pool 0x%x tag 0x%016llx addr 0x%08x\n",
 				     e->pool, e->tag, e->addr[0]);
 		return;
 	}
-	b = pool == ISP_POOL_META ? &st->meta[i] : &st->buf[i];
+	b = isp_sbuf_of(st, pool, i);
 	filled = rendered || (e->flags[0] & ISP_BUF_FILLED);
 	if (READ_ONCE(isp_stream_dump))
 		dev_info(isp->dev, "T2H: pool %u idx %u planes %u addr %08x %08x flags %08x %08x\n",
@@ -215,9 +220,9 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, b
 	}
 	if (pool == ISP_POOL_RENDERED && !filled && !READ_ONCE(isp_keep_empty))
 		st->empty++;	/* CH_BUFFER_RETURN (word2 0x30000000): recycle, not a frame */
-	if (pool == ISP_POOL_META || !st->on || st->stopping ||
+	if (pool != ISP_POOL_RENDERED || !st->on || st->stopping ||
 	    (!filled && !READ_ONCE(isp_keep_empty))) {
-		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
+		b->state = BUF_FREE;	/* meta/raw, empty, or a buffer handed back by CH_BUFFER_RETURN */
 		spin_unlock(&st->frame_lock);
 		return;
 	}

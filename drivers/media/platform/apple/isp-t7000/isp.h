@@ -146,6 +146,10 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
 #define ISP_MAX_BUFS		8
 #define ISP_POOL_META		0
 #define ISP_POOL_RENDERED	1
+#define ISP_POOL_RAW		2	/* fw pool type 3: the RAW frame full-res presets need */
+#define ISP_POOL_KINDS		3
+#define ISP_FW_POOL_RAW		3
+#define ISP_MAX_RAW		2
 #define ISP_BUFLIST_SLOT	0x200	/* one H2T list per BUF_H2T ring slot */
 #define ISP_BUFLIST_MAX		8	/* entries per list (kext clamps T2H lists to 8) */
 
@@ -163,13 +167,18 @@ struct isp_sbuf {
 struct isp_stream {
 	bool on, stopping;
 	u32 ch, sensor_id, preset, npresets;
+	u32 mode;		/* ISP_START_* flags of the running / next START */
+	u32 full_w, full_h;	/* largest preset output of st->ch */
+	bool raw_local[2];	/* LOCAL_RAW_BUFFER_MODE sent as on, per channel */
 	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
 	u32 meta_size;
-	u32 pool_id[2];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
+	u32 pool_id[ISP_POOL_KINDS];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
 	u32 empty;		/* buffers returned without the 0x40000000 data flag */
 	char sensor_name[32];
 	struct isp_sbuf buf[ISP_MAX_BUFS];
 	struct isp_sbuf meta[ISP_MAX_BUFS];
+	struct isp_sbuf raw[ISP_MAX_RAW];
+	u32 raw_size, nraw;	/* RAW pool: size from POOL_CONFIG_GET; buffers posted this START */
 	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
 	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
 	u32 seq;
@@ -387,7 +396,7 @@ void isp_sensor_power_off(struct t7000_isp *isp);
 
 /* isp-stream.c */
 u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2);
-int isp_stream_start(struct t7000_isp *isp, u32 camera);
+int isp_stream_start(struct t7000_isp *isp, u32 arg);
 void isp_stream_stop(struct t7000_isp *isp);
 void isp_stream_release(struct t7000_isp *isp, u32 index);
 void isp_stream_kick(struct t7000_isp *isp);

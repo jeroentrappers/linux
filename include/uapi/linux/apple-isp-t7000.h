@@ -49,7 +49,20 @@ struct isp_frame {
 };
 
 #define ISP_IOC_INFO		_IOR('I', 1, struct isp_info)
-#define ISP_IOC_START		_IOW('I', 2, __u32)
+/*
+ * ISP_IOC_START argument: the camera in bits 7:0 (0 = rear, 1 = front) plus at most one
+ * preset-choice flag. 0 / 1 alone keep the old choice (smallest preset >= 640x480; the
+ * "preset" module parameter overrides it). Drivers before these flags reject them with
+ * EINVAL, so a caller can retry with the bare camera number.
+ */
+#define ISP_START_CAMERA_MASK	0xff
+#define ISP_START_PHOTO_VIEW	0x100	/* viewfinder for stills: smallest preset >= 640x480 with
+					 * the aspect ratio of the full-resolution one (4:3) */
+#define ISP_START_STILL		0x200	/* the sensor's full-resolution preset (largest output) */
+#define ISP_START_PRESET	0x400	/* exactly the preset in bits 23:16 */
+#define ISP_START_PRESET_SHIFT	16
+
+#define ISP_IOC_START		_IOW('I', 2, __u32)	/* *arg: camera | ISP_START_* */
 #define ISP_IOC_STOP		_IO('I', 3)
 #define ISP_IOC_RELEASE		_IOW('I', 4, __u32)
 

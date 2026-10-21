@@ -28,7 +28,7 @@
 #include "isp.h"
 
 #define ISP_AIC_IRQ		91	/* ADT isp interrupts[0]; the kext uses only index 0 */
-#define ISP_SM_MAX		SZ_32M	/* largest single SHAREDMALLOC we honour */
+#define ISP_SM_MAX		SZ_64M	/* largest single SHAREDMALLOC we honour (full-res presets: '0WAR' 0x2db887e) */
 #define ISP_IRQ_STORM		100000	/* give up on the IRQ after this many */
 #define ISP_IRQ_SAFETY_MS	1000	/* poll interval while the IRQ is in use */
 
@@ -118,6 +118,21 @@ void isp_term_flush(struct t7000_isp *isp)
  * below), reply 1. Words 1/2 of the reply are 0 (kext 0x845ba18).
  * A failed alloc replies 1 (= NULL) so the fw sees a failure, not a hang.
  */
+/*
+ * A freed SHAREDMALLOC surface with the same tag and a fitting size (the fw re-allocates
+ * its RAW buffer '0WAR' on every preset change: 13 MB binned, 48 MB full-res), so a
+ * preview <-> still switch does not map a new one each time.
+ */
+static struct isp_surf *isp_sm_reuse(struct t7000_isp *isp, u32 size, u32 tag)
+{
+	struct isp_surf *s;
+
+	list_for_each_entry(s, &isp->surfs, list)
+		if (s->sm && s->sm_freed && s->tag == tag && s->size >= size && s->size / 2 < size)
+			return s;
+	return NULL;
+}
+
 static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
 {
 	u32 rel = w0 & ~3U;
@@ -134,6 +149,13 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
 			dev_err(isp->dev, "SHAREDMALLOC: implausible size 0x%x '%4.4s', replying NULL\n",
 				size, (char *)&tag);
 			return 1;
+		}
+		s = isp_sm_reuse(isp, max_t(u32, size, 0x1000), tag);
+		if (s) {
+			s->sm_freed = false;
+			dev_info(isp->dev, "SHAREDMALLOC: alloc 0x%x '%4.4s' -> fw-rel 0x%08x (reused)\n",
+				 size, (char *)&tag, isp_rel(s->iova));
+			return isp_rel(s->iova) | 1;
 		}
 		s = isp_surf_alloc(isp, max_t(u32, size, 0x1000), tag);
 		if (!s) {
