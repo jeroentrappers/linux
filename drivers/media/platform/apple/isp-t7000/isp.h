@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
@@ -86,6 +87,9 @@
 #define ISP_CHAN_DESC_SIZE	0x100
 #define ISP_MAX_CHANS		0x20
 #define ISP_CMD_BUF_SIZE	0x400
+#define ISP_TERM_MAX		0x80	/* kext caps TERMINAL strings at 0x80 */
+#define ISP_TERM_LINES		64	/* fwlog=1: lines buffered until printed unlocked */
+#define ISP_TERM_SHOW		200	/* fwlog=1: lines printed before rate-limiting */
 
 enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
 
@@ -157,10 +161,16 @@ struct t7000_isp {
 	int irq;
 	atomic_t irq_count;
 	unsigned long dart_err_logged;
+
+	/* fw TERMINAL lines: dev_dbg, or (fwlog=1) buffered and printed without isp->lock */
+	spinlock_t term_lock;
+	char term_buf[ISP_TERM_LINES][ISP_TERM_MAX + 1];
+	unsigned int term_head, term_count;
+	unsigned long term_lines, term_shown, term_dropped;
 };
 
 /* module parameters (isp-main.c) */
-extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful;
+extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwlog;
 extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
 extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
 
@@ -210,6 +220,7 @@ void isp_cpu_stop(struct t7000_isp *isp);
 
 /* isp-ipc.c */
 int isp_service(struct t7000_isp *isp);
+void isp_term_flush(struct t7000_isp *isp);
 int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
 		 bool wait, u16 *status);
 int isp_stage_mbox(struct t7000_isp *isp);

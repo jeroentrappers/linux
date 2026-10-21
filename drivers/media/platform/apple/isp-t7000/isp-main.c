@@ -38,6 +38,9 @@ MODULE_PARM_DESC(smmu_en, "1 = also set SMMU+0xc byte[sid] |= 0x80 like iOS (def
 int isp_graceful = 1;
 module_param_named(graceful, isp_graceful, int, 0444);
 MODULE_PARM_DESC(graceful, "1 = STOP + POWER_DOWN handshake before halting a booted fw");
+int isp_fwlog;
+module_param_named(fwlog, isp_fwlog, int, 0644);
+MODULE_PARM_DESC(fwlog, "1 = print fw TERMINAL lines (ISPCPU:) at info level, rate-limited; default dev_dbg");
 uint isp_fw_iova;
 module_param_named(fw_iova, isp_fw_iova, uint, 0444);
 MODULE_PARM_DESC(fw_iova, "DART IOVA of the firmware (default 0: fw-relative == absolute)");
@@ -108,6 +111,7 @@ static void isp_teardown(struct t7000_isp *isp)
 	}
 	isp->done = 0;
 	mutex_unlock(&isp->lock);
+	isp_term_flush(isp);
 	isp_pmgr_log(isp, "after teardown");
 }
 
@@ -129,6 +133,7 @@ static int isp_run(struct t7000_isp *isp)
 		mutex_lock(&isp->lock);
 		ret = isp_stages[n](isp);
 		mutex_unlock(&isp->lock);
+		isp_term_flush(isp);
 		if (ret) {
 			dev_err(isp->dev, "stage %d: FAILED (%d), unwinding\n", n, ret);
 			return ret;
@@ -153,6 +158,7 @@ static int __init isp_init(void)
 	if (!isp)
 		return -ENOMEM;
 	mutex_init(&isp->lock);
+	spin_lock_init(&isp->term_lock);
 	INIT_LIST_HEAD(&isp->surfs);
 	atomic_set(&isp->irq_count, 0);
 	isp->irq = -1;

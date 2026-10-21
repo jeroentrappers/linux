@@ -27,7 +27,6 @@
 #include "isp.h"
 
 #define ISP_AIC_IRQ		91	/* ADT isp interrupts[0]; the kext uses only index 0 */
-#define ISP_TERM_MAX		0x80	/* kext caps TERMINAL strings at 0x80 */
 #define ISP_SM_MAX		SZ_32M	/* largest single SHAREDMALLOC we honour */
 #define ISP_IRQ_STORM		100000	/* give up on the IRQ after this many */
 #define ISP_IRQ_SAFETY_MS	1000	/* poll interval while the IRQ is in use */
@@ -67,7 +66,49 @@ static void isp_terminal(struct t7000_isp *isp, u32 rel, u32 len)
 	for (i = 0; i < len; i++)
 		if (buf[i] < 0x20 || buf[i] > 0x7e)
 			buf[i] = '.';
-	dev_info(isp->dev, "ISPCPU: %s\n", buf);
+	isp->term_lines++;
+	if (!READ_ONCE(isp_fwlog)) {
+		dev_dbg(isp->dev, "ISPCPU: %s\n", buf);
+		return;
+	}
+	/* printing (fbcon!) under isp->lock could stretch a command wait: defer it */
+	spin_lock(&isp->term_lock);
+	if (isp->term_count < ISP_TERM_LINES) {
+		strscpy(isp->term_buf[(isp->term_head + isp->term_count) % ISP_TERM_LINES], buf,
+			ISP_TERM_MAX + 1);
+		isp->term_count++;
+	} else {
+		isp->term_dropped++;
+	}
+	spin_unlock(&isp->term_lock);
+}
+
+/* Print buffered TERMINAL lines. Call without isp->lock. */
+void isp_term_flush(struct t7000_isp *isp)
+{
+	char line[ISP_TERM_MAX + 1];
+	unsigned long dropped;
+
+	for (;;) {
+		spin_lock(&isp->term_lock);
+		if (!isp->term_count) {
+			dropped = isp->term_dropped;
+			isp->term_dropped = 0;
+			spin_unlock(&isp->term_lock);
+			break;
+		}
+		strscpy(line, isp->term_buf[isp->term_head], sizeof(line));
+		isp->term_head = (isp->term_head + 1) % ISP_TERM_LINES;
+		isp->term_count--;
+		spin_unlock(&isp->term_lock);
+		if (isp->term_shown++ < ISP_TERM_SHOW)
+			dev_info(isp->dev, "ISPCPU: %s\n", line);
+		else
+			dev_info_ratelimited(isp->dev, "ISPCPU: %s\n", line);
+	}
+	if (dropped)
+		dev_warn(isp->dev, "ISPCPU: %lu line(s) dropped (buffer full while a command was waiting)\n",
+			 dropped);
 }
 
 /*
@@ -303,6 +344,7 @@ static irqreturn_t isp_irq_thread(int irq, void *data)
 	isp_service(isp);
 	isp_dart_fault(isp);
 	mutex_unlock(&isp->lock);
+	isp_term_flush(isp);
 	return IRQ_HANDLED;
 }
 
@@ -356,6 +398,7 @@ static void isp_poll_fn(struct work_struct *work)
 		isp_dart_fault(isp);
 	}
 	mutex_unlock(&isp->lock);
+	isp_term_flush(isp);
 	if (n && isp->irq >= 0)
 		dev_info_ratelimited(isp->dev, "safety poll handled %d message(s) the IRQ did not (irqs so far: %d)\n",
 				     n, atomic_read(&isp->irq_count));
@@ -473,6 +516,11 @@ void isp_ipc_stop(struct t7000_isp *isp)
 		isp->poll_init = false;
 		dev_info(isp->dev, "poll worker stopped\n");
 	}
+	isp_term_flush(isp);
+	if (isp->term_lines)
+		dev_info(isp->dev, "TERMINAL: %lu fw line(s), %s\n", isp->term_lines,
+			 isp_fwlog ? "printed as ISPCPU: (rate-limited)" :
+				     "not printed (fwlog=0; dynamic debug or fwlog=1 shows them)");
 	for (i = 0; i < isp->nchans; i++)
 		if (isp->chans[i].msgs)
 			dev_info(isp->dev, "ring '%s': %lu message(s)\n", isp->chans[i].name,
