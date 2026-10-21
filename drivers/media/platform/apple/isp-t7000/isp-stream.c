@@ -48,7 +48,7 @@ static void isp_fill_entry(struct t7000_isp *isp, struct isp_bl_entry *e, u32 po
 	struct isp_stream *st = &isp->st;
 
 	memset(e, 0, sizeof(*e));
-	e->pool = pool;
+	e->pool = st->pool_id[pool];	/* fw pool id; the tag keeps our kind */
 	e->tag = ISP_TAG(pool, i);
 	if (pool == ISP_POOL_META) {
 		e->addr[0] = isp_rel(st->meta[i].surf->iova);
@@ -181,11 +181,12 @@ static void isp_frame_limit(struct isp_stream *st)
 static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
 {
 	struct isp_stream *st = &isp->st;
-	u32 pool = e->pool & 0x0fffffff, i = e->tag & 0xffff;
+	u32 pool = (e->tag >> 16) & 0xffff, i = e->tag & 0xffff;
 	struct isp_sbuf *b;
 
-	if ((e->tag >> 32) != ISP_TAG_MAGIC || ((e->tag >> 16) & 0xffff) != pool ||
-	    i >= st->nbufs || (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED)) {
+	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
+	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
+	    (e->pool & 0x0fffffff) != st->pool_id[pool]) {
 		st->errors++;
 		dev_warn_ratelimited(isp->dev, "T2H: unknown buffer: pool 0x%x tag 0x%016llx addr 0x%08x\n",
 				     e->pool, e->tag, e->addr[0]);
@@ -203,8 +204,11 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
 				     pool, i, b->state);
 		return;
 	}
-	if (pool == ISP_POOL_META || !st->on || st->stopping) {
-		b->state = BUF_FREE;	/* meta, or a buffer handed back by CH_BUFFER_RETURN */
+	if (pool == ISP_POOL_RENDERED && !(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))
+		st->empty++;	/* no data flag (fw 0xa8ff0): recycle, not a frame */
+	if (pool == ISP_POOL_META || !st->on || st->stopping ||
+	    (!(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))) {
+		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
 		spin_unlock(&st->frame_lock);
 		return;
 	}

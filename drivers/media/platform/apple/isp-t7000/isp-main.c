@@ -150,6 +150,16 @@ MODULE_PARM_DESC(quiet_ms, "N > 0: after CH_START, N ms (max 10000) with no ISP 
 int isp_stream_nobufs;
 module_param_named(stream_nobufs, isp_stream_nobufs, int, 0644);
 MODULE_PARM_DESC(stream_nobufs, "1 = CH_START without posting any frame/meta buffer (only the fw's own SHAREDMALLOC buffers get DMA)");
+/* fw pool ids (re/HW-TEST-2026-10-21.md step 15): the BUF list +0x1c indexes the fw's pool table by id, not type */
+int isp_pool_meta = -1;
+module_param_named(pool_meta, isp_pool_meta, int, 0644);
+MODULE_PARM_DESC(pool_meta, "fw pool id for META buffers in the BUF lists (-1 = the type-0 record's id from POOL_CONFIG_GET, else 1)");
+int isp_pool_frame = -1;
+module_param_named(pool_frame, isp_pool_frame, int, 0644);
+MODULE_PARM_DESC(pool_frame, "fw pool id for frame (RENDERED) buffers (-1 = the type-1 record's id from POOL_CONFIG_GET, else 2)");
+int isp_keep_empty;
+module_param_named(keep_empty, isp_keep_empty, int, 0644);
+MODULE_PARM_DESC(keep_empty, "1 = deliver frames the fw returned without the data flag 0x40000000 too (default: recycle them)");
 int isp_dart_ios;
 module_param_named(dart_ios, isp_dart_ios, int, 0444);
 MODULE_PARM_DESC(dart_ios, "1 = also program DART diag(+0x20)=0x100, fetch(+0x30)=0xe0303, bypass(+0x2c)=0 and SMMU bypass(+0x2c)=0 like the iOS DART restore");

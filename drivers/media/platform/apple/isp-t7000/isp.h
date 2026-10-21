@@ -164,6 +164,8 @@ struct isp_stream {
 	u32 ch, sensor_id, preset, npresets;
 	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
 	u32 meta_size;
+	u32 pool_id[2];		/* fw pool id per ISP_POOL_* kind (BUF list +0x1c), from POOL_CONFIG_GET */
+	u32 empty;		/* buffers returned without the 0x40000000 data flag */
 	char sensor_name[32];
 	struct isp_sbuf buf[ISP_MAX_BUFS];
 	struct isp_sbuf meta[ISP_MAX_BUFS];
@@ -301,7 +303,7 @@ extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_
 extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
 /* wedge hunt (re/CAMERA-WEDGE.md), all default off */
 extern uint isp_quiet_ms;
-extern int isp_stream_nobufs, isp_dart_ios, isp_canary;
+extern int isp_stream_nobufs, isp_dart_ios, isp_canary, isp_pool_meta, isp_pool_frame, isp_keep_empty;
 extern unsigned long long isp_canary_base;
 
 /*

@@ -173,7 +173,10 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 	memset(buf, 0, ISP_POOLGET_SIZE);
 	((struct isp_cmd_hdr *)buf)->opcode = CISP_CMD_CH_BUFFER_POOL_CONFIG_GET;
 	*(u32 *)(buf + 8) = st->ch;
+	*(u32 *)(buf + 0xc) = 15;	/* fw 0x16b90: max records; 0 = "Not all the supported pools are reported!" after 1 */
 	st->meta_size = 0;
+	st->pool_id[ISP_POOL_META] = 1;		/* ch 0 ids seen on hw: META 1; fw: id = ch * n + index + 1 */
+	st->pool_id[ISP_POOL_RENDERED] = 2;
 	if (isp_ch_cmd(isp, "BUFFER_POOL_CONFIG_GET", buf, ISP_POOLGET_SIZE, true))
 		return;
 	for (i = 0; i < 15; i++) {
@@ -186,7 +189,15 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 			 rd16(buf, off + 0xe));
 		if (rd16(buf, off) == ISP_POOL_META && rd32(buf, off + 8) <= SZ_1M)
 			st->meta_size = rd32(buf, off + 8);
+		if (rd16(buf, off) <= ISP_POOL_RENDERED)	/* type 0 META, 1 RENDERED */
+			st->pool_id[rd16(buf, off)] = rd16(buf, off + 2);
 	}
+	if (isp_pool_meta >= 0)
+		st->pool_id[ISP_POOL_META] = isp_pool_meta;
+	if (isp_pool_frame >= 0)
+		st->pool_id[ISP_POOL_RENDERED] = isp_pool_frame;
+	dev_info(isp->dev, "pool ids: META %u, RENDERED %u\n", st->pool_id[ISP_POOL_META],
+		 st->pool_id[ISP_POOL_RENDERED]);
 	if (!st->meta_size) {
 		dev_warn(isp->dev, "no META pool reported: not submitting meta buffers\n");
 		return;

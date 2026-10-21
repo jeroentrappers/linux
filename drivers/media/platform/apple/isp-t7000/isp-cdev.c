@@ -227,6 +227,7 @@ int isp_cdev_init(struct t7000_isp *isp)
 	debugfs_create_u64("errors", 0444, isp->dbg, &st->errors);
 	debugfs_create_u64("h2t_posts", 0444, isp->dbg, &st->h2t_posts);
 	debugfs_create_u64("h2t_busy", 0444, isp->dbg, &st->h2t_busy);
+	debugfs_create_u32("empty", 0444, isp->dbg, &st->empty);
 	debugfs_create_u64("t2h_msgs", 0444, isp->dbg, &st->t2h_msgs);
 	dev_info(isp->dev, "stream: /dev/isp0 ready (debugfs apple-isp/)\n");
 	return 0;
