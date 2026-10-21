@@ -365,6 +365,7 @@ struct brcmf_pciedev_info {
 	bool console_active;
 	struct timer_list timer;
 #endif
+	bool kept_d0;
 };
 
 struct brcmf_pcie_ringbuf {
@@ -2654,6 +2655,18 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 #ifdef CONFIG_PM
 
 
+/*
+ * LOCAL (Hoolock, T7000): by default the function stays in D0 across system
+ * suspend. The n61 root port runs without ASPM because iOS cannot touch config
+ * space while the link is in L1/L2 (acpie-l1ss-workaround), and D3hot puts the
+ * link into PCI-PM L1 with a config write on the way out. cfg80211 already
+ * disassociates and enables MPC before this runs, so the radio is off either
+ * way. pcie_d3=1 restores the D3 handshake (D3_INFORM + PCI core D3hot).
+ */
+static bool brcmf_pcie_d3;
+module_param_named(pcie_d3, brcmf_pcie_d3, bool, 0644);
+MODULE_PARM_DESC(pcie_d3, "Put the PCIe function into D3 on system suspend (default: keep it in D0)");
+
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
@@ -2665,6 +2678,20 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	devinfo = bus->bus_priv.pcie->devinfo;
 
 	brcmf_pcie_fwcon_timer(devinfo, false);
+
+	devinfo->kept_d0 = !READ_ONCE(brcmf_pcie_d3);
+	if (devinfo->kept_d0) {
+		/*
+		 * Firmware and link stay as they are. With the config space
+		 * saved here the PCI core leaves this function and the root
+		 * port in D0 (no D3hot, so the link stays in L0); on resume
+		 * it only writes the saved config back, still in L0.
+		 */
+		pci_save_state(devinfo->pdev);
+		brcmf_dbg(PCIE, "staying in D0\n");
+		return 0;
+	}
+
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	devinfo->mbdata_completed = false;
@@ -2696,6 +2723,12 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+
+	if (devinfo->kept_d0) {
+		devinfo->kept_d0 = false;
+		brcmf_pcie_fwcon_timer(devinfo, true);
+		return 0;
+	}
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
