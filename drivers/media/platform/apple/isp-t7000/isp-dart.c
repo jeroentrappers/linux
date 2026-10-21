@@ -12,6 +12,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/iopoll.h>
 #include <linux/platform_device.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 
@@ -81,6 +82,7 @@ int isp_dart_init(struct t7000_isp *isp)
 	u32 m = tcr_mask(), tcr, err;
 	int sid, i;
 
+	BUILD_BUG_ON(PAGE_SIZE != SZ_4K);	/* surface pages == DART pages, 9-bit L2 index */
 	isp->l1 = dma_alloc_coherent(isp->dev, PAGE_SIZE, &isp->l1_dma, GFP_KERNEL);
 	if (!isp->l1)
 		return -ENOMEM;

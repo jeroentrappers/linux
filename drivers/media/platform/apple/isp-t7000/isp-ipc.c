@@ -121,6 +121,12 @@ static u32 isp_sm_request(struct t7000_isp *isp, u32 w0, u32 size, u32 tag)
 {
 	u32 rel = w0 & ~3U;
 	struct isp_surf *s;
+	u8 *t = (u8 *)&tag;
+	int i;
+
+	for (i = 0; i < 4; i++)		/* the tag is only for logs: keep dmesg printable */
+		if (t[i] < 0x20 || t[i] > 0x7e)
+			t[i] = '.';
 
 	if (!rel) {
 		if (size > ISP_SM_MAX) {
@@ -225,7 +231,8 @@ int isp_service(struct t7000_isp *isp)
 	for (i = 0; i < isp->nchans; i++) {
 		struct isp_chan *c = &isp->chans[i];
 
-		if (!c->ring || c->type == CHAN_CMD)
+		/* type 0 = host->fw; unknown types (>= 3) are never answered */
+		if (!c->ring || (c->type != CHAN_REPLY && c->type != CHAN_REPORT))
 			continue;
 		n += isp_drain(isp, c);
 	}
@@ -642,12 +649,17 @@ void isp_fw_shutdown(struct t7000_isp *isp)
 		dev_warn(isp->dev, "graceful shutdown skipped: the fw is not answering IO\n");
 		goto out;
 	}
-	ret = isp_cmd_simple(isp, "STOP", &h, sizeof(h), sizeof(h), NULL);
-	if (ret) {
-		dev_err(isp->dev, "STOP failed (%d): skipping POWER_DOWN, hard stop follows\n", ret);
-		goto out;
+	if (!isp->started) {
+		dev_info(isp->dev, "START was never sent: skipping STOP\n");
+	} else {
+		ret = isp_cmd_simple(isp, "STOP", &h, sizeof(h), sizeof(h), NULL);
+		if (ret) {
+			dev_err(isp->dev, "STOP failed (%d): skipping POWER_DOWN, hard stop follows\n",
+				ret);
+			goto out;
+		}
+		isp->started = false;
 	}
-	isp->started = false;
 	isp_wr(isp, ISP_GPIO(0), ISP_MAGIC_ARGS);
 	h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_POWER_DOWN };
 	ret = isp_cmd_send(isp, &h, sizeof(h), sizeof(h), false, NULL);

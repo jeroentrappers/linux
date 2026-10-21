@@ -241,11 +241,15 @@ int isp_stage_args(struct t7000_isp *isp)
 	a[5] = isp->heap ? isp->heapsize : 0;
 	a[6] = isp_platform_id;
 	a[0xf] = 0xc;
-	for (i = 0; i < ISP_ARGS_SIZE / 4; i += 8)
-		dev_info(isp->dev, "bootargs[%02x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-			 i, a[i], a[i + 1], a[i + 2], a[i + 3], a[i + 4], a[i + 5],
-			 i + 6 < ISP_ARGS_SIZE / 4 ? a[i + 6] : 0,
-			 i + 7 < ISP_ARGS_SIZE / 4 ? a[i + 7] : 0);
+	{
+		u32 d[32] = {};		/* 0x74 bytes = 29 words, padded for the dump */
+
+		memcpy(d, a, ISP_ARGS_SIZE);
+		for (i = 0; i < ISP_ARGS_SIZE / 4; i += 8)
+			dev_info(isp->dev, "bootargs[%02x]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+				 i, d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5],
+				 d[i + 6], d[i + 7]);
+	}
 	dma_wmb();
 	isp_wr(isp, ISP_GPIO(0), isp_rel(isp->ipc->iova + args));
 	dev_info(isp->dev, "gpio0 = 0x%08x (fw-rel boot args), gpio7 = 0xf7fbdff9\n",
@@ -261,8 +265,8 @@ int isp_stage_chans(struct t7000_isp *isp)
 	u32 tbl = isp_rd(isp, ISP_GPIO(0)), n, j;
 	const u8 *d = isp_translate(isp, tbl, isp->nchans * ISP_CHAN_DESC_SIZE);
 
-	if (!d) {
-		dev_err(isp->dev, "channel table at fw-rel 0x%08x is outside every surface\n", tbl);
+	if (!d || (tbl & 3)) {
+		dev_err(isp->dev, "channel table at fw-rel 0x%08x is unaligned or outside every surface\n", tbl);
 		return -EIO;
 	}
 	dev_info(isp->dev, "channel table at fw-rel 0x%08x, %u channels\n", tbl, isp->nchans);
@@ -279,7 +283,7 @@ int isp_stage_chans(struct t7000_isp *isp)
 		c->idx = 0;
 		dev_info(isp->dev, "chan %u '%s': type %u src %u num %u ring fw-rel 0x%08x\n",
 			 n, c->name, c->type, c->src, c->num, c->rel);
-		if (!c->num || c->num > 1024 || c->src > 31 ||
+		if (!c->num || c->num > 1024 || c->src > 31 || (c->rel & 3) ||
 		    !(c->ring = isp_translate(isp, c->rel, c->num * ISP_MSG_SIZE))) {
 			dev_err(isp->dev, "chan %u: bad ring (num %u src %u rel 0x%x)\n",
 				n, c->num, c->src, c->rel);
