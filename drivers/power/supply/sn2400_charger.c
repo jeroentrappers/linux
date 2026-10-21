@@ -294,6 +294,7 @@ static int sn2400_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	sn->dev = dev;
+	i2c_set_clientdata(client, sn);
 	sn->input_limit = SN2400_DEF_INPUT;
 	sn->chg_current = SN2400_DEF_CHG;
 	device_property_read_u32(dev, "input-current-limit-microamp",
@@ -348,6 +349,32 @@ static int sn2400_probe(struct i2c_client *client)
 	return 0;
 }
 
+/*
+ * The poll talks to the chip over I2C every 5 s. Across system suspend that
+ * would run with the I2C interrupt suspended (the work is not freezable), so
+ * stop it and look at the input limit again right after resume: a re-plug
+ * while asleep can leave the chip at its 90 mA default.
+ */
+static int sn2400_suspend(struct device *dev)
+{
+	struct sn2400 *sn = dev_get_drvdata(dev);
+
+	cancel_delayed_work_sync(&sn->work);
+
+	return 0;
+}
+
+static int sn2400_resume(struct device *dev)
+{
+	struct sn2400 *sn = dev_get_drvdata(dev);
+
+	mod_delayed_work(system_percpu_wq, &sn->work, 0);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sn2400_pm_ops, sn2400_suspend, sn2400_resume);
+
 static const struct of_device_id sn2400_of_match[] = {
 	{ .compatible = "ti,sn2400" },
 	{ }
@@ -364,6 +391,7 @@ static struct i2c_driver sn2400_driver = {
 	.driver = {
 		.name = "sn2400-charger",
 		.of_match_table = sn2400_of_match,
+		.pm = pm_sleep_ptr(&sn2400_pm_ops),
 	},
 	.probe = sn2400_probe,
 	.id_table = sn2400_id,
