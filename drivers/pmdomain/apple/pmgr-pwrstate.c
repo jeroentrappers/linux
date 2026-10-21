@@ -47,6 +47,29 @@ struct apple_pmgr_ps {
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
+
+/*
+ * System suspend (s2idle) leaves every domain powered by default. genpd would
+ * otherwise cut each domain whose devices are all suspended, and on A7/A8 most
+ * of the blocks behind them cannot be brought back by Linux: the display pipe
+ * and the flash IOP were set up by iBoot, the PCIe link would need a full
+ * re-train, and losing the GPIO block loses every pin setting and the button
+ * wake path. Runtime PM and the boot-time power-off of unused domains are not
+ * affected.
+ */
+static bool suspend_power_off;
+module_param(suspend_power_off, bool, 0644);
+MODULE_PARM_DESC(suspend_power_off,
+		 "Let genpd power domains off during system suspend (default: keep them on)");
+
+static bool apple_pmgr_ps_system_power_down_ok(struct dev_pm_domain *pd)
+{
+	return READ_ONCE(suspend_power_off);
+}
+
+static struct dev_power_governor apple_pmgr_ps_gov = {
+	.system_power_down_ok = apple_pmgr_ps_system_power_down_ok,
+};
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
@@ -249,7 +272,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 
-	ret = pm_genpd_init(&ps->genpd, NULL, !active);
+	ret = pm_genpd_init(&ps->genpd, &apple_pmgr_ps_gov, !active);
 	if (ret < 0) {
 		dev_err(dev, "pm_genpd_init failed\n");
 		return ret;
