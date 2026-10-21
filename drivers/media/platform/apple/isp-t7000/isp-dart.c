@@ -26,6 +26,10 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
 	u32 s[16];
 	int i;
 
+	dev_info(isp->dev, "dart %s: fetch-cfg %08x err-reflector %08x diag %08x; smmu stream-en %08x +0x20 %08x err-reflector %08x\n",
+		 when, dart_rd(isp, DART_FETCH_CFG), dart_rd(isp, DART_ERR_REFLECT),
+		 dart_rd(isp, DART_DIAG_CFG), isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN),
+		 isp_rd(isp, ISP_SMMU + 0x20), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT));
 	dev_info(isp->dev, "dart %s: cmd %08x tcr %08x err %08x erraddr %08x ttbr0 %08x %08x %08x %08x\n",
 		 when, dart_rd(isp, DART_STREAM_CMD), dart_rd(isp, DART_TCR),
 		 dart_rd(isp, DART_ERROR), dart_rd(isp, DART_ERROR_ADDR),
@@ -96,12 +100,24 @@ int isp_dart_init(struct t7000_isp *isp)
 	dart_wr(isp, DART_TCR, tcr & ~m);
 	err = dart_rd(isp, DART_ERROR);
 	dart_wr(isp, DART_ERROR, err);
+	/*
+	 * iOS AppleS5L8960XDART restore (DART kext 0x7fe627c, 0x7fe63c4): DART+0x24 and
+	 * SMMU+0x24 = error-reflector >> 12. A translation fault then completes to that
+	 * sink page instead of going nowhere (= a fabric wedge).
+	 */
+	isp->dart_old_reflect = dart_rd(isp, DART_ERR_REFLECT);
+	isp->smmu_old_reflect = isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT);
+	if (isp_dart_reflector) {
+		dart_wr(isp, DART_ERR_REFLECT, (u32)(ISP_ERR_REFLECTOR >> 12));
+		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, (u32)(ISP_ERR_REFLECTOR >> 12));
+	}
 	for (sid = 0; sid < 4; sid++) {
 		if (!(isp_dart_sids & BIT(sid)))
 			continue;
 		dart_wr(isp, DART_TTBR(sid, 0), DART_TTBR_VALID | (u32)(isp->l1_dma >> 12));
 		for (i = 1; i < 4; i++)
-			dart_wr(isp, DART_TTBR(sid, i), 0);
+			dart_wr(isp, DART_TTBR(sid, i), i == 1 && isp_dart_alias ?
+				DART_TTBR_VALID | (u32)(isp->l1_dma >> 12) : 0);
 	}
 	dart_wr(isp, DART_TCR, (tcr & ~m) | (0x80808080U & m));
 	isp->dart_on = true;
@@ -132,6 +148,10 @@ void isp_dart_fini(struct t7000_isp *isp)
 			for (i = 0; i < 4; i++)
 				dart_wr(isp, DART_TTBR(sid, i), 0);
 	isp_dart_flush(isp);	/* still dart_on: drop any cached translation */
+	if (isp_dart_reflector) {
+		dart_wr(isp, DART_ERR_REFLECT, isp->dart_old_reflect);
+		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, isp->smmu_old_reflect);
+	}
 	isp->dart_on = false;
 	dev_info(isp->dev, "dart: translation disabled\n");
 }

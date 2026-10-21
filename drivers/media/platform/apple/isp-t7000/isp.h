@@ -76,6 +76,12 @@
 #define DART_ERROR_FLAG		BIT(31)
 #define DART_ERROR_ADDR		0x1c
 #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
+#define DART_FETCH_CFG		0x20		/* iOS: ADT fetch-config (0xe0303) */
+#define DART_ERR_REFLECT	0x24		/* iOS: ADT error-reflector >> 12 */
+#define DART_DIAG_CFG		0x30		/* iOS: written on restore */
+#define SMMU_STREAM_EN		0xc		/* iOS: byte[sid] |= 0x80 */
+#define SMMU_ERR_REFLECT	0x24		/* iOS: error-reflector[1] >> 12 */
+#define ISP_ERR_REFLECTOR	0x20ffff000ULL	/* ADT dart-isp error-reflector: 2 x 0x2_0fff_f000 */
 #define DART_TTBR_VALID		BIT(31)
 #define DART_PTE_VALID		0x3		/* A8: tables + leaves need bits 1:0 = 11 */
 #define DART_PTE_PA		GENMASK_ULL(35, 12)
@@ -206,6 +212,7 @@ struct t7000_isp {
 
 	/* mini DART */
 	bool dart_on;
+	u32 dart_old_reflect, smmu_old_reflect;
 	u64 *l1;
 	dma_addr_t l1_dma;
 	u64 *l2[512];
@@ -259,7 +266,7 @@ extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwl
 extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
 extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
 extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
-extern int isp_keep_on, isp_preset, isp_stream_nostart;
+extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_dart_alias;
 extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
 
 /*

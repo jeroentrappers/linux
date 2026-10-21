@@ -137,6 +137,13 @@ void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...)
 		msleep(50);
 }
 
+int isp_dart_reflector = 1;
+module_param_named(dart_reflector, isp_dart_reflector, int, 0444);
+MODULE_PARM_DESC(dart_reflector, "1 = program the DART + SMMU error reflector (+0x24 = 0x20ffff000 >> 12, ADT error-reflector) like iOS, so a faulting ISP DMA completes harmlessly instead of wedging the fabric");
+int isp_dart_alias;
+module_param_named(dart_alias, isp_dart_alias, int, 0444);
+MODULE_PARM_DESC(dart_alias, "1 = also point TTBR index 1 (IOVA 1-2 GB) at the same L1, so fw addresses 0x4xxxxxxx alias 0x0xxxxxxx (test knob)");
+
 static struct t7000_isp *the_isp;
 
 static int isp_stage_power(struct t7000_isp *isp)
