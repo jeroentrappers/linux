@@ -109,6 +109,8 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		isp_stream_release(isp, v);
 		mutex_unlock(&isp->lock);
 		return 0;
+	case ISP_IOC_FOCUS:
+		return isp_af_ioctl(isp, up);
 	}
 	return -ENOTTY;
 }

@@ -153,6 +153,7 @@ int isp_sensor_power_on(struct t7000_isp *isp)
 	if (ret)
 		return ret;
 	msleep(2);				/* iOS: IOSleep(1) after the rails */
+	isp_af_power(isp, true);		/* focus_ldo (rear VCM), iOS step 2 */
 	if (isp_refclk)
 		for (n = 0; n < 2; n++)
 			if (isp_refclk_set(isp, n))
@@ -210,6 +211,7 @@ void isp_sensor_power_off(struct t7000_isp *isp)
 		}
 	}
 	isp->extclk_saved = isp->refclk_saved = 0;
+	isp_af_power(isp, false);
 	isp_pin_release(isp, 0);
 	isp_pins_log(isp, "after power-off");
 	if (isp->refclk)

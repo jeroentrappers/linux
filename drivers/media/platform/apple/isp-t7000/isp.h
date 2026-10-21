@@ -401,6 +401,12 @@ void isp_stream_stop(struct t7000_isp *isp);
 void isp_stream_release(struct t7000_isp *isp, u32 index);
 void isp_stream_kick(struct t7000_isp *isp);
 
+/* isp-af.c */
+void isp_af_power(struct t7000_isp *isp, bool on);
+void isp_af_prestart(struct t7000_isp *isp);
+void isp_af_stream_on(struct t7000_isp *isp);
+long isp_af_ioctl(struct t7000_isp *isp, void __user *up);
+
 /* isp-cdev.c */
 int isp_cdev_init(struct t7000_isp *isp);
 void isp_cdev_exit(struct t7000_isp *isp);

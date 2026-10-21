@@ -524,6 +524,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 arg)
 		goto out;
 	}
 	isp_extra_prestart(isp, st->ch);
+	isp_af_prestart(isp);
 	if (!READ_ONCE(isp_bufs_after_start))
 		isp_stream_kick(isp);	/* every buffer is FREE: one or two lists on BUF_H2T */
 	if (READ_ONCE(isp_stream_nobufs))
@@ -541,6 +542,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 arg)
 		isp_stream_stop(isp);
 		goto out;
 	}
+	isp_af_stream_on(isp);
 	dev_info(isp->dev, "stream on: camera %u (%s 0x%04x), preset %u, %ux%u, %u buffer(s)%s, %u raw\n",
 		 camera, st->sensor_name, st->sensor_id, st->preset, st->width, st->height, st->nbufs,
 		 st->meta_size ? " + meta" : "", st->nraw);

@@ -66,4 +66,34 @@ struct isp_frame {
 #define ISP_IOC_STOP		_IO('I', 3)
 #define ISP_IOC_RELEASE		_IOW('I', 4, __u32)
 
+/*
+ * Minor 1: ISP_IOC_FOCUS (older drivers answer -ENOTTY). INFO's version stays 1.
+ * Autofocus of the rear camera (IMX237 + VCM); the front camera is fixed-focus, there
+ * only ISP_FOCUS_F_AE does something and position comes back -1.
+ * Window: per-mille (0..1000) of the frame as delivered (sensor orientation, not
+ * mirrored); w = 0 or h = 0 keeps the fw's current window; clamped into the frame.
+ * -EAGAIN when no camera is streaming. Blocks for the fw round trips (a few ms).
+ */
+#define ISP_UAPI_MINOR		1
+
+struct isp_focus {
+	__u32 mode;		/* ISP_FOCUS_* */
+	__u32 flags;		/* ISP_FOCUS_F_* */
+	__u16 x, y, w, h;	/* window, per-mille */
+	__s32 position;		/* in: lens position for ISP_FOCUS_MANUAL (0..255);
+				 * out: fw lens position after the call, -1 = unknown */
+	__u32 fw_status;	/* out: first non-zero fw status of the commands sent, 0 = all ok */
+	__u32 reserved[2];
+};
+
+#define ISP_FOCUS_CONTINUOUS	0	/* window + continuous AF (the default at stream start) */
+#define ISP_FOCUS_ONCE		1	/* window + one AF scan, then hold (tap to focus) */
+#define ISP_FOCUS_LOCK		2	/* continuous AF off: the lens stays where it is (AF lock) */
+#define ISP_FOCUS_MANUAL	3	/* continuous AF off, lens to .position */
+#define ISP_FOCUS_QUERY		4	/* send nothing (except F_AE), read the lens position */
+
+#define ISP_FOCUS_F_AE		0x1	/* also meter exposure on the window */
+
+#define ISP_IOC_FOCUS		_IOWR('I', 0x20, struct isp_focus)
+
 #endif /* _UAPI_LINUX_APPLE_ISP_T7000_H */
