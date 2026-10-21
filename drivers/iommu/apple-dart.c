@@ -1580,11 +1580,43 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * A DART whose power domain stayed on across suspend still holds the saved
+ * configuration. Resetting it anyway disables translation for a moment, and a
+ * DMA from a device that was left running (PCIe Wi-Fi kept in D0 on T7000)
+ * faults in that window. Only reset when the state is really gone, unless
+ * resume_reset=1 asks for the old unconditional reset.
+ */
+static bool resume_reset;
+module_param(resume_reset, bool, 0644);
+MODULE_PARM_DESC(resume_reset, "Always reset the DART on resume, even if it kept its state");
+
+static __maybe_unused bool apple_dart_state_retained(struct apple_dart *dart)
+{
+	unsigned int sid, idx;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->hw->read_tcr(dart, sid) != dart->save_tcr[sid])
+			return false;
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			if (readl(dart->regs + DART_TTBR(dart, sid, idx)) !=
+			    dart->save_ttbr[sid][idx])
+				return false;
+	}
+
+	return true;
+}
+
 static __maybe_unused int apple_dart_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	if (!READ_ONCE(resume_reset) && apple_dart_state_retained(dart)) {
+		dev_dbg(dev, "state retained across suspend, no reset\n");
+		return 0;
+	}
 
 	ret = apple_dart_hw_reset(dart);
 	if (ret) {
