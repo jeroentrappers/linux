@@ -11,7 +11,10 @@
  *  2 bridge settings + clock enable                7 mailbox + rings, poll worker
  *  3 mini DART + firmware into a DART surface      8 PRINT_ENABLE + START
  *  4 ISP CPU start, wait for the wake magic        9 CONFIG_GET + BUILDINFO
- *  5 boot stage 2 (IPC pool + boot args)
+ *  5 boot stage 2 (IPC pool + boot args)      (8 starts with the sensor power-up, sens_pwr=1)
+ *
+ * stream=1 (with stage=9) adds /dev/isp0 (isp-cdev.c): the ISP is powered off again
+ * after the boot test unless keep_on=1, booted on open and powered off on last close.
  */
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
@@ -63,6 +66,40 @@ uint isp_max_shared_mb = 64;
 module_param_named(max_shared_mb, isp_max_shared_mb, uint, 0444);
 MODULE_PARM_DESC(max_shared_mb, "cap on SHAREDMALLOC memory");
 
+int isp_sens_pwr = 1;
+module_param_named(sens_pwr, isp_sens_pwr, int, 0444);
+MODULE_PARM_DESC(sens_pwr, "1 = power the sensors before START like iOS power_on_hardware (GPIO 198/190/196, ref clocks, extclk pins)");
+int isp_refclk = 1;
+module_param_named(refclk, isp_refclk, int, 0444);
+MODULE_PARM_DESC(refclk, "1 = program the PMGR sensor ref clocks (0x20e010218/1c) with refclk_cfg");
+uint isp_refclk_cfg = 0x28;
+module_param_named(refclk_cfg, isp_refclk_cfg, uint, 0444);
+MODULE_PARM_DESC(refclk_cfg, "ISPC byte: srcSel = bits 7:6, divider cfg = bits 5:0 (ADT ISPC arg byte 0 = 0x28)");
+int isp_extclk_periph = 1;
+module_param_named(extclk_periph, isp_extclk_periph, int, 0444);
+MODULE_PARM_DESC(extclk_periph, "pin function (PERIPH) for the MCLK pins 191/197; -1 = leave as iBoot set them");
+int isp_stream_en;
+module_param_named(stream, isp_stream_en, int, 0444);
+MODULE_PARM_DESC(stream, "1 (with stage=9) = streaming via /dev/isp0");
+int isp_stream_dump;
+module_param_named(stream_dump, isp_stream_dump, int, 0644);
+MODULE_PARM_DESC(stream_dump, "1 = log every frame (seq, index, bytes) and every buffer list");
+int isp_keep_on;
+module_param_named(keep_on, isp_keep_on, int, 0644);
+MODULE_PARM_DESC(keep_on, "stream=1: 1 = keep the ISP booted when /dev/isp0 is closed (default: power everything off, boot again on open)");
+int isp_preset = -1;
+module_param_named(preset, isp_preset, int, 0644);
+MODULE_PARM_DESC(preset, "sensor preset to stream (-1 = smallest output >= 640x480)");
+uint isp_nbufs = 4;
+module_param_named(nbufs, isp_nbufs, uint, 0444);
+MODULE_PARM_DESC(nbufs, "frame buffers (2..8)");
+uint isp_setfile_rear = 0x8421;
+module_param_named(setfile_rear, isp_setfile_rear, uint, 0644);
+MODULE_PARM_DESC(setfile_rear, "IMX237 module setfile apple/isp_<hex>_01XX.dat (0x8421/0x8422/0x8423, 0 = none)");
+uint isp_setfile_front = 0x1421;
+module_param_named(setfile_front, isp_setfile_front, uint, 0644);
+MODULE_PARM_DESC(setfile_front, "IMX190 module setfile (0x1421/0x1422, 0 = none)");
+
 static struct t7000_isp *the_isp;
 
 static int isp_stage_power(struct t7000_isp *isp)
@@ -83,16 +120,22 @@ static int (*const isp_stages[])(struct t7000_isp *) = {
 	isp_stage_query,	/* 9 */
 };
 
-/* Reverse unwind. Memory is freed only after the ISP is powered off. */
-static void isp_teardown(struct t7000_isp *isp)
+/* Reverse unwind. Memory is freed only after the ISP is powered off. Caller: no isp->lock. */
+void isp_teardown(struct t7000_isp *isp)
 {
 	dev_info(isp->dev, "teardown from stage %d\n", isp->done);
+	if (isp->st.on) {
+		mutex_lock(&isp->lock);
+		isp_stream_stop(isp);
+		mutex_unlock(&isp->lock);
+	}
 	isp_ipc_stop(isp);
 	mutex_lock(&isp->lock);
 	if (isp->fw_up && isp_graceful)
 		isp_fw_shutdown(isp);
 	if (isp->cpu_started)
 		isp_cpu_stop(isp);
+	isp_sensor_power_off(isp);
 	if (isp->dart_on)
 		isp_dart_fini(isp);
 	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
@@ -109,22 +152,28 @@ static void isp_teardown(struct t7000_isp *isp)
 	} else {
 		isp_surf_free_all(isp);
 	}
+	/* stream buffers were surfaces: forget them (counters stay for debugfs) */
+	memset(isp->st.buf, 0, sizeof(isp->st.buf));
+	memset(isp->st.meta, 0, sizeof(isp->st.meta));
+	isp->st.lists = isp->st.setf = NULL;
+	isp->st.nbufs = 0;
+	/* per-boot state, so isp_boot() can run again (stream=1, open after idle-off) */
 	isp->done = 0;
+	isp->started = isp->io_dead = isp->fw_up = false;
+	isp->nchans = isp->pool_used = 0;
+	isp->io = isp->sm = isp->tm = isp->bh = isp->bt = isp->it = isp->dg = NULL;
+	memset(isp->chans, 0, sizeof(isp->chans));
 	mutex_unlock(&isp->lock);
 	isp_term_flush(isp);
 	isp_pmgr_log(isp, "after teardown");
 }
 
-static int isp_run(struct t7000_isp *isp)
+/* Run stages done+1 .. upto. On failure the caller unwinds with isp_teardown(). */
+int isp_boot(struct t7000_isp *isp, int upto)
 {
 	int n, ret;
 
-	if (stage < 0 || stage >= ARRAY_SIZE(isp_stages)) {
-		dev_err(isp->dev, "stage=%d out of range 0..%zu\n", stage,
-			ARRAY_SIZE(isp_stages) - 1);
-		return -EINVAL;
-	}
-	for (n = 1; n <= stage; n++) {
+	for (n = isp->done + 1; n <= upto; n++) {
 		dev_info(isp->dev, "stage %d: start\n", n);
 		if (n > 1 && isp->isp_was_on) {
 			dev_err(isp->dev, "ps_isp was already on at load: someone else owns it, refusing writes\n");
@@ -144,6 +193,20 @@ static int isp_run(struct t7000_isp *isp)
 	return 0;
 }
 
+static int isp_run(struct t7000_isp *isp)
+{
+	if (stage < 0 || stage >= ARRAY_SIZE(isp_stages)) {
+		dev_err(isp->dev, "stage=%d out of range 0..%zu\n", stage,
+			ARRAY_SIZE(isp_stages) - 1);
+		return -EINVAL;
+	}
+	if (isp_stream_en && stage != ARRAY_SIZE(isp_stages) - 1) {
+		dev_err(isp->dev, "stream=1 needs stage=%zu\n", ARRAY_SIZE(isp_stages) - 1);
+		return -EINVAL;
+	}
+	return isp_boot(isp, stage);
+}
+
 static int __init isp_init(void)
 {
 	struct platform_device_info pinfo = {
@@ -159,6 +222,8 @@ static int __init isp_init(void)
 		return -ENOMEM;
 	mutex_init(&isp->lock);
 	spin_lock_init(&isp->term_lock);
+	spin_lock_init(&isp->st.frame_lock);
+	init_waitqueue_head(&isp->st.wait);
 	INIT_LIST_HEAD(&isp->surfs);
 	atomic_set(&isp->irq_count, 0);
 	isp->irq = -1;
@@ -195,6 +260,17 @@ static int __init isp_init(void)
 		isp_teardown(isp);
 		goto err_unmap;
 	}
+	if (isp_stream_en) {
+		ret = isp_cdev_init(isp);
+		if (ret) {
+			isp_teardown(isp);
+			goto err_unmap;
+		}
+		if (!isp_keep_on) {
+			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
+			isp_teardown(isp);
+		}
+	}
 ok:
 	dev_info(isp->dev, "loaded, stages done: %d (rmmod unwinds)\n", isp->done);
 	the_isp = isp;
@@ -215,6 +291,7 @@ static void __exit isp_exit(void)
 {
 	struct t7000_isp *isp = the_isp;
 
+	isp_cdev_exit(isp);	/* no open fd can exist: each one holds a module reference */
 	if (!isp_dry_run)
 		isp_teardown(isp);
 	iounmap(isp->regs);

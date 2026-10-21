@@ -199,6 +199,11 @@ static int isp_drain(struct t7000_isp *isp, struct isp_chan *c)
 				reply = isp_sm_request(isp, w0, w1, w2);
 				WRITE_ONCE(m[1], 0);
 				WRITE_ONCE(m[2], 0);
+			} else if (c == isp->bt) {
+				/* kext 0x845c744: b138(ch, list or 0, 0, 0x80000000) */
+				reply = isp_bt_handle(isp, w0, w1, w2);
+				WRITE_ONCE(m[1], 0);
+				WRITE_ONCE(m[2], 0x80000000);
 			} else {
 				if (c == isp->tm)
 					isp_terminal(isp, w0 & ~3U, w1);
@@ -236,6 +241,8 @@ int isp_service(struct t7000_isp *isp)
 			continue;
 		n += isp_drain(isp, c);
 	}
+	if (isp->st.on)
+		isp_stream_kick(isp);	/* resubmit freed frame/meta buffers on BUF_H2T */
 	return n;
 }
 
@@ -390,7 +397,12 @@ static int isp_irq_setup(struct t7000_isp *isp)
 
 static uint isp_poll_interval(struct t7000_isp *isp)
 {
-	return isp->irq >= 0 ? ISP_IRQ_SAFETY_MS : max_t(uint, isp_poll_ms, 5);
+	if (isp->irq >= 0)
+		return ISP_IRQ_SAFETY_MS;
+	/* poll mode while streaming: at most 10 ms so 30 fps frames are not batched */
+	if (READ_ONCE(isp->st.on))
+		return clamp_t(uint, isp_poll_ms, 2, 10);
+	return max_t(uint, isp_poll_ms, 5);
 }
 
 static void isp_poll_fn(struct work_struct *work)
@@ -534,13 +546,6 @@ void isp_ipc_stop(struct t7000_isp *isp)
 				 isp->chans[i].msgs);
 }
 
-/* CISP packet header: opcode u16 at +4, status u16 at +6 (A8 kext ISP_deInit) */
-struct isp_cmd_hdr {
-	u32 unk0;
-	u16 opcode;
-	u16 status;
-} __packed;
-
 struct isp_cmd_print_enable {
 	struct isp_cmd_hdr h;
 	u32 enable;
@@ -551,13 +556,12 @@ struct isp_cmd_config_get {
 	u32 w[5];	/* Asahi: timestamp_freq, num_channels, unk_10/14/18 */
 } __packed;
 
-static_assert(sizeof(struct isp_cmd_hdr) == 8);
 static_assert(sizeof(struct isp_cmd_print_enable) == 0xc);
 static_assert(sizeof(struct isp_cmd_config_get) == 0x1c);
 
 /* Send a fixed-size command and wait; a non-zero status is logged and returned. */
-static int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
-			  u32 insize, u32 outsize, u16 *status)
+int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
+		   u32 insize, u32 outsize, u16 *status)
 {
 	u16 st = 0xffff;
 	int ret = isp_cmd_send(isp, pkt, insize, outsize, true, &st);
@@ -586,6 +590,10 @@ int isp_stage_start(struct t7000_isp *isp)
 	u16 st;
 	int ret;
 
+	/* the fw probes the sensors at START (fw 0x7d6e4): power them first */
+	ret = isp_sensor_power_on(isp);
+	if (ret)
+		return ret;
 	ret = isp_cmd_simple(isp, "PRINT_ENABLE", &pe, sizeof(pe), sizeof(pe), &st);
 	if (ret)
 		return ret;

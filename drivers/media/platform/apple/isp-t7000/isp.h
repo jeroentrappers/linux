@@ -10,6 +10,7 @@
 #ifndef __APPLE_ISP_T7000_H__
 #define __APPLE_ISP_T7000_H__
 
+#include <linux/build_bug.h>
 #include <linux/io.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -100,6 +101,75 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
 #define CISP_CMD_PRINT_ENABLE	0x4
 #define CISP_CMD_BUILDINFO	0x6
 #define CISP_CMD_POWER_DOWN	0x10
+#define CISP_CMD_CH_START	0x100
+#define CISP_CMD_CH_STOP	0x101
+#define CISP_CMD_CH_BUFFER_RETURN	0x104
+#define CISP_CMD_CH_CAMERA_CONFIG_GET	0x106
+#define CISP_CMD_CH_CAMERA_CONFIG_SELECT 0x107
+#define CISP_CMD_CH_INFO_GET	0x10d
+#define CISP_CMD_CH_BUFFER_RECYCLE_MODE_SET 0x10e
+#define CISP_CMD_CH_BUFFER_RECYCLE_START 0x10f
+#define CISP_CMD_CH_SET_FILE_LOAD	0x111
+#define CISP_CMD_CH_SIF_PIXEL_FORMAT_SET 0x115
+#define CISP_CMD_CH_BUFFER_POOL_CONFIG_GET 0x116
+#define CISP_CMD_CH_BUFFER_POOL_CONFIG_SET 0x117
+#define CISP_CMD_CH_CROP_SET	0x801
+#define CISP_CMD_CH_OUTPUT_CONFIG_SET	0xb01
+#define CISP_CMD_CH_PREVIEW_STREAM_SET	0xb0d
+
+#define ISP_SENS_GPIOS		3	/* avdd, rear shutdown, front shutdown */
+#define ISP_MAX_BUFS		8
+#define ISP_POOL_META		0
+#define ISP_POOL_RENDERED	1
+#define ISP_BUFLIST_SLOT	0x200	/* one H2T list per BUF_H2T ring slot */
+#define ISP_BUFLIST_MAX		8	/* entries per list (kext clamps T2H lists to 8) */
+
+enum isp_buf_state { BUF_FREE, BUF_FW, BUF_READY, BUF_USER };
+
+struct isp_sbuf {
+	struct isp_surf *surf;
+	enum isp_buf_state state;
+	u32 seq;
+	u64 ts;
+	u32 fwflags;
+};
+
+struct isp_stream {
+	bool on, stopping;
+	u32 ch, sensor_id, preset, npresets;
+	u32 in_w, in_h, width, height, stride, bufsize, nbufs;
+	u32 meta_size;
+	char sensor_name[32];
+	struct isp_sbuf buf[ISP_MAX_BUFS];
+	struct isp_sbuf meta[ISP_MAX_BUFS];
+	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
+	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
+	u32 seq;
+	/* frame queue (frame_lock): indices in completion order */
+	spinlock_t frame_lock;
+	wait_queue_head_t wait;
+	u32 ready[ISP_MAX_BUFS];
+	u32 nready;
+	/* debug counters (debugfs) */
+	u64 frames, dropped, recycled, errors, h2t_posts, h2t_busy, t2h_msgs;
+};
+
+struct dentry;
+
+/* CISP packet header: opcode u16 at +4, status u16 at +6 (A8 kext ISP_deInit) */
+struct isp_cmd_hdr {
+	u32 unk0;
+	u16 opcode;
+	u16 status;
+} __packed;
+static_assert(sizeof(struct isp_cmd_hdr) == 8);
+
+/* most per-channel commands: header + channel (+ args) */
+struct isp_cmd_ch {
+	struct isp_cmd_hdr h;
+	u32 chan;
+	u32 arg[5];
+} __packed;
 
 struct isp_surf {
 	struct list_head list;
@@ -167,12 +237,29 @@ struct t7000_isp {
 	char term_buf[ISP_TERM_LINES][ISP_TERM_MAX + 1];
 	unsigned int term_head, term_count;
 	unsigned long term_lines, term_shown, term_dropped;
+
+	/* sensor power (isp-sens.c) */
+	bool sens_on;
+	int gpio_base;
+	int gpio_on[ISP_SENS_GPIOS];	/* pin numbers we requested, 0 = none */
+	void __iomem *pinregs, *refclk;
+	u32 refclk_old[2], extclk_old[2];
+	unsigned int refclk_saved, extclk_saved;
+
+	/* streaming (isp-stream.c, isp-cdev.c) */
+	struct isp_stream st;
+	bool cdev_on;
+	int open_count;
+	struct dentry *dbg;
 };
 
 /* module parameters (isp-main.c) */
 extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwlog;
 extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
 extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
+extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
+extern int isp_keep_on, isp_preset;
+extern uint isp_refclk_cfg, isp_nbufs, isp_setfile_rear, isp_setfile_front;
 
 static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
 {
@@ -228,5 +315,26 @@ int isp_stage_start(struct t7000_isp *isp);
 int isp_stage_query(struct t7000_isp *isp);
 void isp_ipc_stop(struct t7000_isp *isp);
 void isp_fw_shutdown(struct t7000_isp *isp);
+int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
+		   u32 insize, u32 outsize, u16 *status);
+
+/* isp-sens.c */
+int isp_sensor_power_on(struct t7000_isp *isp);
+void isp_sensor_power_off(struct t7000_isp *isp);
+
+/* isp-stream.c */
+u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2);
+int isp_stream_start(struct t7000_isp *isp, u32 camera);
+void isp_stream_stop(struct t7000_isp *isp);
+void isp_stream_release(struct t7000_isp *isp, u32 index);
+void isp_stream_kick(struct t7000_isp *isp);
+
+/* isp-cdev.c */
+int isp_cdev_init(struct t7000_isp *isp);
+void isp_cdev_exit(struct t7000_isp *isp);
+
+/* isp-main.c */
+int isp_boot(struct t7000_isp *isp, int upto);
+void isp_teardown(struct t7000_isp *isp);
 
 #endif
