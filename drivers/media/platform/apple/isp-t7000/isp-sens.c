@@ -28,6 +28,7 @@
 #define REFCLK_PHYS		0x20e010218ULL	/* kRegGroupISPRef0ClkCfg: AppleT7000PMGR 0x8537a38 */
 #define REFCLK_BUSY		BIT(30)
 #define REFCLK_KEEP		0xfcffffc0	/* configISPRefClock 0x852b49c */
+#define REFCLK_TIMEOUT_US	200000
 
 #define PIN_AVDD		198
 #define PIN_SHUT_REAR		190
@@ -95,10 +96,14 @@ static int isp_refclk_set(struct t7000_isp *isp, int n)
 
 	isp->refclk_old[n] = old;
 	isp->refclk_saved |= BIT(n);
+	if (old & REFCLK_BUSY)
+		dev_warn(isp->dev, "sens_pwr: ref clock %d busy (bit 30) before the write: 0x%08x\n",
+			 n, old);
 	writel((old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24, r);
-	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, 10000);
+	/* iOS waits up to 0x2ee00 (~192 ms) in configISPRefClock */
+	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, REFCLK_TIMEOUT_US);
 	dev_info(isp->dev, "sens_pwr: ref clock %d (PMGR +0x%x): 0x%08x -> 0x%08x%s\n", n,
-		 0x10218 + 4 * n, old, v, ret ? " (TIMEOUT: bit 30 still set after 10 ms)" : "");
+		 0x10218 + 4 * n, old, v, ret ? " (TIMEOUT: bit 30 still set after 200 ms)" : "");
 	return ret;
 }
 
@@ -179,8 +184,15 @@ void isp_sensor_power_off(struct t7000_isp *isp)
 		if (isp->extclk_saved & BIT(n))
 			writel(isp->extclk_old[n],
 			       isp->pinregs + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR));
-		if (isp->refclk_saved & BIT(n))
+		if (isp->refclk_saved & BIT(n)) {
+			u32 v;
+
 			writel(isp->refclk_old[n], isp->refclk + 4 * n);
+			if (readl_poll_timeout(isp->refclk + 4 * n, v, !(v & REFCLK_BUSY), 10,
+					       REFCLK_TIMEOUT_US))
+				dev_warn(isp->dev, "sens_pwr: ref clock %d restore: bit 30 still set (0x%08x)\n",
+					 n, v);
+		}
 	}
 	isp->extclk_saved = isp->refclk_saved = 0;
 	isp_pin_release(isp, 0);

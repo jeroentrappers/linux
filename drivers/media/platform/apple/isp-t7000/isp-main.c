@@ -264,14 +264,15 @@ static int __init isp_init(void)
 		goto err_unmap;
 	}
 	if (isp_stream_en) {
+		/* power off first: /dev/isp0 must not exist while this teardown runs */
+		if (!isp_keep_on) {
+			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
+			isp_teardown(isp);
+		}
 		ret = isp_cdev_init(isp);
 		if (ret) {
 			isp_teardown(isp);
 			goto err_unmap;
-		}
-		if (!isp_keep_on) {
-			dev_info(isp->dev, "stream: boot ok; powering the ISP off until /dev/isp0 is opened (keep_on=0)\n");
-			isp_teardown(isp);
 		}
 	}
 ok:

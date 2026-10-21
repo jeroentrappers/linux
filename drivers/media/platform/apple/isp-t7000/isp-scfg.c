@@ -204,40 +204,47 @@ static void isp_config_meta(struct t7000_isp *isp, u8 *buf)
 
 /*
  * Frame (+ meta) surfaces and the H2T list area. Surfaces can only be freed after the
- * ISP is powered off, so they are allocated once per boot and reused by later STARTs
- * of the same size.
+ * ISP is powered off, so they are allocated once per boot, sized @want (the larger of
+ * the two cameras, see isp_stream_start), and reused by later STARTs. If a START still
+ * needs more, a bigger set is allocated and the old one stays mapped (unused) until
+ * power-off. st->bufsize = the real buffer size = the mmap stride between buffers.
  */
-static int isp_alloc_bufs(struct t7000_isp *isp)
+static int isp_alloc_bufs(struct t7000_isp *isp, u32 want)
 {
 	struct isp_stream *st = &isp->st;
-	u32 n = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS), i;
+	u32 n = clamp_t(u32, isp_nbufs, 2, ISP_MAX_BUFS), i, need = st->bufsize;
+	bool frames, metas;
 
-	if (st->nbufs) {
-		if (st->buf[0].surf->size == st->bufsize &&
-		    (!st->meta_size || (st->meta[0].surf && st->meta[0].surf->size >= st->meta_size)))
-			return 0;
-		dev_err(isp->dev, "buffers of this boot are 0x%x bytes, preset needs 0x%x: close /dev/isp0 (power cycle) first\n",
-			st->buf[0].surf->size, st->bufsize);
-		return -EBUSY;
-	}
+	frames = !st->nbufs || st->buf[0].surf->size < need;
+	metas = st->meta_size && (frames || !st->meta[0].surf ||
+				  st->meta[0].surf->size < st->meta_size);
+	if (st->nbufs && frames)
+		dev_warn(isp->dev, "buffers of this boot are 0x%x bytes, preset needs 0x%x: allocating a bigger set (the old one is freed at power-off)\n",
+			 st->buf[0].surf->size, need);
 	if (!st->lists)
 		st->lists = isp_surf_alloc(isp, isp->bh->num * ISP_BUFLIST_SLOT,
 					   0x4c465542 /* "BUFL" */);
 	if (!st->lists)
 		return -ENOMEM;
-	for (i = 0; i < n; i++) {
-		st->buf[i].surf = isp_surf_alloc(isp, st->bufsize, 0x304d5246 + (i << 24));
-		if (!st->buf[i].surf)
-			return -ENOMEM;
-		st->buf[i].state = BUF_FREE;
-		if (!st->meta_size)
-			continue;
+	if (frames) {
+		st->nbufs = 0;	/* until the new set is complete */
+		for (i = 0; i < n; i++) {
+			st->buf[i].surf = isp_surf_alloc(isp, max(want, need), 0x304d5246 + (i << 24));
+			if (!st->buf[i].surf)
+				return -ENOMEM;
+			st->buf[i].state = BUF_FREE;
+		}
+	} else {
+		n = st->nbufs;
+	}
+	for (i = 0; metas && i < n; i++) {
 		st->meta[i].surf = isp_surf_alloc(isp, st->meta_size, 0x3041544d + (i << 24));
 		if (!st->meta[i].surf)
 			return -ENOMEM;
 		st->meta[i].state = BUF_FREE;
 	}
 	st->nbufs = n;
+	st->bufsize = st->buf[0].surf->size;
 	return 0;
 }
 
@@ -254,6 +261,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 {
 	struct isp_stream *st = &isp->st;
 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
+	u32 want;
 	u8 *buf;
 	int ret;
 
@@ -268,6 +276,19 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	buf = kzalloc(ISP_POOLGET_SIZE, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
+	/*
+	 * First START of this boot: size the buffers for the other camera too, so a
+	 * rear <-> front switch on the same fd reuses them (no new allocation).
+	 */
+	want = 0;
+	if (!st->nbufs) {
+		st->ch = !camera;
+		if (!isp_pick_preset(isp, buf))
+			want = st->bufsize;
+		else
+			dev_info(isp->dev, "camera %u not usable: sizing the buffers for camera %u only\n",
+				 !camera, camera);
+	}
 	st->ch = camera;
 	ret = isp_pick_preset(isp, buf);
 	if (ret)
@@ -310,7 +331,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	isp_ch_simple(isp, "SIF_PIXEL_FORMAT_SET", CISP_CMD_CH_SIF_PIXEL_FORMAT_SET, st->ch, 0x14,
 		      3 | 1 << 8, 0, false);	/* u8 format 3, u8 type 1 (Asahi) */
 	isp_config_meta(isp, buf);
-	ret = isp_alloc_bufs(isp);
+	ret = isp_alloc_bufs(isp, want);
 	if (ret)
 		goto out;
 	st->seq = 0;

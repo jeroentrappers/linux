@@ -110,7 +110,8 @@ void isp_stream_kick(struct t7000_isp *isp)
 		n = 0;
 		spin_lock(&st->frame_lock);
 		for (i = 0; i < st->nbufs && n < ISP_BUFLIST_MAX; i++) {
-			if (st->meta[i].surf && st->meta[i].state == BUF_FREE) {
+			/* meta only when this START configured a META pool (stale surfaces stay idle) */
+			if (st->meta_size && st->meta[i].surf && st->meta[i].state == BUF_FREE) {
 				pool[n] = ISP_POOL_META;
 				idx[n++] = i;
 			}

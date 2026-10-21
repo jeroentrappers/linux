@@ -34,10 +34,11 @@ static int isp_open(struct inode *inode, struct file *f)
 		if (ret)
 			isp_teardown(isp);
 	}
-	if (!ret)
+	if (!ret) {
 		isp->open_count++;
+		f->private_data = isp;
+	}
 	mutex_unlock(&isp_open_lock);
-	f->private_data = isp;
 	return ret;
 }
 
