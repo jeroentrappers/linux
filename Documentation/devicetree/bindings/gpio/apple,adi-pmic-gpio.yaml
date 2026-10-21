@@ -29,6 +29,12 @@ properties:
   "#gpio-cells":
     const: 2
 
+  gpio-line-names:
+    minItems: 1
+    maxItems: 21
+
+  gpio-reserved-ranges: true
+
 required:
   - compatible
   - reg

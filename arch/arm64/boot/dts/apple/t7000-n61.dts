@@ -369,7 +369,14 @@
 &pmic_gpio {
 	/* ADT oscar function-reset: PMU GPIO 5, active low */
 	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
-			  "", "", "BT_REG_ON", "", "WL_REG_ON";
+			  "", "", "BT_REG_ON", "", "WL_REG_ON", "OSCAR_CLK32K";
+	/*
+	 * PMU GPIO 11: LLB programs cfg 0x08 and iOS never writes it again;
+	 * presumably the M8's 32 kHz clock. Keep it away from gpiolib: an
+	 * output request would rewrite the cfg, and a cfg with bits 6:3 =
+	 * 1000 (0x41) wedged the PMU's I2C bus on hw.
+	 */
+	gpio-reserved-ranges = <11 1>;
 };
 
 &serial8 {
