@@ -85,6 +85,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_CS42L51_I2C
 	imply SND_SOC_CS42L52
 	imply SND_SOC_CS42L56
+	imply SND_SOC_CS42L67
 	imply SND_SOC_CS42L73
 	imply SND_SOC_CS42L84
 	imply SND_SOC_CS4234
@@ -1027,6 +1028,18 @@ config SND_SOC_CS42L52
 config SND_SOC_CS42L56
 	tristate "Cirrus Logic CS42L56 CODEC"
 	depends on I2C && INPUT
+
+config SND_SOC_CS42L67
+	tristate "Cirrus Logic CS42L67 CODEC (SPI)"
+	depends on SPI_MASTER
+	help
+	  Enable support for the Cirrus Logic CS42L67 headset/microphone
+	  codec found in the Apple iPhone 6. The driver is based on reverse
+	  engineering; it supports microphone capture over the XSP TDM port
+	  and an experimental headphone path.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called snd-soc-cs42l67.
 
 config SND_SOC_CS42L73
 	tristate "Cirrus Logic CS42L73 CODEC"
