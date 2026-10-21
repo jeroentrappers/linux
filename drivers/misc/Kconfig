@@ -390,6 +390,19 @@ config LATTICE_ECP3_CONFIG
 
 	  If unsure, say N.
 
+config S2IDLE_WAKE_TIMER
+	tristate "Timed wakeup from suspend-to-idle"
+	depends on SUSPEND
+	help
+	  Wake the system from suspend-to-idle after a time set in
+	  /sys/module/s2idle_wake_timer/parameters/wake_after_ms, without
+	  an RTC alarm. It relies on the tick running during s2idle, which
+	  is the case when no cpuidle state implements ->enter_s2idle (for
+	  example the Apple A7/A8, where only WFI exists). Inert until a
+	  time is set.
+
+	  If unsure, say N.
+
 config SRAM
 	bool "Generic on-chip SRAM driver"
 	depends on HAS_IOMEM
