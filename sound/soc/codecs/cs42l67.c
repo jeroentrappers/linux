@@ -63,6 +63,13 @@
 #define  STATUS_PDN_DONE	BIT(7)
 #define  STATUS_DET_DONE	BIT(6)
 #define CS42L67_HSDET_STATUS	0x075	/* [6:5] read by iOS' jack code */
+#define CS42L67_ASP_MISC	0x101	/* iOS: 0 unless a 'mb1x' DSP source is used */
+/*
+ * ASP TX channel n (n = 0, 1), 5 registers from 0x103 + 5n: [6:5] ADC
+ * source; then attenuation-like bytes, 0x3f = off (iOS route fn, the
+ * 0x171 "mic" loop, re/cs42l67/l67-annot.c ~1000-1130)
+ */
+#define CS42L67_ASP_TX(n, r)	(0x103 + 5 * (n) + (r))
 #define CS42L67_VOICE_SRC	0x102	/* [3:0] L, [7:4] R: XSP RX ch (1-based) */
 #define CS42L67_MISC_130	0x130
 #define CS42L67_XSP_TX_SRC(n)	(0x141 + (n))
@@ -85,6 +92,8 @@
 #define CS42L67_ADC2B_BOOST	0x21d
 #define  ADC_PDN_IDLE		0xc6	/* iOS' starting value */
 #define  ADC_GAIN_0		0x34	/* what iOS writes for gain setting 0 */
+#define CS42L67_ADC1_EN		0x234	/* iOS: 0x80 while an ADC1 channel is on */
+#define CS42L67_ADC2_EN		0x235	/* iOS: 0x80 while an ADC2 channel is on */
 #define CS42L67_ANA_239		0x239
 #define CS42L67_OUT_PDN1	0x242
 #define  OUT_PDN_A		BIT(5)
@@ -111,6 +120,8 @@
 #define CS42L67_TX_CHANNELS	10
 #define CS42L67_TX_ROUTED	4	/* XSP TX channels with a source mux */
 #define CS42L67_FRAME_SLOTS	8	/* MCA2: 8 x 16-bit slots */
+#define CS42L67_DAI_XSP		0
+#define CS42L67_DAI_ASP		1
 #define CS42L67_SPI_WRITE	0x6c
 #define CS42L67_SPI_READ	0x6d
 
@@ -222,7 +233,7 @@ static const struct regmap_config cs42l67_regmap = {
 static int cs42l67_power_up(struct cs42l67 *cs)
 {
 	struct regmap *map = cs->regmap;
-	unsigned int rev;
+	unsigned int rev, i;
 	int ret;
 
 	ret = clk_prepare_enable(cs->mclk);
@@ -272,6 +283,15 @@ static int cs42l67_power_up(struct cs42l67 *cs)
 	regmap_write(map, CS42L67_ADC2A_GAIN, ADC_GAIN_0);
 	regmap_write(map, CS42L67_ADC2B_GAIN, ADC_GAIN_0);
 	regmap_write(map, CS42L67_DSP_PDN, 0x4c);
+	/* both ASP TX channels unused, as iOS' route function leaves them */
+	regmap_write(map, CS42L67_ASP_MISC, 0);
+	for (i = 0; i < 2; i++) {
+		regmap_write(map, CS42L67_ASP_TX(i, 0), 0);
+		regmap_write(map, CS42L67_ASP_TX(i, 1), 0x3f);
+		regmap_write(map, CS42L67_ASP_TX(i, 2), 0x3f | i << 6);
+		regmap_write(map, CS42L67_ASP_TX(i, 3), 0x3f | i << 6);
+		regmap_write(map, CS42L67_ASP_TX(i, 4), 0x3f | i << 6);
+	}
 	regmap_write(map, CS42L67_OUTA_VOL, OUT_VOL_MUTE);
 	regmap_write(map, CS42L67_OUTA_VOL_R, OUT_VOL_MUTE);
 	regmap_write(map, CS42L67_OUTB_VOL, OUT_VOL_MUTE);
@@ -385,6 +405,19 @@ static int cs42l67_out_event(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
+/* ASP TX channel on: the two attenuation-like bytes to 0, as iOS does */
+static int cs42l67_asp_tx_event(struct snd_soc_dapm_widget *w,
+				struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
+	unsigned int ch = w->shift, on = SND_SOC_DAPM_EVENT_ON(event);
+
+	snd_soc_component_write(component, CS42L67_ASP_TX(ch, 1), on ? 0 : 0x3f);
+	snd_soc_component_write(component, CS42L67_ASP_TX(ch, 4),
+				(on ? 0 : 0x3f) | ch << 6);
+	return 0;
+}
+
 /* ADC input muxes: values are what iOS writes for each ADT "ainN" input */
 static const char * const adc1a_texts[] = { "AIN1", "AIN2" };
 static const unsigned int adc1a_values[] = { 0, 2 };
@@ -418,6 +451,12 @@ static const unsigned int xsp_tx_values[] = { 0, SRC_ADC1A, SRC_ADC1B, SRC_ADC2A
 					  0, 0x3f, xsp_tx_texts, xsp_tx_values); \
 	static const struct snd_kcontrol_new xsp_tx##n##_mux = \
 		SOC_DAPM_ENUM("XSP TX" #n " Source", xsp_tx##n##_enum)
+
+static const char * const asp_tx_texts[] = { "ADC1A", "ADC1B", "ADC2A", "ADC2B" };
+static SOC_ENUM_SINGLE_DECL(asp_tx1_enum, CS42L67_ASP_TX(0, 0), 5, asp_tx_texts);
+static SOC_ENUM_SINGLE_DECL(asp_tx2_enum, CS42L67_ASP_TX(1, 0), 5, asp_tx_texts);
+static const struct snd_kcontrol_new asp_tx1_mux = SOC_DAPM_ENUM("ASP TX1 Source", asp_tx1_enum);
+static const struct snd_kcontrol_new asp_tx2_mux = SOC_DAPM_ENUM("ASP TX2 Source", asp_tx2_enum);
 
 XSP_TX_ENUM(1);
 XSP_TX_ENUM(2);
@@ -454,6 +493,19 @@ static const struct snd_soc_dapm_widget cs42l67_widgets[] = {
 	SND_SOC_DAPM_MUX("XSP TX3 Mux", SND_SOC_NOPM, 0, 0, &xsp_tx3_mux),
 	SND_SOC_DAPM_MUX("XSP TX4 Mux", SND_SOC_NOPM, 0, 0, &xsp_tx4_mux),
 	SND_SOC_DAPM_AIF_OUT("XSP TX", "XSP Capture", 0, CS42L67_XSP_CTL, 6, 1),
+
+	/* the mic path iOS uses: ASP (I2S to MCA0), 2 channels */
+	SND_SOC_DAPM_SUPPLY("ADC1 Enable", CS42L67_ADC1_EN, 7, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("ADC2 Enable", CS42L67_ADC2_EN, 7, 0, NULL, 0),
+	SND_SOC_DAPM_MUX("ASP TX1 Mux", SND_SOC_NOPM, 0, 0, &asp_tx1_mux),
+	SND_SOC_DAPM_MUX("ASP TX2 Mux", SND_SOC_NOPM, 0, 0, &asp_tx2_mux),
+	SND_SOC_DAPM_PGA_E("ASP TX1 Path", SND_SOC_NOPM, 0, 0, NULL, 0,
+			   cs42l67_asp_tx_event,
+			   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
+	SND_SOC_DAPM_PGA_E("ASP TX2 Path", SND_SOC_NOPM, 1, 0, NULL, 0,
+			   cs42l67_asp_tx_event,
+			   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
+	SND_SOC_DAPM_AIF_OUT("ASP TX", "ASP Capture", 0, SND_SOC_NOPM, 0, 0),
 
 	/* experimental: XSP RX channel 1 -> "voice" L/R -> output A */
 	SND_SOC_DAPM_AIF_IN("XSP RX", "XSP Playback", 0, CS42L67_XSP_CTL, 4, 1),
@@ -505,6 +557,23 @@ static const struct snd_soc_dapm_route cs42l67_routes[] = {
 	{ "XSP TX4 Mux", "ADC2B", "ADC2B" },
 	{ "XSP TX", NULL, "XSP TX4 Mux" },
 
+	{ "ADC1A", NULL, "ADC1 Enable" },
+	{ "ADC1B", NULL, "ADC1 Enable" },
+	{ "ADC2A", NULL, "ADC2 Enable" },
+	{ "ADC2B", NULL, "ADC2 Enable" },
+	{ "ASP TX1 Mux", "ADC1A", "ADC1A" },
+	{ "ASP TX1 Mux", "ADC1B", "ADC1B" },
+	{ "ASP TX1 Mux", "ADC2A", "ADC2A" },
+	{ "ASP TX1 Mux", "ADC2B", "ADC2B" },
+	{ "ASP TX2 Mux", "ADC1A", "ADC1A" },
+	{ "ASP TX2 Mux", "ADC1B", "ADC1B" },
+	{ "ASP TX2 Mux", "ADC2A", "ADC2A" },
+	{ "ASP TX2 Mux", "ADC2B", "ADC2B" },
+	{ "ASP TX1 Path", NULL, "ASP TX1 Mux" },
+	{ "ASP TX2 Path", NULL, "ASP TX2 Mux" },
+	{ "ASP TX", NULL, "ASP TX1 Path" },
+	{ "ASP TX", NULL, "ASP TX2 Path" },
+
 	{ "DAC", NULL, "XSP RX" },
 	{ "DAC", NULL, "Output Path" },
 	{ "OUTA", NULL, "DAC" },
@@ -530,9 +599,13 @@ static const struct snd_kcontrol_new cs42l67_controls[] = {
 
 static int cs42l67_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
-	/* XSP as iOS runs it: the AP's MCA provides BCLK/FSYNC, DSP mode A */
+	/*
+	 * As iOS runs them, the AP's MCA provides BCLK/FSYNC on both ports:
+	 * XSP = DSP mode A on MCA2's TDM bus, ASP = I2S from MCA0
+	 */
 	if ((fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBC_CFC ||
-	    (fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_DSP_A ||
+	    (fmt & SND_SOC_DAIFMT_FORMAT_MASK) !=
+	    (dai->id == CS42L67_DAI_ASP ? SND_SOC_DAIFMT_I2S : SND_SOC_DAIFMT_DSP_A) ||
 	    (fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
 		return -EINVAL;
 	return 0;
@@ -554,6 +627,10 @@ static int cs42l67_hw_params(struct snd_pcm_substream *substream,
 	if (params_rate(params) != 48000 ||
 	    params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
 		return -EINVAL;
+
+	/* ASP: fixed 2 x 16-bit I2S, the sources are DAPM muxes */
+	if (dai->id == CS42L67_DAI_ASP)
+		return 0;
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		/* RX channel 1 listens to one slot; "voice" L and R both take it */
@@ -591,8 +668,10 @@ static const struct snd_soc_dai_ops cs42l67_dai_ops = {
 	.hw_params = cs42l67_hw_params,
 };
 
-static struct snd_soc_dai_driver cs42l67_dai = {
+static struct snd_soc_dai_driver cs42l67_dais[] = {
+	{
 	.name = "cs42l67-xsp",
+	.id = CS42L67_DAI_XSP,
 	.playback = {
 		.stream_name = "XSP Playback",
 		.channels_min = 1,
@@ -608,6 +687,19 @@ static struct snd_soc_dai_driver cs42l67_dai = {
 		.formats = SNDRV_PCM_FMTBIT_S16_LE,
 	},
 	.ops = &cs42l67_dai_ops,
+	},
+	{
+	.name = "cs42l67-asp",
+	.id = CS42L67_DAI_ASP,
+	.capture = {
+		.stream_name = "ASP Capture",
+		.channels_min = 1,
+		.channels_max = 2,
+		.rates = SNDRV_PCM_RATE_48000,
+		.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	},
+	.ops = &cs42l67_dai_ops,
+	},
 };
 
 /* ---- jack (optional, unverified register) ---- */
@@ -749,7 +841,7 @@ static int cs42l67_probe(struct spi_device *spi)
 	}
 
 	return devm_snd_soc_register_component(dev, &cs42l67_component,
-					       &cs42l67_dai, 1);
+					       cs42l67_dais, ARRAY_SIZE(cs42l67_dais));
 }
 
 static const struct of_device_id cs42l67_of_match[] = {

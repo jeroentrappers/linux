@@ -52,7 +52,10 @@ properties:
     description: TDM slot that XSP RX (playback) channel 1 takes its data from.
 
   '#sound-dai-cells':
-    const: 0
+    const: 1
+    description:
+      DAI 0 is the XSP (TDM slave on the speaker amp's bus), DAI 1 the ASP
+      (I2S capture, the port iOS records the microphones from).
 
 required:
   - compatible
@@ -76,6 +79,6 @@ examples:
             interrupts-extended = <&pinctrl 127 IRQ_TYPE_LEVEL_LOW>;
             clocks = <&mca2 0>;
             clock-names = "mclk";
-            #sound-dai-cells = <0>;
+            #sound-dai-cells = <1>;
         };
     };
