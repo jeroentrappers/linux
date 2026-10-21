@@ -646,6 +646,29 @@ error:
 	return retval;
 }
 
+/*
+ * suspend_keep: 0 = always suspend (soft-disconnect the gadget, PHY off);
+ * 1 = leave the controller and PHY running while a host has the gadget in L0
+ * (a USB console / netconsole survives suspend-to-idle without re-enumerating;
+ * the host just sees NAKs until resume), suspend as usual otherwise;
+ * 2 = never suspend the controller.
+ */
+static int suspend_keep = 1;
+module_param(suspend_keep, int, 0644);
+MODULE_PARM_DESC(suspend_keep,
+		 "System suspend: 0 = power down, 1 = stay up while a host is connected, 2 = always stay up");
+
+static bool dwc2_keep_in_suspend(struct dwc2_hsotg *dwc2)
+{
+	int keep = READ_ONCE(suspend_keep);
+
+	if (keep >= 2)
+		return true;
+
+	return keep == 1 && dwc2_is_device_mode(dwc2) &&
+	       dwc2->lx_state == DWC2_L0 && dwc2->connected;
+}
+
 static int __maybe_unused dwc2_suspend(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
@@ -654,6 +677,13 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
 
 	if (!dwc2->ll_hw_enabled)
 		return 0;
+
+	dwc2->kept_in_suspend = dwc2_keep_in_suspend(dwc2);
+	if (dwc2->kept_in_suspend) {
+		dev_info(dev, "staying up across suspend (suspend_keep=%d)\n",
+			 READ_ONCE(suspend_keep));
+		return 0;
+	}
 
 	is_device_mode = dwc2_is_device_mode(dwc2);
 	if (is_device_mode)
@@ -734,6 +764,11 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 
 	if (!dwc2->ll_hw_enabled)
 		return 0;
+
+	if (dwc2->kept_in_suspend) {
+		dwc2->kept_in_suspend = false;
+		return 0;
+	}
 
 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
 		ret = __dwc2_lowlevel_hw_enable(dwc2);
