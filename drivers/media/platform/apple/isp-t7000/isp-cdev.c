@@ -140,7 +140,7 @@ static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *o
 			fr.seq = b->seq;
 			fr.timestamp_ns = b->ts;
 			fr.bytesused = st->stride * st->height * 3 / 2;
-			fr.flags = (b->fwflags & 0x40000000) ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
+			fr.flags = b->filled ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
 			spin_unlock(&st->frame_lock);
 			break;
 		}

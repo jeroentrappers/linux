@@ -6,6 +6,11 @@
  *   { u32 type, u32 count, count x { u32 addr[3], u32 flags[3], u32 nplanes, u32 pool, u64 tag } }
  * Host -> fw on BUF_H2T (type-0 ring: word0 = fw-rel list, word1 = length, word2 bit 28 =
  * list mode); fw -> host on BUF_T2H (type-1 ring: reply word0 = list | 1, word2 = 0x80000000).
+ * A T2H list with word2 bits 31:28 = 1 (Asahi ISP_IPC_BUFEXC_FLAG_RENDER 0x10000000; list type 2:
+ * meta + frame; low bits seen on hw: ch 0 -> 0, ch 1 -> 5) carries rendered frames; word2 =
+ * 0x30000000 (list type 1) is CH_BUFFER_RETURN handing back unused buffers. The per-plane
+ * bit 0x40000000 is NOT a data flag: fw 0xa8ff0 sets it only when the
+ * fw CPU wrote the buffer (+0x50) and cleaned its cache (0xa7cd8); scaler DMA output never has it.
  * Buffer states change under st.frame_lock; everything that talks to the fw holds isp->lock.
  */
 #include <linux/delay.h>
@@ -22,7 +27,9 @@
 #define ISP_TAG(pool, i)	((ISP_TAG_MAGIC << 32) | ((u64)(pool) << 16) | (i))
 #define ISP_H2T_LIST		0x10000000	/* word2 bit 28: word0 is a buffer list */
 #define ISP_H2T_WORD2		0x30000000	/* Asahi's BUFEXC COMMAND value (bit 28 set) */
-#define ISP_BUF_FILLED		0x40000000	/* per-plane flag (Asahi submits it; fw sets it on data) */
+#define ISP_BUF_FILLED		0x40000000	/* per-plane: fw CPU wrote it + cache clean (Asahi submits it) */
+#define ISP_T2H_KIND(w2)	((w2) >> 28)	/* T2H word2 bits 31:28: 1 render, 3 buffer return */
+#define ISP_T2H_RENDER		1
 #define ISP_LIST_MIN		0x180		/* the fw's own T2H list size */
 
 struct isp_bl_entry {
@@ -178,11 +185,12 @@ static void isp_frame_limit(struct isp_stream *st)
 	}
 }
 
-static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
+static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e, bool rendered)
 {
 	struct isp_stream *st = &isp->st;
 	u32 pool = (e->tag >> 16) & 0xffff, i = e->tag & 0xffff;
 	struct isp_sbuf *b;
+	bool filled;
 
 	if ((e->tag >> 32) != ISP_TAG_MAGIC || i >= st->nbufs ||
 	    (pool != ISP_POOL_META && pool != ISP_POOL_RENDERED) ||
@@ -193,6 +201,7 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
 		return;
 	}
 	b = pool == ISP_POOL_META ? &st->meta[i] : &st->buf[i];
+	filled = rendered || (e->flags[0] & ISP_BUF_FILLED);
 	if (READ_ONCE(isp_stream_dump))
 		dev_info(isp->dev, "T2H: pool %u idx %u planes %u addr %08x %08x flags %08x %08x\n",
 			 pool, i, e->nplanes, e->addr[0], e->addr[1], e->flags[0], e->flags[1]);
@@ -204,10 +213,10 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
 				     pool, i, b->state);
 		return;
 	}
-	if (pool == ISP_POOL_RENDERED && !(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))
-		st->empty++;	/* no data flag (fw 0xa8ff0): recycle, not a frame */
+	if (pool == ISP_POOL_RENDERED && !filled && !READ_ONCE(isp_keep_empty))
+		st->empty++;	/* CH_BUFFER_RETURN (word2 0x30000000): recycle, not a frame */
 	if (pool == ISP_POOL_META || !st->on || st->stopping ||
-	    (!(e->flags[0] & ISP_BUF_FILLED) && !READ_ONCE(isp_keep_empty))) {
+	    (!filled && !READ_ONCE(isp_keep_empty))) {
 		b->state = BUF_FREE;	/* meta, empty, or a buffer handed back by CH_BUFFER_RETURN */
 		spin_unlock(&st->frame_lock);
 		return;
@@ -216,6 +225,7 @@ static void isp_t2h_entry(struct t7000_isp *isp, const struct isp_bl_entry *e)
 	b->seq = st->seq++;
 	b->ts = ktime_get_ns();
 	b->fwflags = e->flags[0];
+	b->filled = filled;
 	st->ready[st->nready++] = i;
 	st->frames++;
 	isp_frame_limit(st);
@@ -260,7 +270,7 @@ u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2)
 		dev_info(isp->dev, "T2H: list fw-rel 0x%08x type %u count %u w1 0x%x w2 0x%08x\n",
 			 rel, bl->type, bl->count, w1, w2);
 	for (i = 0; i < n; i++)
-		isp_t2h_entry(isp, &bl->e[i]);
+		isp_t2h_entry(isp, &bl->e[i], ISP_T2H_KIND(w2) == ISP_T2H_RENDER);
 	return rel | 1;
 }
 

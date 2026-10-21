@@ -157,6 +157,7 @@ struct isp_sbuf {
 	u32 seq;
 	u64 ts;
 	u32 fwflags;
+	bool filled;		/* came back in a RENDER list (T2H word2 0x1xxxxxxx) */
 };
 
 struct isp_stream {
