@@ -89,6 +89,7 @@ struct apple_swi {
 	struct i2c_client *master;
 	struct mutex lock;	/* one HDQ transaction at a time */
 	bool granted;
+	bool suspended;		/* system sleep: no HDQ traffic */
 	struct bq27xxx_device_info di;
 };
 
@@ -295,6 +296,9 @@ static int swi_begin(struct apple_swi *swi)
 {
 	int ret;
 
+	if (READ_ONCE(swi->suspended))
+		return -EAGAIN;
+
 	ret = pm_runtime_resume_and_get(swi->dev);
 	if (ret)
 		return ret;
@@ -445,8 +449,37 @@ static void apple_swi_remove(struct platform_device *pdev)
 	bq27xxx_battery_teardown(&swi->di);
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(apple_swi_pm_ops, swi_runtime_suspend,
-				 swi_runtime_resume, NULL);
+/*
+ * bq27xxx polls from a non-freezable work item, and a reader can also come in
+ * through external_power_changed() while the charger is suspending. Across
+ * system suspend the transfer would need the charger's I2C bus with its
+ * interrupt suspended, so stop the poll, refuse transfers until resume, and
+ * refresh the cache once on the way back.
+ */
+static int swi_suspend(struct device *dev)
+{
+	struct apple_swi *swi = dev_get_drvdata(dev);
+
+	WRITE_ONCE(swi->suspended, true);
+	cancel_delayed_work_sync(&swi->di.work);
+
+	return 0;
+}
+
+static int swi_resume(struct device *dev)
+{
+	struct apple_swi *swi = dev_get_drvdata(dev);
+
+	WRITE_ONCE(swi->suspended, false);
+	mod_delayed_work(system_percpu_wq, &swi->di.work, 0);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_swi_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(swi_suspend, swi_resume)
+	RUNTIME_PM_OPS(swi_runtime_suspend, swi_runtime_resume, NULL)
+};
 
 static const struct of_device_id apple_swi_of_match[] = {
 	{ .compatible = "apple,t7000-swi-gauge" },
