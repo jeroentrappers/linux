@@ -44,6 +44,9 @@
 #define  PATH_PDN_OUT		BIT(7)
 #define  PATH_PDN_IN		BIT(6)
 #define CS42L67_XSP_CFG1	0x011
+#define CS42L67_SP_FS		0x012	/* [3:0] serial port rate, CS42L73 VXSPFS codes */
+#define  SP_FS_MASK		GENMASK(3, 0)
+#define  SP_FS_48K		9	/* 8k=1 11.025k=2 12k=3 16k=4 22.05k=5 24k=6 32k=7 44.1k=8 */
 #define CS42L67_XSP_CTL		0x013
 #define  XSP_PDN		BIT(7)
 #define  XSP_TX_PDN		BIT(6)	/* codec -> AP */
@@ -243,6 +246,8 @@ static int cs42l67_power_up(struct cs42l67 *cs)
 	regmap_write(map, CS42L67_ANA_202, 0x00);
 	regmap_write(map, CS42L67_ANA_239, 0x00);
 	regmap_update_bits(map, CS42L67_OUT_CTL, 0x20, 0x20);
+	/* iOS sets the rate here (0x…86eeb58); 0 = "unknown" on the CS42L73 */
+	regmap_update_bits(map, CS42L67_SP_FS, SP_FS_MASK, SP_FS_48K);
 	regmap_write(map, CS42L67_MISC_130, 0xa0);
 
 	/*
