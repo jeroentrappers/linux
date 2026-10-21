@@ -180,8 +180,13 @@ void isp_cpu_stop(struct t7000_isp *isp)
 	for (i = 0; i < ARRAY_SIZE(isp_tlimit); i++)
 		isp_wr(isp, isp_tlimit[i], 0);
 	/* kext ISP_deInit always waits up to 100 ms per drain, fault or not */
-	__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)", false);
-	__isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)", false);
+	if (__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 100, "TLIMIT0 drain (+0x44 == 0)", false) ||
+	    __isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 100, "TLIMIT1 drain (+0x68 == 0)", false)) {
+		/* one more chance: a streaming pipeline may need longer than iOS's 100 ms */
+		if (__isp_wait(isp, ISP_TLIMIT0_OUT, ~0U, 0, 1000, "TLIMIT0 drain, 2nd try", false) ||
+		    __isp_wait(isp, ISP_TLIMIT1_OUT, ~0U, 0, 1000, "TLIMIT1 drain, 2nd try", false))
+			isp->drain_failed = true;
+	}
 	isp->cpu_started = false;
 	isp_log_window(isp, "after CPU stop");
 }

@@ -28,6 +28,7 @@ static int isp_open(struct inode *inode, struct file *f)
 	int ret = 0;
 
 	mutex_lock(&isp_open_lock);
+	isp_trace_mark(isp, "open (count %d, stages done %d)", isp->open_count, isp->done);
 	if (isp->open_count == 0 && isp->done < ISP_FULL_STAGE) {
 		dev_info(isp->dev, "/dev/isp0 opened: booting the ISP\n");
 		ret = isp_boot(isp, ISP_FULL_STAGE);
@@ -47,6 +48,7 @@ static int isp_release(struct inode *inode, struct file *f)
 	struct t7000_isp *isp = f->private_data;
 
 	mutex_lock(&isp_open_lock);
+	isp_trace_mark(isp, "release (count %d)", isp->open_count);
 	if (--isp->open_count == 0) {
 		mutex_lock(&isp->lock);
 		isp_stream_stop(isp);
@@ -69,6 +71,7 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	u32 v;
 	long ret;
 
+	isp_trace_mark(isp, "ioctl 0x%x", cmd);
 	switch (cmd) {
 	case ISP_IOC_INFO:
 		memset(&info, 0, sizeof(info));

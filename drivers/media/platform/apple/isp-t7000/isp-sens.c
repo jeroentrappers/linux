@@ -76,7 +76,10 @@ static int isp_gpio_base(struct t7000_isp *isp)
 
 static int isp_pin_out(struct t7000_isp *isp, int idx, int pin, const char *name)
 {
-	int ret = gpio_request_one(isp->gpio_base + pin, GPIOF_OUT_INIT_HIGH, name);
+	int ret;
+
+	isp_trace_mark(isp, "gpio %d (%s) := 1", pin, name);
+	ret = gpio_request_one(isp->gpio_base + pin, GPIOF_OUT_INIT_HIGH, name);
 
 	if (ret) {
 		dev_err(isp->dev, "sens_pwr: gpio %d (%s) request failed: %d\n", pin, name, ret);
@@ -99,7 +102,10 @@ static int isp_refclk_set(struct t7000_isp *isp, int n)
 	if (old & REFCLK_BUSY)
 		dev_warn(isp->dev, "sens_pwr: ref clock %d busy (bit 30) before the write: 0x%08x\n",
 			 n, old);
-	writel((old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24, r);
+	v = (old & REFCLK_KEEP) | (isp_refclk_cfg & 0x3f) | ((isp_refclk_cfg >> 6) & 3) << 24;
+	if (unlikely(READ_ONCE(isp_trace)))
+		isp_trace_io(isp, 'W', "REFCLK", REFCLK_PHYS + 4 * n, v);
+	writel(v, r);
 	/* iOS waits up to 0x2ee00 (~192 ms) in configISPRefClock */
 	ret = readl_poll_timeout(r, v, !(v & REFCLK_BUSY), 10, REFCLK_TIMEOUT_US);
 	dev_info(isp->dev, "sens_pwr: ref clock %d (PMGR +0x%x): 0x%08x -> 0x%08x%s\n", n,
@@ -114,6 +120,9 @@ static void isp_extclk_set(struct t7000_isp *isp, int n, int pin)
 
 	isp->extclk_old[n] = old;
 	isp->extclk_saved |= BIT(n);
+	if (unlikely(READ_ONCE(isp_trace)))
+		isp_trace_io(isp, 'W', "PIN", PINCTRL_PHYS + 4 * pin,
+			     (old & ~PIN_PERIPH) | FIELD_PREP(PIN_PERIPH, isp_extclk_periph));
 	writel((old & ~PIN_PERIPH) | FIELD_PREP(PIN_PERIPH, isp_extclk_periph), r);
 	dev_info(isp->dev, "sens_pwr: extclk pin %d: 0x%08x -> 0x%08x (periph %d)\n", pin, old,
 		 readl(r), isp_extclk_periph);
@@ -166,6 +175,7 @@ static void isp_pin_release(struct t7000_isp *isp, int idx)
 {
 	if (!isp->gpio_on[idx])
 		return;
+	isp_trace_mark(isp, "gpio %d := 0", isp->gpio_on[idx]);
 	gpio_set_value(isp->gpio_base + isp->gpio_on[idx], 0);
 	gpio_free(isp->gpio_base + isp->gpio_on[idx]);
 	isp->gpio_on[idx] = 0;
@@ -181,12 +191,17 @@ void isp_sensor_power_off(struct t7000_isp *isp)
 	isp_pin_release(isp, 2);
 	isp_pin_release(isp, 1);
 	for (n = 1; n >= 0; n--) {
+		if (isp->extclk_saved & BIT(n) && READ_ONCE(isp_trace))
+			isp_trace_io(isp, 'W', "PIN", PINCTRL_PHYS + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR),
+				     isp->extclk_old[n]);
 		if (isp->extclk_saved & BIT(n))
 			writel(isp->extclk_old[n],
 			       isp->pinregs + 4 * (n ? PIN_CLK_FRONT : PIN_CLK_REAR));
 		if (isp->refclk_saved & BIT(n)) {
 			u32 v;
 
+			if (READ_ONCE(isp_trace))
+				isp_trace_io(isp, 'W', "REFCLK", REFCLK_PHYS + 4 * n, isp->refclk_old[n]);
 			writel(isp->refclk_old[n], isp->refclk + 4 * n);
 			if (readl_poll_timeout(isp->refclk + 4 * n, v, !(v & REFCLK_BUSY), 10,
 					       REFCLK_TIMEOUT_US))

@@ -36,6 +36,8 @@ static int ps_set(struct t7000_isp *isp, u32 off, const char *name, u32 state)
 
 	v &= ~(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET);
 	v |= FIELD_PREP(PS_TARGET, state);
+	if (unlikely(READ_ONCE(isp_trace)))
+		isp_trace_io(isp, 'W', "PMGR", PMGR_PS_PHYS + off, v);
 	writel(v, isp->pmgr + off);
 	ret = readl_poll_timeout(isp->pmgr + off, v,
 				 FIELD_GET(PS_ACTUAL, v) == state, 10, 100000);

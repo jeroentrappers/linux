@@ -226,6 +226,7 @@ struct t7000_isp {
 	struct delayed_work poll_work;
 	bool poll_init, poll_on;
 	bool started;		/* START acked */
+	bool drain_failed;	/* TLIMIT drains did not reach 0 at the last CPU stop */
 	bool io_dead;		/* an IO command timed out: fw not answering */
 	u32 cmd_seq;
 	int irq;
@@ -258,16 +259,29 @@ extern int isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en, isp_graceful, isp_fwl
 extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
 extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
 extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
-extern int isp_keep_on, isp_preset;
+extern int isp_keep_on, isp_preset, isp_stream_nostart;
 extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+
+/*
+ * trace=1: every ISP-window write (and the PMGR / pin / ref clock writes) is printed
+ * BEFORE it happens, followed by msleep(50) in task context, so with the console on
+ * tty0 the last line on screen names the access that hung. trace=2 adds the reads.
+ */
+extern int isp_trace;
+void isp_trace_io(struct t7000_isp *isp, char rw, const char *blk, u64 phys, u32 val);
+void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...) __printf(2, 3);
 
 static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
 {
+	if (unlikely(READ_ONCE(isp_trace) >= 2))
+		isp_trace_io(isp, 'R', "ISP", ISP_PHYS_BASE + off, 0);
 	return readl(isp->regs + off);
 }
 
 static inline void isp_wr(struct t7000_isp *isp, u32 off, u32 val)
 {
+	if (unlikely(READ_ONCE(isp_trace)))
+		isp_trace_io(isp, 'W', "ISP", ISP_PHYS_BASE + off, val);
 	writel(val, isp->regs + off);
 }
 
@@ -298,6 +312,7 @@ struct isp_surf *isp_surf_find(struct t7000_isp *isp, u32 iova);
 /* isp-boot.c */
 int isp_wait(struct t7000_isp *isp, u32 off, u32 mask, u32 want, uint ms,
 	     const char *what);
+bool isp_cpu_drained(struct t7000_isp *isp);
 void isp_fw_peek(struct t7000_isp *isp);
 int isp_stage_fw(struct t7000_isp *isp);
 int isp_stage_cpu(struct t7000_isp *isp);

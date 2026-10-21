@@ -16,6 +16,7 @@
  * stream=1 (with stage=9) adds /dev/isp0 (isp-cdev.c): the ISP is powered off again
  * after the boot test unless keep_on=1, booted on open and powered off on last close.
  */
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -103,6 +104,39 @@ uint isp_setfile_front = 0x1421;
 module_param_named(setfile_front, isp_setfile_front, uint, 0644);
 MODULE_PARM_DESC(setfile_front, "IMX190 module setfile (0x1421/0x1422, 0 = none)");
 
+int isp_trace;
+module_param_named(trace, isp_trace, int, 0644);
+MODULE_PARM_DESC(trace, "1 = print every register write before it happens + msleep(50) (hang hunting, console on tty0); 2 = also reads");
+int isp_stream_nostart;
+module_param_named(stream_nostart, isp_stream_nostart, int, 0644);
+MODULE_PARM_DESC(stream_nostart, "1 = ISP_IOC_START configures everything but does not post buffers or send CH_START (no frame DMA)");
+
+void isp_trace_io(struct t7000_isp *isp, char rw, const char *blk, u64 phys, u32 val)
+{
+	if (rw == 'W')
+		dev_info(isp->dev, "T W %s 0x%09llx = 0x%08x\n", blk, phys, val);
+	else
+		dev_info(isp->dev, "T R %s 0x%09llx\n", blk, phys);
+	if (in_task() && preemptible())
+		msleep(50);
+}
+
+void isp_trace_mark(struct t7000_isp *isp, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	if (!READ_ONCE(isp_trace))
+		return;
+	va_start(args, fmt);
+	vaf.fmt = fmt;
+	vaf.va = &args;
+	dev_info(isp->dev, "T: %pV\n", &vaf);
+	va_end(args);
+	if (in_task() && preemptible())
+		msleep(50);
+}
+
 static struct t7000_isp *the_isp;
 
 static int isp_stage_power(struct t7000_isp *isp)
@@ -136,12 +170,25 @@ void isp_teardown(struct t7000_isp *isp)
 	mutex_lock(&isp->lock);
 	if (isp->fw_up && isp_graceful)
 		isp_fw_shutdown(isp);
+	isp_trace_mark(isp, "teardown: CPU stop");
 	if (isp->cpu_started)
 		isp_cpu_stop(isp);
+	isp_trace_mark(isp, "teardown: sensor power off");
 	isp_sensor_power_off(isp);
 	if (isp->dart_on)
 		isp_dart_fini(isp);
-	if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
+	if (isp->drain_failed) {
+		/*
+		 * Outstanding ISP transactions: gating ps_isp now can wedge the fabric
+		 * (the whole SoC). Leave the ISP powered and leak its memory instead.
+		 */
+		dev_err(isp->dev, "!!! TLIMIT drains did not reach 0: NOT powering ps_isp/ps_media off, LEAKING all ISP memory; reboot before the next test !!!\n");
+		isp->on_media = isp->on_isp = isp->on_sens0 = isp->on_sens1 = false;
+		INIT_LIST_HEAD(&isp->surfs);
+		isp->fw = isp->ipc = isp->heap = NULL;
+		isp->l1 = NULL;
+		memset(isp->l2, 0, sizeof(isp->l2));
+	} else if (isp_power_off(isp) && (isp->l1 || !list_empty(&isp->surfs))) {
 		/*
 		 * ps_isp did not gate: the ISP (and its DART) may still be live, so
 		 * every page it could reach stays allocated. Leaked on purpose.
@@ -178,6 +225,11 @@ int isp_boot(struct t7000_isp *isp, int upto)
 
 	for (n = isp->done + 1; n <= upto; n++) {
 		dev_info(isp->dev, "stage %d: start\n", n);
+		isp_trace_mark(isp, "stage %d", n);
+		if (isp->drain_failed) {
+			dev_err(isp->dev, "an earlier CPU stop left transactions outstanding: refusing to boot\n");
+			return -EBUSY;
+		}
 		if (n > 1 && isp->isp_was_on) {
 			dev_err(isp->dev, "ps_isp was already on at load: someone else owns it, refusing writes\n");
 			return -EBUSY;

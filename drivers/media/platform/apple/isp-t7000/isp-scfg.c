@@ -338,6 +338,10 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	st->nready = 0;
 	st->stopping = false;
 	st->on = true;
+	if (READ_ONCE(isp_stream_nostart)) {
+		dev_info(isp->dev, "stream_nostart=1: configured, no buffers posted, no CH_START\n");
+		goto out;
+	}
 	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
 	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
 	if (ret) {

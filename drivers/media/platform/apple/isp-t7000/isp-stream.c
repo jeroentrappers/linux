@@ -72,6 +72,7 @@ static int isp_h2t_post(struct t7000_isp *isp, u32 n, const u32 *pool, const u32
 
 	if (!c || !st->lists || !n)
 		return -ENODEV;
+	isp_trace_mark(isp, "H2T post: %u buffer(s), first pool %u idx %u", n, pool[0], idx[0]);
 	slot = c->idx;
 	m = (u32 *)(c->ring + slot * ISP_MSG_SIZE);
 	if (!(READ_ONCE(m[0]) & 1)) {
@@ -106,6 +107,8 @@ void isp_stream_kick(struct t7000_isp *isp)
 	struct isp_stream *st = &isp->st;
 	u32 pool[ISP_BUFLIST_MAX], idx[ISP_BUFLIST_MAX], n, i, round;
 
+	if (READ_ONCE(isp_stream_nostart))
+		return;		/* debug: configure only, never hand buffers to the fw */
 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
 		n = 0;
 		spin_lock(&st->frame_lock);
@@ -228,6 +231,7 @@ u32 isp_bt_handle(struct t7000_isp *isp, u32 w0, u32 w1, u32 w2)
 	const struct isp_bl *bl;
 
 	st->t2h_msgs++;
+	isp_trace_mark(isp, "T2H: %08x %08x %08x", w0, w1, w2);
 	if (!(w2 & ISP_H2T_LIST)) {
 		dev_warn_ratelimited(isp->dev, "T2H: single-buffer message %08x %08x %08x ignored\n",
 				     w0, w1, w2);

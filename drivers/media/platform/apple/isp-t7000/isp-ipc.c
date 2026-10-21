@@ -284,6 +284,7 @@ int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
 	rel = isp_rel(isp->ipc->iova + isp->cmd_off);	/* 64-byte aligned: bit0 = 0 */
 	memset(buf, 0, max(insize, outsize));
 	memcpy(buf, pkt, insize);
+	isp_trace_mark(isp, "cmd #%u opcode 0x%04x -> IO slot %u", seq, op, slot);
 	WRITE_ONCE(m[1], insize);
 	WRITE_ONCE(m[2], outsize);
 	dma_wmb();
