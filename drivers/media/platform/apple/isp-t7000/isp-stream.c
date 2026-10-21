@@ -109,6 +109,8 @@ void isp_stream_kick(struct t7000_isp *isp)
 
 	if (READ_ONCE(isp_stream_nostart))
 		return;		/* debug: configure only, never hand buffers to the fw */
+	if (READ_ONCE(isp_stream_nobufs))
+		return;		/* wedge hunt: CH_START with no frame/meta buffer posted */
 	for (round = 0; round < 4 && st->on && !st->stopping; round++) {
 		n = 0;
 		spin_lock(&st->frame_lock);

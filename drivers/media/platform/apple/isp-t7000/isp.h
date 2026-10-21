@@ -76,11 +76,30 @@
 #define DART_ERROR_FLAG		BIT(31)
 #define DART_ERROR_ADDR		0x1c
 #define DART_TTBR(sid, i)	(0x40 + 0x10 * (sid) + 4 * (i))
-#define DART_FETCH_CFG		0x20		/* iOS: ADT fetch-config (0xe0303) */
+/*
+ * DART kext restore 0x7fe6204: +0x20 = ADT diag-config (0x100), +0x30 = ADT fetch-config
+ * (0xe0303); 0x7fe6448: +0x2c = ADT bypass-address (absent on dart-isp -> 0).
+ */
+#define DART_DIAG_CFG		0x20
 #define DART_ERR_REFLECT	0x24		/* iOS: ADT error-reflector >> 12 */
-#define DART_DIAG_CFG		0x30		/* iOS: written on restore */
-#define SMMU_STREAM_EN		0xc		/* iOS: byte[sid] |= 0x80 */
+#define DART_BYPASS		0x2c
+#define DART_FETCH_CFG		0x30
+#define ISP_DART_DIAG_IOS	0x100		/* ADT dart-isp diag-config */
+#define ISP_DART_FETCH_IOS	0xe0303		/* ADT dart-isp fetch-config */
+/*
+ * SMMU block (+0x24000): names from the DART kext state dump 0x7fe5788. No TTBRs: iOS
+ * never writes any, the block walks the DART's tables [A]. iOS setTranslationEnable
+ * (0x7fe35a8 -> 0x7fe361c) sets CONFIG byte[sid] |= 0x80 right after the DART TCR.
+ */
+#define SMMU_STREAM_EN		0xc		/* SMMU_CONFIG: byte[sid] |= 0x80 */
+#define SMMU_ERROR		0x10		/* SMMU_ERROR_STATUS, bit 31 = fault */
+#define SMMU_ERR_AXI0		0x14
+#define SMMU_ERR_AXI1		0x18
+#define SMMU_ERR_ADDR		0x1c
+#define SMMU_DIAG		0x20
 #define SMMU_ERR_REFLECT	0x24		/* iOS: error-reflector[1] >> 12 */
+#define SMMU_BYPASS		0x2c		/* reset 0x08080808; iOS: bypass-address[1] = 0 */
+#define SMMU_ERR_ACK		0x0c00006c	/* iOS fault handler 0x7fe46c4: write back status & this */
 #define ISP_ERR_REFLECTOR	0x20ffff000ULL	/* ADT dart-isp error-reflector: 2 x 0x2_0fff_f000 */
 #define DART_TTBR_VALID		BIT(31)
 #define DART_PTE_VALID		0x3		/* A8: tables + leaves need bits 1:0 = 11 */
@@ -213,6 +232,17 @@ struct t7000_isp {
 	/* mini DART */
 	bool dart_on;
 	u32 dart_old_reflect, smmu_old_reflect;
+	bool smmu_set, dart_ios_set;	/* smmu_en / dart_ios wrote these: restore at fini */
+	u32 smmu_old_cfg, dart_old_diag, dart_old_fetch, dart_old_bypass, smmu_old_bypass;
+	unsigned long smmu_err_logged, smmu_faults;
+
+	/* canary=1: pages at canary_base + IOVA, where an untranslated (bypassed) DMA lands [A] */
+#define ISP_CANARIES		6
+	u64 canary_pa[ISP_CANARIES];
+	u64 canary_sum[ISP_CANARIES];
+	const char *canary_what[ISP_CANARIES];
+	unsigned int ncanary;
+	unsigned long canary_hits;
 	u64 *l1;
 	dma_addr_t l1_dma;
 	u64 *l2[512];
@@ -235,6 +265,7 @@ struct t7000_isp {
 	bool started;		/* START acked */
 	bool drain_failed;	/* TLIMIT drains did not reach 0 at the last CPU stop */
 	bool io_dead;		/* an IO command timed out: fw not answering */
+	bool skip_final_service;	/* quiet_ms: no service pass right after CH_START */
 	u32 cmd_seq;
 	int irq;
 	atomic_t irq_count;
@@ -268,6 +299,10 @@ extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
 extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
 extern int isp_keep_on, isp_preset, isp_stream_nostart, isp_dart_reflector, isp_dart_alias;
 extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
+/* wedge hunt (re/CAMERA-WEDGE.md), all default off */
+extern uint isp_quiet_ms;
+extern int isp_stream_nobufs, isp_dart_ios, isp_canary;
+extern unsigned long long isp_canary_base;
 
 /*
  * trace=1: every ISP-window write (and the PMGR / pin / ref clock writes) is printed
@@ -310,6 +345,7 @@ int isp_dart_init(struct t7000_isp *isp);
 void isp_dart_fini(struct t7000_isp *isp);
 void isp_dart_log(struct t7000_isp *isp, const char *when);
 bool isp_dart_fault(struct t7000_isp *isp);
+bool isp_smmu_fault(struct t7000_isp *isp);
 struct isp_surf *isp_surf_alloc(struct t7000_isp *isp, u32 size, u32 tag);
 void isp_surf_free(struct t7000_isp *isp, struct isp_surf *s);
 void isp_surf_free_all(struct t7000_isp *isp);
@@ -339,6 +375,8 @@ void isp_ipc_stop(struct t7000_isp *isp);
 void isp_fw_shutdown(struct t7000_isp *isp);
 int isp_cmd_simple(struct t7000_isp *isp, const char *name, void *pkt,
 		   u32 insize, u32 outsize, u16 *status);
+void isp_canary_arm(struct t7000_isp *isp);
+void isp_quiet_window(struct t7000_isp *isp, uint ms);
 
 /* isp-sens.c */
 int isp_sensor_power_on(struct t7000_isp *isp);

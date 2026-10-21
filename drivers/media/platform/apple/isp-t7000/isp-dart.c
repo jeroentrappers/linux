@@ -26,10 +26,12 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
 	u32 s[16];
 	int i;
 
-	dev_info(isp->dev, "dart %s: fetch-cfg %08x err-reflector %08x diag %08x; smmu stream-en %08x +0x20 %08x err-reflector %08x\n",
-		 when, dart_rd(isp, DART_FETCH_CFG), dart_rd(isp, DART_ERR_REFLECT),
-		 dart_rd(isp, DART_DIAG_CFG), isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN),
-		 isp_rd(isp, ISP_SMMU + 0x20), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT));
+	dev_info(isp->dev, "dart %s: diag(+0x20) %08x err-reflector %08x bypass(+0x2c) %08x fetch(+0x30) %08x; smmu stream-en %08x err %08x diag %08x err-reflector %08x bypass %08x\n",
+		 when, dart_rd(isp, DART_DIAG_CFG), dart_rd(isp, DART_ERR_REFLECT),
+		 dart_rd(isp, DART_BYPASS), dart_rd(isp, DART_FETCH_CFG),
+		 isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN), isp_rd(isp, ISP_SMMU + SMMU_ERROR),
+		 isp_rd(isp, ISP_SMMU + SMMU_DIAG), isp_rd(isp, ISP_SMMU + SMMU_ERR_REFLECT),
+		 isp_rd(isp, ISP_SMMU + SMMU_BYPASS));
 	dev_info(isp->dev, "dart %s: cmd %08x tcr %08x err %08x erraddr %08x ttbr0 %08x %08x %08x %08x\n",
 		 when, dart_rd(isp, DART_STREAM_CMD), dart_rd(isp, DART_TCR),
 		 dart_rd(isp, DART_ERROR), dart_rd(isp, DART_ERROR_ADDR),
@@ -42,9 +44,33 @@ void isp_dart_log(struct t7000_isp *isp, const char *when)
 		 s[10], s[11], s[12], s[13], s[14], s[15]);
 }
 
+/*
+ * SMMU fault (iOS 0x7fe27e8: SMMU+0x10 bit 31; ack 0x7fe46c4: write back status &
+ * 0x0c00006c). Logged and acked only: a reflected pipeline fault does not stop the fw,
+ * so it does not mark the IO channel dead like a DART fault does.
+ */
+bool isp_smmu_fault(struct t7000_isp *isp)
+{
+	u32 err = isp_rd(isp, ISP_SMMU + SMMU_ERROR);
+
+	if (!(err & BIT(31)))
+		return false;
+	isp->smmu_faults++;
+	if (isp->smmu_err_logged++ < 5)
+		dev_err(isp->dev, "SMMU fault #%lu: status 0x%08x axi-req0 0x%08x axi-req1 0x%08x addr 0x%08x (config 0x%08x)\n",
+			isp->smmu_faults, err, isp_rd(isp, ISP_SMMU + SMMU_ERR_AXI0),
+			isp_rd(isp, ISP_SMMU + SMMU_ERR_AXI1), isp_rd(isp, ISP_SMMU + SMMU_ERR_ADDR),
+			isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN));
+	isp_wr(isp, ISP_SMMU + SMMU_ERROR, err & SMMU_ERR_ACK);
+	return true;
+}
+
 bool isp_dart_fault(struct t7000_isp *isp)
 {
-	u32 err = dart_rd(isp, DART_ERROR);
+	u32 err;
+
+	isp_smmu_fault(isp);
+	err = dart_rd(isp, DART_ERROR);
 
 	if (!(err & DART_ERROR_FLAG))
 		return false;
@@ -121,13 +147,40 @@ int isp_dart_init(struct t7000_isp *isp)
 	}
 	dart_wr(isp, DART_TCR, (tcr & ~m) | (0x80808080U & m));
 	isp->dart_on = true;
+	if (isp_dart_ios) {
+		/* iOS restore 0x7fe62ec/0x7fe6394/0x7fe64cc: fetch, diag, bypass (absent = 0) */
+		isp->dart_old_diag = dart_rd(isp, DART_DIAG_CFG);
+		isp->dart_old_fetch = dart_rd(isp, DART_FETCH_CFG);
+		isp->dart_old_bypass = dart_rd(isp, DART_BYPASS);
+		isp->smmu_old_bypass = isp_rd(isp, ISP_SMMU + SMMU_BYPASS);
+		dart_wr(isp, DART_FETCH_CFG, ISP_DART_FETCH_IOS);
+		dart_wr(isp, DART_DIAG_CFG, ISP_DART_DIAG_IOS);
+		dart_wr(isp, DART_BYPASS, 0);
+		isp_wr(isp, ISP_SMMU + SMMU_DIAG, 0);
+		isp_wr(isp, ISP_SMMU + SMMU_BYPASS, 0);
+		isp->dart_ios_set = true;
+		dev_info(isp->dev, "dart_ios: dart diag 0x%08x fetch 0x%08x bypass 0x%08x (was %08x %08x %08x), smmu bypass 0x%08x (was %08x)\n",
+			 dart_rd(isp, DART_DIAG_CFG), dart_rd(isp, DART_FETCH_CFG),
+			 dart_rd(isp, DART_BYPASS), isp->dart_old_diag, isp->dart_old_fetch,
+			 isp->dart_old_bypass, isp_rd(isp, ISP_SMMU + SMMU_BYPASS),
+			 isp->smmu_old_bypass);
+	}
 	isp_dart_flush(isp);
 	if (isp_smmu_en) {
-		u32 v = isp_rd(isp, ISP_SMMU + 0xc);
+		/*
+		 * iOS setTranslationEnable(sid, true) = DART TCR, then SMMU CONFIG byte[sid]
+		 * |= 0x80 (0x7fe361c) and a read-back check of the 0x80 bits. Without it the
+		 * SMMU clients (the pipeline DMA, [A]) are not translated.
+		 */
+		u32 v = isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN);
 
-		isp_wr(isp, ISP_SMMU + 0xc, v | (0x80808080U & m));
-		dev_info(isp->dev, "smmu_en: SMMU+0xc 0x%08x -> 0x%08x\n", v,
-			 isp_rd(isp, ISP_SMMU + 0xc));
+		isp->smmu_old_cfg = v;
+		isp->smmu_set = true;
+		isp_wr(isp, ISP_SMMU + SMMU_STREAM_EN, v | (0x80808080U & m));
+		v = isp_rd(isp, ISP_SMMU + SMMU_STREAM_EN);
+		dev_info(isp->dev, "smmu_en: SMMU+0xc 0x%08x -> 0x%08x%s\n", isp->smmu_old_cfg, v,
+			 (v & 0x80808080U & m) == (0x80808080U & m) ? "" :
+			 " (!!! enable bits did not stick: iOS treats that as fatal)");
 	}
 	isp->iova_next = isp_fw_iova;
 	dev_info(isp->dev, "dart: L1 at %pad, sids 0x%x, old tcr 0x%08x, old err 0x%08x\n",
@@ -142,6 +195,13 @@ void isp_dart_fini(struct t7000_isp *isp)
 	int sid, i;
 
 	isp_dart_fault(isp);
+	if (isp->smmu_faults)
+		dev_info(isp->dev, "smmu: %lu fault(s) this boot\n", isp->smmu_faults);
+	if (isp->smmu_set) {
+		/* SMMU translation off before the DART tables go away */
+		isp_wr(isp, ISP_SMMU + SMMU_STREAM_EN, isp->smmu_old_cfg);
+		isp->smmu_set = false;
+	}
 	dart_wr(isp, DART_TCR, dart_rd(isp, DART_TCR) & ~tcr_mask());
 	for (sid = 0; sid < 4; sid++)
 		if (isp_dart_sids & BIT(sid))
@@ -151,6 +211,13 @@ void isp_dart_fini(struct t7000_isp *isp)
 	if (isp_dart_reflector) {
 		dart_wr(isp, DART_ERR_REFLECT, isp->dart_old_reflect);
 		isp_wr(isp, ISP_SMMU + SMMU_ERR_REFLECT, isp->smmu_old_reflect);
+	}
+	if (isp->dart_ios_set) {
+		dart_wr(isp, DART_FETCH_CFG, isp->dart_old_fetch);
+		dart_wr(isp, DART_DIAG_CFG, isp->dart_old_diag);
+		dart_wr(isp, DART_BYPASS, isp->dart_old_bypass);
+		isp_wr(isp, ISP_SMMU + SMMU_BYPASS, isp->smmu_old_bypass);
+		isp->dart_ios_set = false;
 	}
 	isp->dart_on = false;
 	dev_info(isp->dev, "dart: translation disabled\n");

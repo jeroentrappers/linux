@@ -142,6 +142,23 @@ module_param_named(dart_reflector, isp_dart_reflector, int, 0444);
 MODULE_PARM_DESC(dart_reflector, "1 = program the DART + SMMU error reflector (+0x24 = 0x20ffff000 >> 12, ADT error-reflector) like iOS, so a faulting ISP DMA completes harmlessly instead of wedging the fabric");
 int isp_dart_alias;
 module_param_named(dart_alias, isp_dart_alias, int, 0444);
+
+/* wedge hunt after CH_START (re/CAMERA-WEDGE.md H6+), all default off */
+uint isp_quiet_ms;
+module_param_named(quiet_ms, isp_quiet_ms, uint, 0644);
+MODULE_PARM_DESC(quiet_ms, "N > 0: after CH_START, N ms (max 10000) with no ISP register access at all (IRQ masked, no mailbox ack/doorbell), only a heartbeat line every 10 ms + fw TERMINAL lines");
+int isp_stream_nobufs;
+module_param_named(stream_nobufs, isp_stream_nobufs, int, 0644);
+MODULE_PARM_DESC(stream_nobufs, "1 = CH_START without posting any frame/meta buffer (only the fw's own SHAREDMALLOC buffers get DMA)");
+int isp_dart_ios;
+module_param_named(dart_ios, isp_dart_ios, int, 0444);
+MODULE_PARM_DESC(dart_ios, "1 = also program DART diag(+0x20)=0x100, fetch(+0x30)=0xe0303, bypass(+0x2c)=0 and SMMU bypass(+0x2c)=0 like the iOS DART restore");
+int isp_canary;
+module_param_named(canary, isp_canary, int, 0644);
+MODULE_PARM_DESC(canary, "1 = before CH_START log which RAM pages sit at canary_base + the frame/RAW IOVAs (where an untranslated DMA would land), and watch them during quiet_ms");
+unsigned long long isp_canary_base = 0x800000000ULL;
+module_param_named(canary_base, isp_canary_base, ullong, 0444);
+MODULE_PARM_DESC(canary_base, "PA an untranslated (SMMU bypass) IOVA is assumed to be offset by (default 0x8_0000_0000 = DRAM base, SMMU+0x2c reset 0x08080808)");
 MODULE_PARM_DESC(dart_alias, "1 = also point TTBR index 1 (IOVA 1-2 GB) at the same L1, so fw addresses 0x4xxxxxxx alias 0x0xxxxxxx (test knob)");
 
 static struct t7000_isp *the_isp;
@@ -299,6 +316,8 @@ static int __init isp_init(void)
 	dev_info(isp->dev, "load: stage=%d dry_run=%d irq=%d sens=%d smmu_en=%d fw_iova=0x%x dart_sids=0x%x platform_id=0x%x\n",
 		 stage, isp_dry_run, isp_irq_en, isp_sens, isp_smmu_en,
 		 isp_fw_iova, isp_dart_sids, isp_platform_id);
+	dev_info(isp->dev, "load: wedge knobs: dart_ios=%d quiet_ms=%u stream_nobufs=%d canary=%d canary_base=0x%llx (build n61-isp-wedge)\n",
+		 isp_dart_ios, isp_quiet_ms, isp_stream_nobufs, isp_canary, isp_canary_base);
 
 	ret = -ENOMEM;
 	isp->pmgr = ioremap_np(PMGR_PS_PHYS, PMGR_PS_SIZE);

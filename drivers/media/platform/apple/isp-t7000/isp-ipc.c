@@ -18,6 +18,7 @@
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
@@ -330,8 +331,175 @@ int isp_cmd_send(struct t7000_isp *isp, void *pkt, u32 insize, u32 outsize,
 	dev_info(isp->dev, "cmd #%u opcode 0x%04x: done after %u ms, word0 0x%08x w1 0x%x w2 0x%x, status 0x%04x\n",
 		 seq, op, jiffies_to_msecs(jiffies - start), w0, READ_ONCE(m[1]),
 		 READ_ONCE(m[2]), ((u16 *)buf)[3]);
-	isp_service(isp);
+	if (isp->skip_final_service)
+		dev_info(isp->dev, "cmd #%u: no service pass after it (quiet_ms window follows)\n", seq);
+	else
+		isp_service(isp);
+	/*
+	 * fwlog lines are otherwise printed only after the whole START ioctl returns, so a
+	 * wedge inside START loses all of them (H2/H2b "no fw text"). Under trace the
+	 * extra printing time does not matter: print them per command.
+	 */
+	if (READ_ONCE(isp_trace))
+		isp_term_flush(isp);
 	return 0;
+}
+
+/*
+ * canary=1 (wedge hunt): the SMMU passes untranslated addresses through while its
+ * CONFIG byte is 0, and its bypass register reads 0x08080808 = the DRAM base 0x8_0000_0000
+ * [A, re/CAMERA-WEDGE.md]. Pipeline DMA to IOVA X would then hit PA canary_base + X.
+ * Name what lives there (printed before CH_START, so it survives a wedge) and watch a
+ * hash of each page during quiet_ms. Reads only.
+ */
+static u64 isp_canary_hash(u64 pa)
+{
+	unsigned long pfn = PHYS_PFN(pa);
+	const u64 *p;
+	u64 h = 0;
+	int i;
+
+	/* arm64: NOMAP memory has a struct page but no linear mapping */
+	if (!pfn_valid(pfn) || !pfn_is_map_memory(pfn))
+		return 0;
+	p = page_address(pfn_to_page(pfn));
+	for (i = 0; i < PAGE_SIZE / 8; i++)
+		h = (h ^ READ_ONCE(p[i])) * 0x100000001b3ULL;
+	return h;
+}
+
+static void isp_canary_add(struct t7000_isp *isp, u32 iova, const char *what)
+{
+	u64 pa = isp_canary_base + iova;
+	unsigned long pfn = PHYS_PFN(pa);
+	unsigned int i = isp->ncanary;
+	struct page *pg;
+
+	if (i >= ISP_CANARIES)
+		return;
+	isp->canary_pa[i] = pa;
+	isp->canary_what[i] = what;
+	isp->ncanary++;
+	if (!pfn_valid(pfn)) {
+		dev_info(isp->dev, "canary %u (%s): iova 0x%08x -> PA 0x%llx: no struct page (not RAM / hole)\n",
+			 i, what, iova, pa);
+		return;
+	}
+	pg = pfn_to_page(pfn);
+	isp->canary_sum[i] = isp_canary_hash(pa);
+	dev_info(isp->dev, "canary %u (%s): iova 0x%08x -> PA 0x%llx: %s refcount %d reserved %d slab %d lru %d buddy %d flags %pGp, hash %016llx\n",
+		 i, what, iova, pa, pfn_is_map_memory(pfn) ? "RAM" : "NOMAP RAM (not watched)",
+		 page_ref_count(pg), PageReserved(pg), PageSlab(pg), PageLRU(pg),
+		 PageBuddy(pg), &pg->flags, isp->canary_sum[i]);
+}
+
+/* Before CH_START: FRM0, MTA0 and where the fw's 'RAW0' alloc will go (next IOVA). */
+void isp_canary_arm(struct t7000_isp *isp)
+{
+	struct isp_stream *st = &isp->st;
+	u32 next = isp->iova_next;	/* the next surface (guard page already included) */
+
+	isp->ncanary = 0;
+	if (!READ_ONCE(isp_canary))
+		return;
+	dev_info(isp->dev, "canary: base 0x%llx; kernel text PA %pa (printk), data PA %pa (jiffies), memstart 0x%llx\n",
+		 isp_canary_base, &(phys_addr_t){ __pa_symbol(_printk) },
+		 &(phys_addr_t){ __pa_symbol(&jiffies) }, (u64)memstart_addr);
+	if (st->buf[0].surf)
+		isp_canary_add(isp, st->buf[0].surf->iova, "FRM0");
+	if (st->meta[0].surf)
+		isp_canary_add(isp, st->meta[0].surf->iova, "MTA0");
+	isp_canary_add(isp, next, "RAW0 start?");
+	isp_canary_add(isp, next + SZ_4M, "RAW0 +4M?");
+	isp_canary_add(isp, next + SZ_8M, "RAW0 +8M?");
+	isp_canary_add(isp, next + SZ_8M + SZ_4M, "RAW0 +12M?");
+}
+
+static void isp_canary_check(struct t7000_isp *isp, unsigned int ms)
+{
+	unsigned int i;
+	u64 h;
+
+	for (i = 0; i < isp->ncanary; i++) {
+		if (!isp->canary_sum[i])
+			continue;
+		h = isp_canary_hash(isp->canary_pa[i]);
+		if (h == isp->canary_sum[i])
+			continue;
+		isp->canary_hits++;
+		dev_info(isp->dev, "canary %u (%s) PA 0x%llx CHANGED at +%u ms: hash %016llx -> %016llx\n",
+			 i, isp->canary_what[i], isp->canary_pa[i], ms, isp->canary_sum[i], h);
+		isp->canary_sum[i] = h;
+	}
+}
+
+/* fw->host request slots waiting for us (DRAM peek, not answered) */
+static int isp_pending_requests(struct t7000_isp *isp, u32 *bt)
+{
+	int n = 0;
+	u32 i, w0;
+
+	*bt = 0;
+	for (i = 0; i < isp->nchans; i++) {
+		struct isp_chan *c = &isp->chans[i];
+
+		if (!c->ring || c->type != CHAN_REPLY)
+			continue;
+		w0 = READ_ONCE(isp_slot(c, c->idx)[0]);
+		if (w0 & 1 || (!w0 && !READ_ONCE(isp_slot(c, c->idx)[1])))
+			continue;
+		n++;
+		if (c == isp->bt)
+			*bt = w0;
+	}
+	return n;
+}
+
+/*
+ * quiet_ms (wedge hunt): right after CH_START completes, touch no ISP register for @ms:
+ * the IRQ line is masked, no mailbox ack, no doorbell, no DART/SMMU read. Only DRAM:
+ * the TERMINAL ring (type 2: consumed by a DRAM write, no doorbell) is drained and
+ * printed, the other fw->host rings are only peeked. One heartbeat line per 10 ms.
+ * Heartbeats that stop inside the window = an async wedge (fw / pipeline DMA); a
+ * window that completes and a wedge at the first access after it = the AP access
+ * (ISP window stuck). Called with isp->lock held (the poll worker waits on it).
+ */
+void isp_quiet_window(struct t7000_isp *isp, uint ms)
+{
+	unsigned long start = jiffies, end;
+	unsigned int beat = 0, el;
+	bool masked = false;
+	u32 bt;
+	int req;
+
+	ms = min(ms, 10000U);
+	if (isp->irq >= 0) {
+		disable_irq_nosync(isp->irq);	/* not disable_irq(): the thread may wait on isp->lock */
+		masked = true;
+	}
+	dev_info(isp->dev, "quiet: %u ms without any ISP register access (IRQ %s)\n", ms,
+		 masked ? "masked" : "not in use");
+	end = start + msecs_to_jiffies(ms);
+	while (time_before(jiffies, end)) {
+		int lines = 0;
+
+		if (isp->tm && isp->tm->ring && isp->tm->type == CHAN_REPORT)
+			lines = isp_drain(isp, isp->tm);
+		isp_term_flush(isp);
+		req = isp_pending_requests(isp, &bt);
+		el = jiffies_to_msecs(jiffies - start);
+		dev_info(isp->dev, "quiet +%u ms: beat %u, fw lines %d, requests waiting %d%s\n",
+			 el, beat, lines, req, bt ? " (BUF_T2H: frame list posted)" : "");
+		if (!(beat % 5))
+			isp_canary_check(isp, el);
+		beat++;
+		msleep(10);
+	}
+	isp_canary_check(isp, jiffies_to_msecs(jiffies - start));
+	dev_info(isp->dev, "quiet: window over after %u ms (%lu canary change(s)), resuming ISP access\n",
+		 jiffies_to_msecs(jiffies - start), isp->canary_hits);
+	if (masked)
+		enable_irq(isp->irq);
 }
 
 /* Hard half: ack the mailbox (as the kext ISR does) and hand off to the thread. */

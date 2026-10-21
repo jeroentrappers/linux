@@ -262,6 +262,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	struct isp_stream *st = &isp->st;
 	struct isp_cmd_output_config oc = { .h.opcode = CISP_CMD_CH_OUTPUT_CONFIG_SET };
 	u32 want;
+	uint quiet;
 	u8 *buf;
 	int ret;
 
@@ -343,7 +344,15 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 		goto out;
 	}
 	isp_stream_kick(isp);		/* every buffer is FREE: one or two lists on BUF_H2T */
+	if (READ_ONCE(isp_stream_nobufs))
+		dev_info(isp->dev, "stream_nobufs=1: CH_START with no buffer posted (only fw-allocated DMA, e.g. 'RAW0')\n");
+	isp_canary_arm(isp);		/* canary=1: before CH_START, so it is logged even if the SoC wedges */
+	quiet = READ_ONCE(isp_quiet_ms);
+	isp->skip_final_service = quiet != 0;
 	ret = isp_ch_simple(isp, "CH_START", CISP_CMD_CH_START, st->ch, 0xc, 0, 0, true);
+	isp->skip_final_service = false;
+	if (!ret && quiet)
+		isp_quiet_window(isp, quiet);
 	if (ret) {
 		isp_stream_stop(isp);
 		goto out;
