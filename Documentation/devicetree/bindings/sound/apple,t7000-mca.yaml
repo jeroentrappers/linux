@@ -51,6 +51,15 @@ properties:
     description:
       I2S switch pin group the port is routed to. Defaults to the MCA index.
 
+  apple,shim-sram-offset:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 0x3fc
+    multipleOf: 4
+    default: 0
+    description:
+      Byte offset of this MCA's FIFOs in the TX and RX shim SRAM pools
+      (0x400 bytes each), so that MCAs running at once do not overlap.
+
   '#sound-dai-cells':
     enum: [0, 1]
     description:
