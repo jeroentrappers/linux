@@ -275,7 +275,9 @@
 			interrupts = <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&nco 2>;
 			power-domains = <&ps_mca2>;
-			#sound-dai-cells = <0>;
+			#sound-dai-cells = <1>;
+			/* the MCLK pads of MCA0-4 */
+			#clock-cells = <1>;
 			status = "disabled";
 		};
 
