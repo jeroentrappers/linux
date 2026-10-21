@@ -12,7 +12,11 @@
  *   ioctl(fd, ISP_IOC_STOP);  close(fd);     last close powers the sensor/ISP down (keep_on=0)
  *
  * Userspace may hold at most nbufs - 1 buffers; beyond that the driver recycles the
- * oldest one it handed out.
+ * oldest one it handed out. O_NONBLOCK: read() returns -EAGAIN when no frame is ready.
+ * INFO reports the format of the camera started last (re-read + remap after each START).
+ *
+ * Upstreaming TODO: ioctl letter 'I' collides with ISDN in
+ * Documentation/userspace-api/ioctl/ioctl-number.rst; pick a free range before posting.
  */
 #ifndef _UAPI_LINUX_APPLE_ISP_T7000_H
 #define _UAPI_LINUX_APPLE_ISP_T7000_H
@@ -21,6 +25,7 @@
 #include <linux/types.h>
 
 #define ISP_INFO_VERSION	1
+#define ISP_UAPI_VERSION	ISP_INFO_VERSION	/* name used by Orchard's copy (ui/src/isp_uapi.h) */
 
 struct isp_info {
 	__u32 version;		/* ISP_INFO_VERSION */

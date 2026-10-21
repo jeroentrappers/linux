@@ -259,7 +259,7 @@ extern uint isp_fw_iova, isp_dart_sids, isp_platform_id, isp_poll_ms;
 extern uint isp_boot_timeout_ms, isp_cmd_timeout_ms, isp_max_shared_mb;
 extern int isp_sens_pwr, isp_refclk, isp_extclk_periph, isp_stream_en, isp_stream_dump;
 extern int isp_keep_on, isp_preset;
-extern uint isp_refclk_cfg, isp_nbufs, isp_setfile_rear, isp_setfile_front;
+extern uint isp_refclk_cfg, isp_nbufs, isp_out_range, isp_setfile_rear, isp_setfile_front;
 
 static inline u32 isp_rd(struct t7000_isp *isp, u32 off)
 {

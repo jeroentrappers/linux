@@ -294,7 +294,8 @@ int isp_stream_start(struct t7000_isp *isp, u32 camera)
 	oc.chan = st->ch;
 	oc.width = st->width;
 	oc.height = st->height;
-	oc.colorspace = 1;		/* REC709 (Asahi) */
+	/* fw 0x1b99c logs this field as "range" ("format = %d, range %d"): Asahi calls it colorspace */
+	oc.colorspace = isp_out_range;
 	oc.format = 0;			/* 2-plane YUV 4:2:0 = NV12 (fw 0x162b8) */
 	oc.strides[0] = st->stride;
 	oc.strides[1] = st->stride;

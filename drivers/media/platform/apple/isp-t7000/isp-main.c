@@ -90,6 +90,9 @@ MODULE_PARM_DESC(keep_on, "stream=1: 1 = keep the ISP booted when /dev/isp0 is c
 int isp_preset = -1;
 module_param_named(preset, isp_preset, int, 0644);
 MODULE_PARM_DESC(preset, "sensor preset to stream (-1 = smallest output >= 640x480)");
+uint isp_out_range = 1;
+module_param_named(out_range, isp_out_range, uint, 0644);
+MODULE_PARM_DESC(out_range, "OUTPUT_CONFIG_SET +0x14, logged by the fw as 'range' (Asahi: colorspace 1 = REC709)");
 uint isp_nbufs = 4;
 module_param_named(nbufs, isp_nbufs, uint, 0444);
 MODULE_PARM_DESC(nbufs, "frame buffers (2..8)");
