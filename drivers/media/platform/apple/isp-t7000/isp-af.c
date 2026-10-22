@@ -127,16 +127,38 @@ static bool af_rear(struct t7000_isp *isp)
 	return isp->st.on && isp->st.sensor_id == AF_SENSOR_REAR;
 }
 
-/* isp_stream_start(), right before CH_START (iOS H6ISPCaptureStreamStart order). Never fatal. */
+/* the replayed request holds the lens (one scan done, lock, manual) rather than running CAF */
+static bool af_held(struct isp_stream *st)
+{
+	return st->af_have && st->af_mode != ISP_FOCUS_CONTINUOUS;
+}
+
+/* open / last release: nothing of an earlier client is replayed */
+void isp_af_forget(struct t7000_isp *isp)
+{
+	isp->st.af_have = false;
+	isp->st.af_lens = -1;
+	memset(isp->st.af_win, 0, sizeof(isp->st.af_win));
+}
+
+/*
+ * isp_stream_start(), right before CH_START (iOS H6ISPCaptureStreamStart order). Never fatal.
+ * A client's last ISP_IOC_FOCUS on this channel is replayed instead of plain CAF, so a STOP +
+ * START (Orchard's photo: viewfinder -> still preset -> viewfinder) keeps tap-to-focus / AF lock:
+ * its window, and CAF off when the lens was held (isp_af_stream_on puts the lens back).
+ */
 void isp_af_prestart(struct t7000_isp *isp)
 {
+	struct isp_stream *st = &isp->st;
 	int fpix = READ_ONCE(isp_af_fpix), en = READ_ONCE(isp_af_enable);
 	u8 pkt[0x20];
 
+	if (st->af_have && st->af_ch != st->ch)
+		isp_af_forget(isp);	/* (the other camera's request) */
 	if (!READ_ONCE(isp_af) || !af_rear(isp))
 		return;
 	if (en >= 0) {
-		af_pkt(pkt, 0x70a, isp->st.ch);
+		af_pkt(pkt, 0x70a, st->ch);
 		put_unaligned_le16(en, pkt + 0xc);
 		af_cmd(isp, "FOCUS_ENABLE", pkt, 0x14, NULL);
 	}
@@ -144,17 +166,56 @@ void isp_af_prestart(struct t7000_isp *isp)
 		af_simple(isp, "AF_FOCUS_PIXELS_ENABLE", 0x8410, 0x10, !!fpix, 0, NULL);
 	if (READ_ONCE(isp_af_start))
 		af_simple(isp, "AF_START", 0x400, 0xc, 0, 0, NULL);
-	af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 1, READ_ONCE(isp_af_mode), NULL);
+	if (st->af_have && st->af_win[2] && st->af_win[3]) {
+		struct isp_focus f = { .x = st->af_win[0], .y = st->af_win[1], .w = st->af_win[2],
+				       .h = st->af_win[3] };
+
+		af_window(isp, "AF_WINDOW_PARAM_SET", 0x8401, &f, NULL);
+	}
+	if (af_held(st))
+		af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 0, 0, NULL);
+	else
+		af_simple(isp, "AF_CONTINUOUS_FOCUS_ENABLE", 0x840f, 0x10, 1, READ_ONCE(isp_af_mode),
+			  NULL);
 }
 
 /* isp_stream_start(), after CH_START succeeded */
 void isp_af_stream_on(struct t7000_isp *isp)
 {
+	struct isp_stream *st = &isp->st;
+	int pos;
+
 	if (!READ_ONCE(isp_af) || !af_rear(isp))
 		return;
-	dev_info(isp->dev, "af: continuous AF on (mode %u), lens position %d, focus_ldo %s\n",
-		 READ_ONCE(isp_af_mode), af_position(isp),
+	pos = af_position(isp);
+	if (af_held(st)) {
+		int was = pos;
+
+		if (st->af_lens >= 0 && pos != st->af_lens) {	/* the fw moved it across STOP/START */
+			u8 pkt[0x20];
+
+			af_pkt(pkt, 0x702, st->ch);
+			pkt[0xc] = st->af_lens;
+			if (!af_cmd(isp, "FOCUS_POSITION_SET", pkt, 0x14, NULL))
+				pos = af_position(isp);
+		}
+		dev_info(isp->dev, "af: replayed mode %u window %u,%u %ux%u: lens held, %d -> %d (was %d at stop)\n",
+			 st->af_mode, st->af_win[0], st->af_win[1], st->af_win[2], st->af_win[3], was, pos,
+			 st->af_lens);
+		return;
+	}
+	dev_info(isp->dev, "af: continuous AF on (mode %u%s), lens position %d, focus_ldo %s\n",
+		 READ_ONCE(isp_af_mode), st->af_have ? ", replayed window" : "", pos,
 		 af_pmic ? (af_ldo_set ? "switched on" : "was on") : "not controlled");
+}
+
+/* isp_stream_stop(), before CH_STOP (isp->lock held): where a held lens is, for the next START */
+void isp_af_prestop(struct t7000_isp *isp)
+{
+	struct isp_stream *st = &isp->st;
+
+	if (READ_ONCE(isp_af) && af_rear(isp) && af_held(st))
+		st->af_lens = af_position(isp);
 }
 
 static void af_clamp(u16 *pos, u16 *len)
@@ -191,7 +252,7 @@ long isp_af_ioctl(struct t7000_isp *isp, void __user *up)
 	rear = af_rear(isp);
 	if (win && f.flags & ISP_FOCUS_F_AE)
 		ret = af_window(isp, "AE_WINDOW_PARAM_SET", 0x8200, &f, &fwst);
-	if (!rear || f.mode == ISP_FOCUS_QUERY || ret)
+	if (!rear || f.mode == ISP_FOCUS_QUERY || ret || !READ_ONCE(isp_af))	/* af=0: no AF command at all */
 		goto pos;
 	if (win && f.mode != ISP_FOCUS_MANUAL)
 		ret = af_window(isp, "AF_WINDOW_PARAM_SET", 0x8401, &f, &fwst);
@@ -222,8 +283,18 @@ long isp_af_ioctl(struct t7000_isp *isp, void __user *up)
 		break;
 	}
 	}
+	if (!ret) {	/* replayed at the next START of this channel (isp_af_prestart) */
+		isp->st.af_have = true;
+		isp->st.af_ch = isp->st.ch;
+		isp->st.af_mode = f.mode;
+		isp->st.af_lens = -1;
+		if (win) {
+			isp->st.af_win[0] = f.x, isp->st.af_win[1] = f.y;
+			isp->st.af_win[2] = f.w, isp->st.af_win[3] = f.h;
+		}
+	}
 pos:
-	f.position = rear ? af_position(isp) : -1;
+	f.position = rear && READ_ONCE(isp_af) ? af_position(isp) : -1;
 	f.fw_status = fwst;
 	dev_info(isp->dev, "af: mode %u window %u,%u %ux%u%s -> lens %d, fw status 0x%04x%s\n", f.mode,
 		 f.x, f.y, f.w, f.h, f.flags & ISP_FOCUS_F_AE ? " +AE" : "", f.position, fwst,

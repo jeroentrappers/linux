@@ -182,6 +182,13 @@ struct isp_stream {
 	struct isp_surf *lists;		/* ISP_BUFLIST_SLOT per BUF_H2T slot */
 	struct isp_surf *setf;		/* setfile copy for CH_SET_FILE_LOAD */
 	u32 seq;
+	bool mapped_cached;	/* a user mapping of this START is cacheable: read() invalidates (isp-cdev.c) */
+	/* rear AF request to replay at the next START of the same channel (isp-af.c); cleared at the
+	 * first open and the last release, so it lives as long as one client's session */
+	bool af_have;
+	u32 af_ch, af_mode;
+	u16 af_win[4];		/* x, y, w, h per-mille; w == 0: none */
+	int af_lens;		/* lens position at the last STOP while AF was held, -1 = unknown */
 	/* frame queue (frame_lock): indices in completion order */
 	spinlock_t frame_lock;
 	wait_queue_head_t wait;
@@ -404,6 +411,8 @@ void isp_stream_kick(struct t7000_isp *isp);
 /* isp-af.c */
 void isp_af_power(struct t7000_isp *isp, bool on);
 void isp_af_prestart(struct t7000_isp *isp);
+void isp_af_prestop(struct t7000_isp *isp);
+void isp_af_forget(struct t7000_isp *isp);
 void isp_af_stream_on(struct t7000_isp *isp);
 long isp_af_ioctl(struct t7000_isp *isp, void __user *up);
 

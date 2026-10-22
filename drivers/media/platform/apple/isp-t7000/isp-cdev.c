@@ -30,6 +30,8 @@ static int isp_open(struct inode *inode, struct file *f)
 
 	mutex_lock(&isp_open_lock);
 	isp_trace_mark(isp, "open (count %d, stages done %d)", isp->open_count, isp->done);
+	if (isp->open_count == 0)
+		isp_af_forget(isp);	/* (a new client: no AF request of the last one is replayed) */
 	if (isp->open_count == 0 && isp->done < ISP_FULL_STAGE) {
 		dev_info(isp->dev, "/dev/isp0 opened: booting the ISP\n");
 		ret = isp_boot(isp, ISP_FULL_STAGE);
@@ -53,6 +55,7 @@ static int isp_release(struct inode *inode, struct file *f)
 	if (--isp->open_count == 0) {
 		mutex_lock(&isp->lock);
 		isp_stream_stop(isp);
+		isp_af_forget(isp);
 		mutex_unlock(&isp->lock);
 		if (!isp_keep_on) {
 			dev_info(isp->dev, "/dev/isp0 closed: powering sensor + ISP off (keep_on=0)\n");
@@ -65,7 +68,7 @@ static int isp_release(struct inode *inode, struct file *f)
 
 static bool isp_mmap_cached = true;
 module_param_named(mmap_cached, isp_mmap_cached, bool, 0644);
-MODULE_PARM_DESC(mmap_cached, "frames mapped cacheable + invalidated on read() (default); 0 = write-combine (old)");
+MODULE_PARM_DESC(mmap_cached, "frames mapped cacheable + invalidated on read() (default); 0 = write-combine (old). Read at mmap time (the next START)");
 
 static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -101,7 +104,7 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		mutex_unlock(&isp->lock);
 		isp_term_flush(isp);
 		return ret;
-	case ISP_IOC_STOP:
+	case ISP_IOC_STOP:	/* (the AF request stays: the next START of this channel replays it) */
 		mutex_lock(&isp->lock);
 		isp_stream_stop(isp);
 		mutex_unlock(&isp->lock);
@@ -133,7 +136,7 @@ static void isp_frame_sync_for_cpu(struct t7000_isp *isp, struct isp_surf *s)
 	unsigned int i;
 
 	for (i = 0; i < s->npages; i++)
-		dma_sync_single_for_cpu(isp->dev, s->dma[i], PAGE_SIZE, DMA_FROM_DEVICE);
+		dma_sync_single_for_cpu(isp->dev, s->dma[i], PAGE_SIZE, DMA_BIDIRECTIONAL);	/* (as mapped) */
 }
 
 static bool isp_frame_ready(struct isp_stream *st)
@@ -165,7 +168,7 @@ static ssize_t isp_read(struct file *f, char __user *ubuf, size_t len, loff_t *o
 			fr.bytesused = st->stride * st->height * 3 / 2;
 			fr.flags = b->filled ? 0 : ISP_FRAME_FLAG_NOT_FILLED;
 			spin_unlock(&st->frame_lock);
-			if (READ_ONCE(isp_mmap_cached))
+			if (READ_ONCE(st->mapped_cached))	/* (latched at mmap: the knob may have changed since) */
 				isp_frame_sync_for_cpu(isp, b->surf);
 			break;
 		}
@@ -213,6 +216,8 @@ static int isp_mmap(struct file *f, struct vm_area_struct *vma)
 	vm_flags_mod(vma, VM_DONTEXPAND | VM_DONTDUMP, VM_MAYWRITE);
 	if (!READ_ONCE(isp_mmap_cached))
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	else
+		WRITE_ONCE(st->mapped_cached, true);	/* sticky until the next START: any cached mapping is synced */
 	for (pg = first; pg < first + npg && !ret; pg++, addr += PAGE_SIZE)
 		ret = vm_insert_page(vma, addr, st->buf[pg / per].surf->pages[pg % per]);
 out:

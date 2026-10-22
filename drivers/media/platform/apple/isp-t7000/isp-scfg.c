@@ -536,6 +536,7 @@ int isp_stream_start(struct t7000_isp *isp, u32 arg)
 		goto out;
 	st->seq = 0;
 	st->nready = 0;
+	st->mapped_cached = false;	/* (the previous START's mappings are gone: STOP = unmap) */
 	st->stopping = false;
 	st->on = true;
 	if (READ_ONCE(isp_stream_nostart)) {

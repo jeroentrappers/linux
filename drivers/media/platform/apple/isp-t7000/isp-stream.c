@@ -316,6 +316,7 @@ void isp_stream_stop(struct t7000_isp *isp)
 		return;
 	st->stopping = true;
 	if (isp->io && !isp->io_dead) {
+		isp_af_prestop(isp);	/* (a held lens: remember where it is) */
 		c.h.opcode = CISP_CMD_CH_STOP;
 		isp_cmd_simple(isp, "CH_STOP", &c, 0xc, 0xc, NULL);
 		c.h = (struct isp_cmd_hdr){ .opcode = CISP_CMD_CH_BUFFER_RETURN };
