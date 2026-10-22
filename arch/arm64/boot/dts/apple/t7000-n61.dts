@@ -209,9 +209,14 @@
 	charger: charger@75 {
 		compatible = "ti,sn2400";
 		reg = <0x75>;
-		/* PMU event 3 = VBUS detect (iOS wake reason "usb") */
-		interrupts-extended = <&pmic_irq 3 IRQ_TYPE_EDGE_RISING>;
-		interrupt-names = "vbus";
+		/*
+		 * INT on PMU GPIO 0 = PMU event 24 (ADT tigris: interrupts
+		 * <24>, parent = pmu), a level input. PMU event 3 ("usb") is
+		 * not wired on N61: iOS asks the charger instead (ADT pmu
+		 * function-get_vbus_detect), and it never fires on a re-plug.
+		 */
+		interrupts-extended = <&pmic_irq 24 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
 		wakeup-source;
 		input-current-limit-microamp = <500000>;
 		constant-charge-current-max-microamp = <1000000>;
@@ -384,7 +389,7 @@
 };
 
 /*
- * PMU events (iOS AppleD2186PMU): 3 = VBUS detect, 24 + n = PMU GPIO n
+ * PMU events (iOS AppleD2186PMU): 3 = "usb" (unused on N61), 24 + n = PMU GPIO n
  * (0 = SN2400 INT, 6 = WLAN host wake, 9 = BT host wake), 88 = RTC alarm.
  */
 &pmic_irq {
