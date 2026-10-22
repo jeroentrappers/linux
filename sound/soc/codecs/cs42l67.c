@@ -111,7 +111,13 @@
  * that the encoding only makes continuous at +10 / +20 dB.
  */
 #define  ADC_VOL_MAX		76
-#define  ADC_VOL_DEFAULT	0	/* iOS ctl 0x170 default: -6 dB = 0x34 */
+/*
+ * Default +20 dB (0x80, stage 2 + 0 fine). iOS' own ctl 0x170 default is
+ * index 0 (-6 dB) with CoreAudio raising it at run time; at -6 dB the n61
+ * mics read about -57 dBFS (90th percentile) for speech at arm's length,
+ * so +26 dB puts speech near -30 dBFS with room left for taps.
+ */
+#define  ADC_VOL_DEFAULT	52
 #define CS42L67_ADC1_EN		0x234	/* iOS: 0x80 while an ADC1 channel is on */
 #define CS42L67_ADC2_EN		0x235	/* iOS: 0x80 while an ADC2 channel is on */
 #define  ADC_EN_SHIFT		4	/* [7:4]: 0x8 on (iOS), 0x7 = reset value */
@@ -337,7 +343,7 @@ static int cs42l67_power_up(struct cs42l67 *cs)
 	regmap_write(map, CS42L67_ADC1_DMIC, 0);
 	regmap_write(map, CS42L67_ADC2_PDN, ADC_PDN_IDLE);
 	regmap_write(map, CS42L67_ADC2_DMIC, 0);
-	/* iOS defaults: PGA ctl 0x170 = 0, ctl 0x16f ("boost") = 1 */
+	/* PGA = ADC_VOL_DEFAULT; iOS' ctl 0x16f ("boost") default = 1 */
 	for (i = 0; i < ARRAY_SIZE(cs42l67_adc_gain_regs); i++) {
 		regmap_write(map, cs42l67_adc_gain_regs[i],
 			     cs42l67_adc_vol_to_reg(ADC_VOL_DEFAULT));
