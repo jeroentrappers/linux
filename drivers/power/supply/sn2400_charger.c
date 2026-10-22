@@ -8,17 +8,21 @@
  * it has an input current limit, so the driver only programs the input
  * and charge current and reads back the ADC.
  *
- * The interrupt line goes through the PMU, which has no driver yet, so
- * the input limit is checked by polling instead.
+ * The chip's own interrupt line goes through the PMU and is not used: the
+ * input limit is checked by polling. The PMU's VBUS detect event, when
+ * described, reports plug and unplug right away and wakes the system.
  */
 
 #include <linux/bits.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pm_wakeirq.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 
@@ -54,6 +58,7 @@
 #define SN2400_DEF_INPUT	500000
 #define SN2400_DEF_CHG		1000000
 #define SN2400_POLL_MS		5000
+#define SN2400_VBUS_SETTLE_MS	500
 
 struct sn2400 {
 	struct device *dev;
@@ -63,6 +68,8 @@ struct sn2400 {
 	struct mutex lock;	/* serialises ADC use and the limits */
 	u32 input_limit;	/* requested, 0 = input suspended */
 	u32 chg_current;
+	bool suspended;		/* no I2C from the VBUS event until resume */
+	bool vbus_event;	/* report a change from the next work run */
 };
 
 static const struct regmap_config sn2400_regmap = {
@@ -143,9 +150,13 @@ static void sn2400_work(struct work_struct *work)
 {
 	struct sn2400 *sn = container_of(work, struct sn2400, work.work);
 	unsigned int code, want;
+	bool changed;
 	int vbus;
 
 	mutex_lock(&sn->lock);
+
+	changed = sn->vbus_event;
+	sn->vbus_event = false;
 
 	if (!sn->input_limit)
 		goto out;
@@ -165,11 +176,62 @@ static void sn2400_work(struct work_struct *work)
 
 	dev_dbg(sn->dev, "restoring input limit\n");
 	sn2400_set_input_limit(sn, sn->input_limit);
-	power_supply_changed(sn->psy);
+	changed = true;
 
 out:
 	mutex_unlock(&sn->lock);
+	if (changed)
+		power_supply_changed(sn->psy);
 	schedule_delayed_work(&sn->work, msecs_to_jiffies(SN2400_POLL_MS));
+}
+
+/*
+ * PMU VBUS detect (plug or unplug). Let VBUS settle, then check the input
+ * limit (the chip starts at 90 mA after a plug) and tell userspace.
+ */
+static irqreturn_t sn2400_vbus_irq(int irq, void *data)
+{
+	struct sn2400 *sn = data;
+
+	dev_dbg(sn->dev, "VBUS event\n");
+
+	mutex_lock(&sn->lock);
+	sn->vbus_event = true;
+	if (!sn->suspended)
+		mod_delayed_work(system_percpu_wq, &sn->work,
+				 msecs_to_jiffies(SN2400_VBUS_SETTLE_MS));
+	mutex_unlock(&sn->lock);
+
+	return IRQ_HANDLED;
+}
+
+static int sn2400_request_vbus_irq(struct sn2400 *sn)
+{
+	struct device *dev = sn->dev;
+	int irq, ret;
+
+	irq = fwnode_irq_get_byname(dev_fwnode(dev), "vbus");
+	if (irq == -EPROBE_DEFER)
+		return irq;
+	if (irq <= 0)
+		return 0;
+
+	ret = devm_request_threaded_irq(dev, irq, NULL, sn2400_vbus_irq,
+					IRQF_ONESHOT, "sn2400-vbus", sn);
+	if (ret) {
+		dev_warn(dev, "VBUS interrupt unusable: %d\n", ret);
+		return 0;
+	}
+
+	if (device_property_read_bool(dev, "wakeup-source")) {
+		ret = devm_device_init_wakeup(dev);
+		if (!ret)
+			ret = devm_pm_set_wake_irq(dev, irq);
+		if (ret)
+			dev_warn(dev, "VBUS wake unusable: %d\n", ret);
+	}
+
+	return 0;
 }
 
 static const enum power_supply_property sn2400_props[] = {
@@ -341,6 +403,10 @@ static int sn2400_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	ret = sn2400_request_vbus_irq(sn);
+	if (ret)
+		return ret;
+
 	schedule_delayed_work(&sn->work, msecs_to_jiffies(SN2400_POLL_MS));
 
 	dev_info(dev, "input limit %u mA, charge current %u mA\n",
@@ -359,6 +425,10 @@ static int sn2400_suspend(struct device *dev)
 {
 	struct sn2400 *sn = dev_get_drvdata(dev);
 
+	mutex_lock(&sn->lock);
+	sn->suspended = true;
+	mutex_unlock(&sn->lock);
+
 	cancel_delayed_work_sync(&sn->work);
 
 	return 0;
@@ -367,6 +437,10 @@ static int sn2400_suspend(struct device *dev)
 static int sn2400_resume(struct device *dev)
 {
 	struct sn2400 *sn = dev_get_drvdata(dev);
+
+	mutex_lock(&sn->lock);
+	sn->suspended = false;
+	mutex_unlock(&sn->lock);
 
 	mod_delayed_work(system_percpu_wq, &sn->work, 0);
 
