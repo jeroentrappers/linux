@@ -95,7 +95,7 @@
 #define CS42L67_ADC1B_GAIN	0x207
 #define CS42L67_ADC1A_BOOST	0x208
 #define CS42L67_ADC1B_BOOST	0x209
-#define  ADC_BOOST		BIT(7)	/* iOS ctl 0x16f, default on; meaning unknown */
+#define  ADC_BOOST		BIT(7)	/* iOS ctl 0x16f; set, the ADC outputs digital zero on n61 */
 #define CS42L67_ADC2_PDN	0x217	/* bit7 ADC2B, bit6 ADC2A, bit2 DMIC2 */
 #define CS42L67_ADC2_DMIC	0x218
 #define CS42L67_ADC2_MUX	0x219	/* [5:4] ADC2A input, [7:6] ADC2B input */
@@ -343,11 +343,15 @@ static int cs42l67_power_up(struct cs42l67 *cs)
 	regmap_write(map, CS42L67_ADC1_DMIC, 0);
 	regmap_write(map, CS42L67_ADC2_PDN, ADC_PDN_IDLE);
 	regmap_write(map, CS42L67_ADC2_DMIC, 0);
-	/* PGA = ADC_VOL_DEFAULT; iOS' ctl 0x16f ("boost") default = 1 */
+	/*
+	 * PGA = ADC_VOL_DEFAULT. iOS' ctl 0x16f ("boost") defaults to 1, but
+	 * with that bit set the n61 ADCs capture nothing but digital zero
+	 * (hw 2026-10-22: all four, any PGA value), so leave it clear.
+	 */
 	for (i = 0; i < ARRAY_SIZE(cs42l67_adc_gain_regs); i++) {
 		regmap_write(map, cs42l67_adc_gain_regs[i],
 			     cs42l67_adc_vol_to_reg(ADC_VOL_DEFAULT));
-		regmap_write(map, cs42l67_adc_gain_regs[i] + 2, ADC_BOOST);
+		regmap_write(map, cs42l67_adc_gain_regs[i] + 2, 0);
 	}
 	/*
 	 * The n61 mic map as default input selects (item 0 of every mux):
