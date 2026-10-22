@@ -811,6 +811,18 @@ config APPLE_AIC
 	  Support for the Apple Interrupt Controller found on Apple Silicon SoCs,
 	  such as the M1.
 
+config APPLE_PMIC_IRQ
+	bool "Apple PMIC interrupt controller"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on MFD_SIMPLE_MFD_I2C && OF
+	select IRQ_DOMAIN
+	default ARCH_APPLE
+	help
+	  Support for the event interrupts of the Dialog based PMICs of
+	  Apple A8 devices, such as the D2186 of the iPhone 6. They carry
+	  the RTC alarm, VBUS detect and the PMIC GPIO inputs (Wi-Fi and
+	  Bluetooth host wake), and can wake the system from suspend.
+
 config MCHP_EIC
 	bool "Microchip External Interrupt Controller"
 	depends on ARCH_AT91 || COMPILE_TEST
