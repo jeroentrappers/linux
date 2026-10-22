@@ -14,7 +14,13 @@
  *   base + 0x20..0x2c  mask, 1 = masked. iOS masks everything at start.
  *
  * Event n is bit n % 8 of register n / 8. Events 24..44 are PMU GPIO 0..20,
- * event 3 is VBUS detect and event 88 the RTC alarm.
+ * event 3 is the PMU's own VBUS detect (not wired on the iPhone 6, which
+ * learns about VBUS from its charger on PMU GPIO 0) and event 88 the RTC
+ * alarm.
+ *
+ * Masked events still latch, and some masked ones (PMU GPIOs with a level
+ * input that stays active) latch again right after every read. Only the
+ * unmasked events can have pulled the line, so only those count.
  *
  * Only events that have a user are unmasked. A broken PMU or a stuck line
  * must not take the rest of the system with it, so the driver gives up on
@@ -260,7 +266,7 @@ static bool apple_pmic_irq_guard(struct apple_pmic_irq *pi, bool idle)
 static irqreturn_t apple_pmic_irq_thread(int irq, void *data)
 {
 	struct apple_pmic_irq *pi = data;
-	u8 ev[APMIC_IRQ_NREGS];
+	u8 ev[APMIC_IRQ_NREGS], live[APMIC_IRQ_NREGS];
 	unsigned long pending;
 	unsigned int i, bit;
 	bool any, kept;
@@ -289,7 +295,17 @@ static irqreturn_t apple_pmic_irq_thread(int irq, void *data)
 	}
 	pi->errors = 0;
 
-	any = memchr_inv(ev, 0, sizeof(ev));
+	/*
+	 * Masked events that latched anyway are ignored. The ones masked only
+	 * for suspend count too: they were unmasked a moment ago and are kept
+	 * for resume below.
+	 */
+	for (i = 0; i < APMIC_IRQ_NREGS; i++) {
+		pi->seen[i] |= ev[i];
+		live[i] = ev[i] & ~(pi->hw_mask[i] & pi->mask[i]);
+	}
+
+	any = memchr_inv(live, 0, sizeof(live));
 	kept = memchr_inv(pi->deferred, 0, sizeof(pi->deferred));
 	if (any) {
 		memcpy(pi->last, ev, sizeof(ev));
@@ -306,10 +322,10 @@ static irqreturn_t apple_pmic_irq_thread(int irq, void *data)
 	}
 
 	for (i = 0; i < APMIC_IRQ_NREGS; i++) {
+		ev[i] = live[i];
 		pending = ev[i];
 		for_each_set_bit(bit, &pending, 8)
 			pi->count[i * 8 + bit]++;
-		pi->seen[i] |= ev[i];
 
 		/*
 		 * Events of users that are only masked for suspend are kept
