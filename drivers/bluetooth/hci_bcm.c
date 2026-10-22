@@ -347,14 +347,17 @@ static int bcm_request_irq(struct bcm_data *bcm)
 		goto unlock;
 	}
 
-	err = devm_request_irq(bdev->dev, bdev->irq, bcm_host_wake,
-			       bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
-						      IRQF_TRIGGER_RISING,
-			       "host_wake", bdev);
-	if (err) {
+	/* The host wake line may come from a PMIC behind a slow bus */
+	err = devm_request_any_context_irq(bdev->dev, bdev->irq, bcm_host_wake,
+					   bdev->irq_active_low ?
+						IRQF_TRIGGER_FALLING :
+						IRQF_TRIGGER_RISING,
+					   "host_wake", bdev);
+	if (err < 0) {
 		bdev->irq = err;
 		goto unlock;
 	}
+	err = 0;
 
 	bdev->irq_acquired = true;
 
