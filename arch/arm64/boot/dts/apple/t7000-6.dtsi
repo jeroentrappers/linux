@@ -79,7 +79,21 @@
 			#gpio-cells = <2>;
 		};
 
-		rtc@5c0 {
+		/*
+		 * Event interrupts: 0x50 events (clear on read), 0x60 status,
+		 * 0x70 masks. The PMU signals them on AP GPIO 106 (ADT
+		 * "pmu,d2186" interrupts <106 1>).
+		 */
+		pmic_irq: interrupt-controller@50 {
+			compatible = "apple,adi-pmic-irq";
+			reg = <0x50 0x2d>;
+			interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			status = "disabled";
+		};
+
+		pmic_rtc: rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
 			reg = <0x5c0 0x10>;
 			nvmem-cells = <&rtc_offset>;

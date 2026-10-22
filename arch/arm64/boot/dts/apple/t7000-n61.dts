@@ -209,6 +209,10 @@
 	charger: charger@75 {
 		compatible = "ti,sn2400";
 		reg = <0x75>;
+		/* PMU event 3 = VBUS detect (iOS wake reason "usb") */
+		interrupts-extended = <&pmic_irq 3 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "vbus";
+		wakeup-source;
 		input-current-limit-microamp = <500000>;
 		constant-charge-current-max-microamp = <1000000>;
 	};
@@ -377,6 +381,19 @@
 	 * 1000 (0x41) wedged the PMU's I2C bus on hw.
 	 */
 	gpio-reserved-ranges = <11 1>;
+};
+
+/*
+ * PMU events (iOS AppleD2186PMU): 3 = VBUS detect, 24 + n = PMU GPIO n
+ * (0 = SN2400 INT, 6 = WLAN host wake, 9 = BT host wake), 88 = RTC alarm.
+ */
+&pmic_irq {
+	status = "okay";
+};
+
+&pmic_rtc {
+	interrupts-extended = <&pmic_irq 88 IRQ_TYPE_EDGE_RISING>;
+	wakeup-source;
 };
 
 &serial8 {
