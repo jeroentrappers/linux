@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/interrupt-controller/apple,adi-pmic-irq.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple PMIC interrupt controller
+
+maintainers:
+  - ITSMEFRTRUST <215584995+ITSMEFRTRUST@users.noreply.github.com>
+
+description:
+  The event interrupts of an Apple PMIC (see ../mfd/apple,pmic.yaml). The
+  PMIC latches up to 104 events in 13 event registers, each with a mask bit,
+  and signals them on one interrupt line to the SoC. Event n is bit n % 8 of
+  event register n / 8. On the D2186 of the iPhone 6, event 3 is VBUS
+  detect, events 24 to 44 are PMIC GPIO 0 to 20 and event 88 is the RTC
+  alarm.
+
+properties:
+  compatible:
+    enum:
+      - apple,adi-pmic-irq
+
+  reg:
+    maxItems: 1
+    description:
+      The event, status and mask registers, in this order, 16 registers
+      apart.
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-controller: true
+
+  "#interrupt-cells":
+    const: 2
+    description:
+      The first cell is the event number, the second the trigger type. The
+      PMIC latches every event on its own, so the type is not used.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-controller
+  - "#interrupt-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        pmic@74 {
+            compatible = "apple,adi-pmic", "apple,i2c-pmic";
+            reg = <0x74>;
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            interrupt-controller@50 {
+                compatible = "apple,adi-pmic-irq";
+                reg = <0x50 0x2d>;
+                interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+                interrupt-controller;
+                #interrupt-cells = <2>;
+            };
+        };
+    };

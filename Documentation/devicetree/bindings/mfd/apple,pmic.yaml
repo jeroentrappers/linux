@@ -70,6 +70,9 @@ patternProperties:
   "^gpio(@[0-9a-f]+)?$":
     $ref: /schemas/gpio/apple,adi-pmic-gpio.yaml
 
+  "^interrupt-controller(@[0-9a-f]+)?$":
+    $ref: /schemas/interrupt-controller/apple,adi-pmic-irq.yaml
+
 required:
   - compatible
   - reg
