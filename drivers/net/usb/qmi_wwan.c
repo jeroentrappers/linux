@@ -96,15 +96,51 @@ static int qmimux_stop(struct net_device *dev)
 	return 0;
 }
 
+/* Apple iPhone basebands (MDM9625 "Mav10", 05c6:9011 on HSIC) drop uplink packets without the 16-byte IP
+ * metadata trailer that iOS's AppleIPAppender appends to every IP packet before QMAP framing: u16 type
+ * (3; 7 for keepalive packets), u8 0, u8 service class index (XNU MBUF_SCIDX: 2 = best effort, 0xff only
+ * for an invalid class), le32 flow id (0xffffffff when the packet has none), 8 zero bytes. The QMAP
+ * length covers packet, trailer and padding to 4 bytes.
+ */
+static bool apple_trailer;
+module_param(apple_trailer, bool, 0644);
+MODULE_PARM_DESC(apple_trailer, "append Apple's IP metadata trailer to QMAP uplink packets (iPhone basebands)");
+
+static uint apple_trailer_class = 2;
+module_param(apple_trailer_class, uint, 0644);
+MODULE_PARM_DESC(apple_trailer_class, "service class index in the Apple trailer (default 2 = best effort)");
+
+static const u8 qmimux_apple_trailer[16] = { 0x03, 0x00, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff };
+
 static netdev_tx_t qmimux_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct qmimux_priv *priv = netdev_priv(dev);
 	unsigned int len = skb->len;
 	struct qmimux_hdr *hdr;
 	netdev_tx_t ret;
+	u8 pad = 0;
+
+	if (apple_trailer) {
+		unsigned int tail = sizeof(qmimux_apple_trailer) + 3;
+
+		if (skb_linearize(skb) ||
+		    ((skb_cloned(skb) || skb_tailroom(skb) < tail) &&
+		     pskb_expand_head(skb, 0, tail, GFP_ATOMIC))) {
+			dev->stats.tx_dropped++;
+			dev_kfree_skb_any(skb);
+			return NET_XMIT_DROP;
+		}
+		u8 *t = skb_put_data(skb, qmimux_apple_trailer, sizeof(qmimux_apple_trailer));
+
+		t[3] = min(apple_trailer_class, 0xffU);
+		pad = -skb->len & 3;
+		if (pad)
+			skb_put_zero(skb, pad);
+		len = skb->len;
+	}
 
 	hdr = skb_push(skb, sizeof(struct qmimux_hdr));
-	hdr->pad = 0;
+	hdr->pad = pad;
 	hdr->mux_id = priv->mux_id;
 	hdr->pkt_len = cpu_to_be16(len);
 	skb->dev = priv->real_dev;
