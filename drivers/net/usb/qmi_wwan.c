@@ -63,6 +63,7 @@ enum qmi_wwan_flags {
 
 enum qmi_wwan_quirks {
 	QMI_WWAN_QUIRK_DTR = 1 << 0,	/* needs "set DTR" request */
+	QMI_WWAN_QUIRK_SPLIT_NEXT = 1 << 1,	/* QMI control iface + QMAP data iface next to it, no CDC Union */
 };
 
 struct qmimux_hdr {
@@ -782,6 +783,22 @@ static int qmi_wwan_bind(struct usbnet *dev, struct usb_interface *intf)
 		}
 	}
 
+	/* Apple iPhone basebands (MDM9625 on HSIC, 05c6:9011): the QMI control
+	 * interface has only an interrupt endpoint and its bulk data interface
+	 * (ff/01/02, QMAP) is the next one, without a CDC Union to say so.
+	 * Other 05c6:9011 devices have combined interfaces and are not affected.
+	 */
+	if (!cdc_union && (dev->driver_info->data & QMI_WWAN_QUIRK_SPLIT_NEXT) &&
+	    desc->bNumEndpoints == 1 &&
+	    usb_endpoint_is_int_in(&intf->cur_altsetting->endpoint[0].desc)) {
+		struct usb_interface *next = usb_ifnum_to_if(dev->udev, desc->bInterfaceNumber + 1);
+		struct usb_interface_descriptor *nd = next ? &next->cur_altsetting->desc : NULL;
+
+		if (nd && nd->bInterfaceClass == USB_CLASS_VENDOR_SPEC &&
+		    nd->bInterfaceSubClass == 0x01 && nd->bInterfaceProtocol == 0x02)
+			info->data = next;
+	}
+
 	/* errors aren't fatal - we can live with the dynamic address */
 	if (cdc_ether && cdc_ether->wMaxSegmentSize) {
 		dev->hard_mtu = le16_to_cpu(cdc_ether->wMaxSegmentSize);
@@ -948,6 +965,16 @@ static const struct driver_info	qmi_wwan_info_quirk_dtr = {
 #define HUAWEI_VENDOR_ID	0x12D1
 
 /* map QMI/wwan function by a fixed interface number */
+static const struct driver_info	qmi_wwan_info_split_next = {
+	.description	= "WWAN/QMI device",
+	.flags		= FLAG_WWAN | FLAG_NOMAXMTU | FLAG_SEND_ZLP,
+	.bind		= qmi_wwan_bind,
+	.unbind		= qmi_wwan_unbind,
+	.manage_power	= qmi_wwan_manage_power,
+	.rx_fixup       = qmi_wwan_rx_fixup,
+	.data           = QMI_WWAN_QUIRK_SPLIT_NEXT,
+};
+
 #define QMI_FIXED_INTF(vend, prod, num) \
 	USB_DEVICE_INTERFACE_NUMBER(vend, prod, num), \
 	.driver_info = (unsigned long)&qmi_wwan_info
@@ -1118,7 +1145,8 @@ static const struct usb_device_id products[] = {
 	{QMI_FIXED_INTF(0x05c6, 0x900f, 5)},
 	{QMI_FIXED_INTF(0x05c6, 0x9010, 4)},
 	{QMI_FIXED_INTF(0x05c6, 0x9010, 5)},
-	{QMI_FIXED_INTF(0x05c6, 0x9011, 3)},
+	{USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9011, 3),	/* also Apple iPhone 6 baseband: split ctrl 3 / data 4 */
+	 .driver_info = (unsigned long)&qmi_wwan_info_split_next},
 	{QMI_FIXED_INTF(0x05c6, 0x9011, 4)},
 	{QMI_FIXED_INTF(0x05c6, 0x9021, 1)},
 	{QMI_FIXED_INTF(0x05c6, 0x9022, 2)},
