@@ -421,3 +421,9 @@
 		vout-supply = <&pmic_ldo4>;
 	};
 };
+
+&ehci_hsic {
+	host-ready-gpios = <&pinctrl 67 GPIO_ACTIVE_HIGH>;
+	device-ready-gpios = <&pinctrl 56 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};

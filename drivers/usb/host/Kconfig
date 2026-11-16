@@ -340,6 +340,14 @@ config USB_OCTEON_HCD
 	  To compile this driver as a module, choose M here. The module
 	  will be called octeon-hcd.
 
+config USB_EHCI_APPLE_HSIC
+	tristate "EHCI glue for the Apple T7000 HSIC host (baseband link)"
+	depends on USB_EHCI_HCD && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  The HSIC EHCI controller of Apple A8 (T7000) SoCs, used for the
+	  link to the baseband modem on the iPhone 6.
+
 config USB_EHCI_HCD_PLATFORM
 	tristate "Generic EHCI driver for a platform device"
 	help

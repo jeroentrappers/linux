@@ -426,6 +426,17 @@
 				power-domains = <&ps_usb2host2>;
 			};
 #endif
+
+			/* HSIC host to the baseband; 2nd/3rd reg: per-controller ctl + HSIC PHY in the usb ctl block */
+			ehci_hsic: usb@20c500000 {
+				compatible = "apple,t7000-ehci-hsic";
+				reg = <0x2 0x0c500000 0x0 0x10000>,
+				      <0x2 0x0c000018 0x0 0x8>,
+				      <0x2 0x0c000060 0x0 0x10>;
+				interrupts = <AIC_IRQ 186 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_hsic1_phy>;
+				status = "disabled";
+			};
 		};
 
 		nco: clock-controller@20e011000 {
