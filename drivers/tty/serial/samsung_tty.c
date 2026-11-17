@@ -1272,8 +1272,16 @@ static int apple_s5l_serial_startup(struct uart_port *port)
 
 	uart_port_lock_irqsave(port, &flags);
 
+	/*
+	 * RX trigger at the lowest level. The field used to be OR-ed onto what
+	 * the bootloader left, so a stale 1 plus RXTRIG8 (2) read back as 3:
+	 * the FIFO then overran on every burst at 1.5 Mbaud (the iPhone 6
+	 * motion coprocessor lost ~5% of its bytes). The RX timeout interrupt
+	 * still flushes short bursts.
+	 */
 	ufcon = rd_regl(port, S3C2410_UFCON);
-	ufcon |= S3C2410_UFCON_RESETRX | S5PV210_UFCON_RXTRIG8;
+	ufcon &= ~S5PV210_UFCON_RXTRIG256;	/* the whole 3-bit field */
+	ufcon |= S3C2410_UFCON_RESETRX | S5PV210_UFCON_RXTRIG1;
 	if (!uart_console(port))
 		ufcon |= S3C2410_UFCON_RESETTX;
 	wr_regl(port, S3C2410_UFCON, ufcon);
