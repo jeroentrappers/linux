@@ -12,3 +12,14 @@
 	compatible = "apple,n61", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6";
 };
+
+&i2c1 {
+	status = "okay";
+
+	charger@75 {
+		compatible = "ti,sn2400";
+		reg = <0x75>;
+		input-current-limit-microamp = <500000>;
+		constant-charge-current-max-microamp = <1000000>;
+	};
+};
