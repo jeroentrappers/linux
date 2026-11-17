@@ -348,10 +348,17 @@ static enum hrtimer_restart mca_t7000_timer(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
-/* TX control, enable bit clear: [16:8] = slot offset, one higher as master (iOS) */
+/*
+ * TX control, enable bit clear: [16:8] = slot offset, one higher as master
+ * (iOS). As a slave (the baseband link) bit1 is set as in the RX control
+ * (0x10a): without it the far end read the data on the wrong clock edge,
+ * heard as loud noise whenever the samples were not all zero. Measured over a
+ * live call: 0x10b (enabled) carried a speech clip intact, 0x109 / 0x10d /
+ * 0x10f / 0x209 did not.
+ */
 static u32 mca_t7000_tx_ctl(struct mca_t7000 *mca)
 {
-	return mca->slave ? 0x108 : 0x208;
+	return mca->slave ? 0x10a : 0x208;
 }
 
 static u32 mca_t7000_frame(struct mca_t7000 *mca, bool run)
@@ -745,7 +752,7 @@ static int mca_t7000_pcm_trigger(struct snd_soc_component *component,
 			writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_TX);
 			writel_relaxed(shim, mca->wrap + WRAP_SHIM_ON_RX);
 			writel_relaxed(1, mca->base + SHIM_TX + SHIM_LINK);
-			writel(0x208 | TX_CTL_EN, mca->base + MCA_TX_CTL);
+			writel(mca_t7000_tx_ctl(mca) | TX_CTL_EN, mca->base + MCA_TX_CTL);
 		} else {
 			/* the SIO fw RX start: TRIGGER = 1, shim on, then RX */
 			writel_relaxed(1, mca->base + SHIM_RX + SHIM_TRIGGER);
