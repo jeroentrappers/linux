@@ -98,8 +98,10 @@ struct isp_focus {
 
 /*
  * ISP_IOC_TORCH (minor 2): the rear flash LEDs (white + amber) in torch mode, through the ISP
- * firmware, which owns the flash chip on the rear sensor's I2C bus. Needs a camera streaming
- * (-EAGAIN otherwise). level 0 = off, 1..5 = brightness steps (fw: 6 and up = full);
+ * firmware, which owns the flash chip on the rear sensor's I2C bus. Works with or without a stream
+ * (-EAGAIN only while the ISP is not booted); the last close of /dev/isp0 powers the ISP off, and
+ * the light with it, so a torch-only client keeps the device open. level 0 = off, 1..5 =
+ * brightness steps (fw: 6 and up = full);
  * split: -1 = leave the colour mix alone, 0..100 = % of the current on LED2 (fw manual mode;
  * measured on n61: 0 = LED1 only, 100 = LED2 only).
  * The currents the fw reports (mA) come back after the call; both 0 also when it found no chip.

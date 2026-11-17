@@ -385,7 +385,9 @@ long isp_torch_ioctl(struct t7000_isp *isp, void __user *up)
 		t.level = 5;
 
 	mutex_lock(&isp->lock);
-	if (!isp->st.on || isp->st.stopping) {
+	/* the fw takes the torch commands once booted (open boots it, with the rear sensor and GPIO 8
+	 * powered): no stream needed. The light stays on while any client keeps /dev/isp0 open. */
+	if (isp->done < ISP_FULL_STAGE || isp->st.stopping) {
 		ret = -EAGAIN;
 		goto out;
 	}

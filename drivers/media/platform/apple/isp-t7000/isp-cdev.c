@@ -18,7 +18,6 @@
 
 #include "isp.h"
 
-#define ISP_FULL_STAGE	9
 
 static DEFINE_MUTEX(isp_open_lock);
 static struct t7000_isp *cdev_isp;

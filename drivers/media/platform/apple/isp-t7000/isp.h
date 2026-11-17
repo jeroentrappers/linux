@@ -143,6 +143,7 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
 #define CISP_CMD_CH_PREVIEW_STREAM_SET	0xb0d
 
 #define ISP_SENS_GPIOS		4	/* avdd, rear shutdown, front shutdown, torch enable */
+#define ISP_FULL_STAGE		9	/* boot stages for /dev/isp0: through CONFIG_GET + BUILDINFO */
 #define ISP_MAX_BUFS		8
 #define ISP_POOL_META		0
 #define ISP_POOL_RENDERED	1
