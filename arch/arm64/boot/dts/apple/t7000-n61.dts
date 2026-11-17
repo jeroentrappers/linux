@@ -47,7 +47,8 @@
 			"Microphone", "Rear Mic",
 			"Microphone", "Front Mic",
 			"Microphone", "Headset Mic",
-			"Headphone", "Headphones";
+			"Headphone", "Headphones",
+			"Speaker", "Earpiece";
 		simple-audio-card,routing =
 			"AIN1", "Bottom Mic",
 			"Bottom Mic", "MICBIAS1",
@@ -56,7 +57,8 @@
 			"AIN6", "Front Mic",
 			"Front Mic", "MICBIAS3",
 			"HSMIC", "Headset Mic",
-			"Headphones", "HPOUT";
+			"Headphones", "HPOUT",
+			"Earpiece", "RCV";	/* codec output C, ADT aout1-rcvr */
 
 		/* hw:0,0: speaker amp, slot 0 of MCA2's 8 x 16-bit frame */
 		simple-audio-card,dai-link@0 {

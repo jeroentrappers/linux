@@ -181,6 +181,9 @@ struct cs42l67 {
 	unsigned int rx_slot;		/* TDM slot XSP RX channel 0 listens to */
 	bool inert;
 	bool powered;
+	int rcv_gain;			/* earpiece gain, 0.5 dB steps (0x252 = this, signed) */
+	bool rcv_on;			/* output C (earpiece) powered */
+	unsigned int dbg_reg;		/* "Debug Reg" / "Debug Val" controls */
 
 	struct snd_soc_jack jack;
 	struct delayed_work jack_work;
@@ -447,6 +450,58 @@ static int cs42l67_set_bias_level(struct snd_soc_component *component,
 	return 0;
 }
 
+/*
+ * Output C = the earpiece (ADT aout1-rcvr; re/CODEC-EARPIECE.md): powered by 0x24f bit 5, gain 0x252 (2 x dB,
+ * signed, -102..+12 dB), fed by its own mixer pair 0x12d/0x12e (L) and 0x132/0x133 (R). On power-up the writes of
+ * iOS' route function, in its order: mixer headers with sidetone off, voice source = XSP RX channel 1, the headphone
+ * mixers off, the earpiece mixers' voice input at 0 dB (their main input muted), sidetone/ANC off, headphone and
+ * hearing-aid outputs muted; 0x243 bit 3 stays set (iOS clears it only for headphones / line out).
+ */
+static int cs42l67_rcv_event(struct snd_soc_dapm_widget *w, struct snd_kcontrol *kcontrol, int event)
+{
+	struct snd_soc_component *c = snd_soc_dapm_to_component(w->dapm);
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(c);
+
+	if (event == SND_SOC_DAPM_PRE_PMU) {
+		snd_soc_component_write(c, 0x121, 0x00);
+		snd_soc_component_write(c, 0x126, 0x20);
+		snd_soc_component_write(c, 0x12b, 0x40);
+		snd_soc_component_write(c, 0x130, 0x60);
+		snd_soc_component_write(c, CS42L67_VOICE_SRC, 0x11);
+		snd_soc_component_write(c, 0x123, 0x3f);
+		snd_soc_component_write(c, 0x124, 0x3f);
+		snd_soc_component_write(c, 0x128, 0x7f);
+		snd_soc_component_write(c, 0x129, 0x7f);
+		snd_soc_component_write(c, 0x12e, 0x80);
+		snd_soc_component_write(c, 0x133, 0x80);
+		snd_soc_component_write(c, 0x12d, 0xbf);
+		snd_soc_component_write(c, 0x132, 0xbf);
+		snd_soc_component_write(c, CS42L67_DSP_PDN, 0x4c);
+		snd_soc_component_write(c, 0x122, 0x3f);
+		snd_soc_component_write(c, 0x127, 0x3f);
+		snd_soc_component_write(c, 0x131, 0x3f);
+		snd_soc_component_update_bits(c, 0x054, BIT(1), BIT(1));
+		snd_soc_component_write(c, CS42L67_OUTA_AGAIN, OUT_AGAIN_MUTE);
+		snd_soc_component_write(c, CS42L67_OUTC_GAIN, cs->rcv_gain & 0xff);
+		snd_soc_component_write(c, CS42L67_OUTD_GAIN, OUT_AGAIN_MUTE);
+		snd_soc_component_update_bits(c, CS42L67_OUT_PDN1, 0xa8, 0x28);
+	} else if (event == SND_SOC_DAPM_POST_PMU) {
+		snd_soc_component_update_bits(c, 0x251, 0x03, 0x01);
+		cs->rcv_on = true;
+	} else if (event == SND_SOC_DAPM_PRE_PMD) {
+		cs->rcv_on = false;
+		snd_soc_component_write(c, 0x12d, 0xbf);
+		snd_soc_component_write(c, 0x12e, 0xbf);
+		snd_soc_component_write(c, 0x132, 0xbf);
+		snd_soc_component_write(c, 0x133, 0xbf);
+		snd_soc_component_write(c, CS42L67_OUTC_GAIN, OUT_AGAIN_MUTE);
+	}
+	return 0;
+}
+
+static const struct snd_kcontrol_new hp_switch = SOC_DAPM_SINGLE_VIRT("Switch", 1);
+static const struct snd_kcontrol_new rcv_switch = SOC_DAPM_SINGLE_VIRT("Switch", 0);
+
 /* ---- DAPM ---- */
 
 /*
@@ -610,6 +665,13 @@ static const struct snd_soc_dapm_widget cs42l67_widgets[] = {
 			       cs42l67_out_event,
 			       SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 	SND_SOC_DAPM_OUTPUT("HPOUT"),
+
+	/* which output the playback goes to: "Headphone" (output A) / "Earpiece" (output C) Playback Switch */
+	SND_SOC_DAPM_SWITCH("Headphone", SND_SOC_NOPM, 0, 0, &hp_switch),
+	SND_SOC_DAPM_SWITCH("Earpiece", SND_SOC_NOPM, 0, 0, &rcv_switch),
+	SND_SOC_DAPM_OUT_DRV_E("OUTC", CS42L67_OUT_PDN2, 5, 1, NULL, 0, cs42l67_rcv_event,
+			       SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
+	SND_SOC_DAPM_OUTPUT("RCV"),
 };
 
 static const struct snd_soc_dapm_route cs42l67_routes[] = {
@@ -671,8 +733,12 @@ static const struct snd_soc_dapm_route cs42l67_routes[] = {
 
 	{ "DAC", NULL, "XSP RX" },
 	{ "DAC", NULL, "Output Path" },
-	{ "OUTA", NULL, "DAC" },
+	{ "Headphone", "Switch", "DAC" },
+	{ "OUTA", NULL, "Headphone" },
 	{ "HPOUT", NULL, "OUTA" },
+	{ "Earpiece", "Switch", "DAC" },
+	{ "OUTC", NULL, "Earpiece" },
+	{ "RCV", NULL, "OUTC" },
 };
 
 static int cs42l67_adc_vol_get(struct snd_kcontrol *kcontrol,
@@ -699,6 +765,70 @@ static int cs42l67_adc_vol_put(struct snd_kcontrol *kcontrol,
 					     cs42l67_adc_vol_to_reg(vol));
 }
 
+/* Earpiece volume: control 0..228 = -102..+12 dB in 0.5 dB steps */
+#define RCV_GAIN_MIN	(-204)
+#define RCV_GAIN_MAX	24
+static const DECLARE_TLV_DB_SCALE(rcv_vol_tlv, -10200, 50, 0);
+
+static int cs42l67_rcv_vol_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
+
+	u->value.integer.value[0] = cs->rcv_gain - RCV_GAIN_MIN;
+	return 0;
+}
+
+static int cs42l67_rcv_vol_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(c);
+	long v = u->value.integer.value[0];
+
+	if (v < 0 || v > RCV_GAIN_MAX - RCV_GAIN_MIN)
+		return -EINVAL;
+	if (cs->rcv_gain == v + RCV_GAIN_MIN)
+		return 0;
+	cs->rcv_gain = v + RCV_GAIN_MIN;
+	if (cs->rcv_on)
+		snd_soc_component_write(c, CS42L67_OUTC_GAIN, cs->rcv_gain & 0xff);
+	return 1;
+}
+
+/* bring-up aid: "Debug Reg" selects a page:reg, "Debug Val" reads / writes it (amixer cset) */
+static int cs42l67_dbg_reg_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	u->value.integer.value[0] = ((struct cs42l67 *)snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol)))->dbg_reg;
+	return 0;
+}
+
+static int cs42l67_dbg_reg_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(snd_kcontrol_chip(kcontrol));
+
+	cs->dbg_reg = u->value.integer.value[0];
+	return 1;
+}
+
+static int cs42l67_dbg_val_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(c);
+
+	u->value.integer.value[0] = cs->powered ? snd_soc_component_read(c, cs->dbg_reg) : 0;
+	return 0;
+}
+
+static int cs42l67_dbg_val_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *u)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct cs42l67 *cs = snd_soc_component_get_drvdata(c);
+
+	if (!cs->powered)
+		return -EBUSY;
+	snd_soc_component_write(c, cs->dbg_reg, u->value.integer.value[0]);
+	return 1;
+}
+
 /* iOS' declared scale for ctl 0x170; the two stage steps are inferred */
 static const DECLARE_TLV_DB_SCALE(adc_vol_tlv, -600, 50, 0);
 
@@ -723,6 +853,10 @@ static const struct snd_kcontrol_new cs42l67_controls[] = {
 	/* 0x40 = mute (what iOS writes); iOS maps volume v to (v - 0x37) & 0x7f */
 	SOC_DOUBLE_R("OUTA Volume Raw", CS42L67_OUTA_VOL, CS42L67_OUTA_VOL_R,
 		     0, 0x7f, 0),
+	SOC_SINGLE_EXT_TLV("Earpiece Playback Volume", SND_SOC_NOPM, 0, RCV_GAIN_MAX - RCV_GAIN_MIN, 0,
+			   cs42l67_rcv_vol_get, cs42l67_rcv_vol_put, rcv_vol_tlv),
+	SOC_SINGLE_EXT("Debug Reg", SND_SOC_NOPM, 0, 0x37f, 0, cs42l67_dbg_reg_get, cs42l67_dbg_reg_put),
+	SOC_SINGLE_EXT("Debug Val", SND_SOC_NOPM, 0, 0xff, 0, cs42l67_dbg_val_get, cs42l67_dbg_val_put),
 };
 
 /* ---- DAI ---- */
@@ -953,6 +1087,7 @@ static int cs42l67_probe(struct spi_device *spi)
 	cs = devm_kzalloc(dev, sizeof(*cs), GFP_KERNEL);
 	if (!cs)
 		return -ENOMEM;
+	cs->rcv_gain = -24;	/* earpiece -12 dB until someone sets it: it sits at the ear */
 	cs->dev = dev;
 	cs->spi = spi;
 	spi_set_drvdata(spi, cs);
