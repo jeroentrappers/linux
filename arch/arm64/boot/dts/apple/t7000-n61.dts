@@ -114,6 +114,32 @@
 				sound-dai = <&headset_codec 1>;
 			};
 		};
+
+		/*
+		 * hw:0,3: baseband voice PCM (ADT mca3/audio-baseband-voice): I2S,
+		 * 2 x 16-bit slots, 8 kHz (narrowband) or 16 kHz (wideband), the
+		 * modem is the clock master. The modem side is a plain PCM endpoint.
+		 */
+		simple-audio-card,dai-link@3 {
+			reg = <3>;
+			format = "i2s";
+			bitclock-master = <&baseband_voice>;
+			frame-master = <&baseband_voice>;
+
+			cpu {
+				sound-dai = <&mca3 1>;
+			};
+
+			baseband_voice: codec {
+				sound-dai = <&baseband_pcm 1>;
+			};
+		};
+	};
+
+	/* the modem's voice PCM: mono, 8 / 16 kHz, it provides BCLK + FSYNC */
+	baseband_pcm: baseband-pcm {
+		compatible = "linux,bt-sco";
+		#sound-dai-cells = <1>;
 	};
 };
 
@@ -124,6 +150,12 @@
 };
 
 &mca2 {
+	status = "okay";
+};
+
+&mca3 {
+	/* after MCA2 (0-0xcb) and MCA0 (0x100-0x1cb) in both shim SRAM pools */
+	apple,shim-sram-offset = <0x200>;
 	status = "okay";
 };
 

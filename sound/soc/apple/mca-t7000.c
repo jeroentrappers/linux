@@ -9,10 +9,12 @@
  * the TX shim FIFO from the ALSA ring buffer, and drains the RX shim FIFO
  * into the capture ring buffer. The SIO CPU is never started.
  *
- * Only what has been seen working on the iPhone 6 speaker path is
- * supported: MCA as clock master, 48 kHz, 16-bit, one playback channel in
- * slot 0 of an 8 x 16-bit frame. Capture takes 1..8 consecutive slots
- * starting at rx_slot_base.
+ * Supported: MCA as clock master at 48 kHz, 16-bit, one playback channel in
+ * slot 0 of an 8 x 16-bit frame (capture takes 1..8 consecutive slots
+ * starting at rx_slot_base), or a 2 x 16-bit I2S link; and as a clock SLAVE
+ * on an I2S link at 8 or 16 kHz, the baseband voice PCM on MCA3 (ADT
+ * mca3/audio-baseband-voice: cfg[0] bit0 = 0, 2 slots of 16 bits, both
+ * directions; the modem provides BCLK and FSYNC on the pins).
  *
  * DAI 0 is the speaker link, DAI 1 the headset codec link. Both share the
  * one TX slot, so only one playback stream can run at a time.
@@ -52,6 +54,8 @@
  * bits, BCLK = NCO / 8 (NCO at 12.288 MHz like MCA2), bit 3 = not DSP mode
  */
 #define  FRAME_CFG_I2S_2X16	(0x0f101300 | BIT(3) | BIT(2))
+/* I2S slave, 2 x 16-bit slots (MCA3 <-> baseband): no BCLK divider, both ends agree the MCA is not master */
+#define  FRAME_CFG_I2S_SLAVE	(0x0f101000 | BIT(3))
 #define MCA_IRQ_EN		0x10
 #define MCA_PAD_BITS		0x14
 #define MCA_TX_CTL		0x18
@@ -119,6 +123,8 @@
 #define  SWITCH_IDLE		0x00181818
 #define  SWITCH_NODE_PIN(n)	((n) + 8)
 #define  SWITCH_AUD_RX(pin)	(0x00180018 | SWITCH_NODE_PIN(pin) << 8)
+/* slave: the pin feeds AUDn both its RX data [12:8] and its clock [4:0] */
+#define  SWITCH_AUD_SLAVE(pin)	(0x00180000 | SWITCH_NODE_PIN(pin) << 8 | SWITCH_NODE_PIN(pin))
 
 /* second shim wrapper page (0x20a100000) */
 #define SHIM1_CFG		0x004
@@ -186,8 +192,11 @@ struct mca_t7000 {
 	unsigned int index;
 	unsigned int pin;
 	unsigned int sram_off;		/* bytes into the TX and RX shim SRAM pools */
-	u32 frame_cfg;			/* FRAME_CFG_8X16 or FRAME_CFG_I2S_2X16 */
+	u32 frame_cfg;			/* FRAME_CFG_8X16, FRAME_CFG_I2S_2X16 or FRAME_CFG_I2S_SLAVE */
 	bool i2s;
+	bool slave;			/* BCLK/FSYNC come from the pins (the baseband) */
+	unsigned int rate;		/* 48000, or 8000 / 16000 as a slave */
+	unsigned int tx_ch;		/* playback channels (slots 0..) */
 
 	struct hrtimer timer;
 	struct mca_dir tx, rx;
@@ -313,6 +322,17 @@ static enum hrtimer_restart mca_t7000_timer(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+/* TX control, enable bit clear: [16:8] = slot offset, one higher as master (iOS) */
+static u32 mca_t7000_tx_ctl(struct mca_t7000 *mca)
+{
+	return mca->slave ? 0x108 : 0x208;
+}
+
+static u32 mca_t7000_frame(struct mca_t7000 *mca, bool run)
+{
+	return mca->frame_cfg | (run ? FRAME_CFG_RUN : 0) | (mca->slave ? 0 : FRAME_CFG_MASTER);
+}
+
 static void mca_t7000_hw_init(struct mca_t7000 *mca)
 {
 	unsigned int shim = BIT(MCA_SHIM_INDEX(mca->index));
@@ -373,14 +393,21 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
 	writel(0x00170018, mca->base + MCA_TX_FIFO);
 	writel(0x00030004, mca->base + MCA_RX_FIFO);
 	writel(0, mca->base + MCA_PAD_BITS);
-	writel(1, mca->base + MCA_TX_MASK);
+	writel(GENMASK(max(mca->tx_ch, 1u) - 1, 0), mca->base + MCA_TX_MASK);
 	writel(mca->i2s ? 0x3 : 0xf, mca->base + MCA_RX_MASK);
-	writel(0x208, mca->base + MCA_TX_CTL);
+	writel(mca_t7000_tx_ctl(mca), mca->base + MCA_TX_CTL);
 	writel(RX_CTL_IDLE, mca->base + MCA_RX_CTL);
 	writel(1, mca->base + MCA_IRQ_EN);
 	writel(IRQ_STATUS_ALL, mca->base + MCA_IRQ_STATUS);
-	writel(mca->frame_cfg | FRAME_CFG_MASTER, mca->base + MCA_FRAME_CFG);
+	writel(mca_t7000_frame(mca, false), mca->base + MCA_FRAME_CFG);
 
+	if (mca->slave) {
+		/* data out to the pins; the pins give AUDn its clock (and RX data) */
+		writel(SWITCH_AUD_SLAVE(mca->pin), mca->wrap + WRAP_SWITCH_AUD(mca->index));
+		writel(0x00180018 | (mca->index << 8), mca->wrap + WRAP_SWITCH_PIN(mca->pin));
+		writel(0x11, mca->wrap + WRAP_SWITCH_PINCTL(mca->pin));
+		return;
+	}
 	/* route MCAn's data out to its I2S pins; the pins clock from the MCA */
 	writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
 	writel(0x00180000 | (mca->index << 8) | mca->index,
@@ -394,7 +421,7 @@ static void mca_t7000_hw_stop_tx(struct mca_t7000 *mca)
 	u32 val;
 
 	/* the frame clock keeps running until hw_free, for the amp's sake */
-	writel_relaxed(0x208, mca->base + MCA_TX_CTL);
+	writel_relaxed(mca_t7000_tx_ctl(mca), mca->base + MCA_TX_CTL);
 	writel_relaxed(0, mca->base + SHIM_TX + SHIM_LINK);
 	writel_relaxed(shim, mca->wrap + WRAP_SHIM_OFF_TX);
 	writel(CMD_TX_FLUSH, mca->base + MCA_CMD);
@@ -424,9 +451,22 @@ static int mca_t7000_dai_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	 * (tested); I2S = MCA0's 2 x 16 link to the codec ASP (iOS' ADT
 	 * config). All links of one MCA must agree.
 	 */
-	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF ||
-	    (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_BP_FP)
+	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
 		return -EINVAL;
+	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_BP_FP:
+		mca->slave = false;
+		break;
+	case SND_SOC_DAIFMT_BC_FC:	/* the other end clocks the link: I2S only (the baseband) */
+		if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
+			return -EINVAL;
+		mca->slave = true;
+		mca->i2s = true;
+		mca->frame_cfg = FRAME_CFG_I2S_SLAVE;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_DSP_A:
@@ -455,12 +495,19 @@ static int mca_t7000_dai_hw_params(struct snd_pcm_substream *substream,
 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
 	int ret;
 
-	if (params_rate(params) != MCA_RATE ||
-	    params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
+	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE)
+		return -EINVAL;
+	if (mca->slave ? params_rate(params) != 8000 && params_rate(params) != 16000 :
+			 params_rate(params) != MCA_RATE)
 		return -EINVAL;
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
-	    params_channels(params) != 1)
+	    params_channels(params) > (mca->slave ? 2 : 1))
 		return -EINVAL;
+	mca->rate = params_rate(params);
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		mca->tx_ch = params_channels(params);
+	if (mca->slave)
+		return 0;	/* no NCO: the baseband clocks the link */
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
 	    mca_t7000_rx_base(mca) + params_channels(params) > (mca->i2s ? 2 : 8))
 		return -EINVAL;
@@ -489,8 +536,7 @@ static int mca_t7000_dai_prepare(struct snd_pcm_substream *substream,
 		 * clock. TX stays disabled until trigger; the shim link starts
 		 * fine late.
 		 */
-		writel(mca->frame_cfg | FRAME_CFG_RUN | FRAME_CFG_MASTER,
-		       mca->base + MCA_FRAME_CFG);
+		writel(mca_t7000_frame(mca, true), mca->base + MCA_FRAME_CFG);
 	}
 	mca->users |= BIT(substream->stream);
 
@@ -500,11 +546,11 @@ static int mca_t7000_dai_prepare(struct snd_pcm_substream *substream,
 			       mca_t7000_rx_base(mca)),
 		       mca->base + MCA_RX_MASK);
 		/* the pin's data into this MCA, or RX samples nothing */
-		writel(SWITCH_AUD_RX(mca->pin),
+		writel(mca->slave ? SWITCH_AUD_SLAVE(mca->pin) : SWITCH_AUD_RX(mca->pin),
 		       mca->wrap + WRAP_SWITCH_AUD(mca->index));
 		/* drain at half full: ch * 2 bytes arrive per frame */
 		mca->rx_period_us = rx_fifo_bytes / 2 * USEC_PER_SEC /
-				    (MCA_RATE * frames_to_bytes(substream->runtime, 1));
+				    (mca->rate * frames_to_bytes(substream->runtime, 1));
 	}
 	return 0;
 }
@@ -515,11 +561,13 @@ static int mca_t7000_dai_hw_free(struct snd_pcm_substream *substream,
 	struct mca_t7000 *mca = snd_soc_dai_get_drvdata(dai);
 
 	mca->users &= ~BIT(substream->stream);
-	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE && !mca->slave)
 		writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
-	if (!mca->users)
-		writel(mca->frame_cfg | FRAME_CFG_MASTER,
-		       mca->base + MCA_FRAME_CFG);
+	if (!mca->users) {
+		writel(mca_t7000_frame(mca, false), mca->base + MCA_FRAME_CFG);
+		if (mca->slave)
+			writel(SWITCH_IDLE, mca->wrap + WRAP_SWITCH_AUD(mca->index));
+	}
 	return 0;
 }
 
@@ -549,15 +597,15 @@ static struct snd_soc_dai_driver mca_t7000_dais[] = {
 		.playback = {
 			.stream_name = "Codec Playback",
 			.channels_min = 1,
-			.channels_max = 1,
-			.rates = SNDRV_PCM_RATE_48000,
+			.channels_max = 2,
+			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_48000,
 			.formats = SNDRV_PCM_FMTBIT_S16_LE,
 		},
 		.capture = {
 			.stream_name = "Codec Capture",
 			.channels_min = 1,
 			.channels_max = 8,
-			.rates = SNDRV_PCM_RATE_48000,
+			.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_48000,
 			.formats = SNDRV_PCM_FMTBIT_S16_LE,
 		},
 		.ops = &mca_t7000_dai_ops,
@@ -568,8 +616,8 @@ static const struct snd_pcm_hardware mca_t7000_pcm_hw = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BATCH,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
-	.rates = SNDRV_PCM_RATE_48000,
-	.rate_min = MCA_RATE,
+	.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_48000,
+	.rate_min = 8000,
 	.rate_max = MCA_RATE,
 	.channels_min = 1,
 	.channels_max = 8,
@@ -864,6 +912,8 @@ static int mca_t7000_probe(struct platform_device *pdev)
 	if (!mca->wrap || !mca->shim1)
 		return -ENOMEM;
 
+	mca->rate = MCA_RATE;
+	mca->tx_ch = 1;
 	mca->pin = mca->index;
 	of_property_read_u32(dev->of_node, "apple,i2s-pin", &mca->pin);
 	mca->frame_cfg = FRAME_CFG_8X16;

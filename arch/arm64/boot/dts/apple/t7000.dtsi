@@ -310,6 +310,20 @@
 			status = "disabled";
 		};
 
+		mca3: i2s@20a0ac000 {
+			compatible = "apple,t7000-mca";
+			reg = <0x2 0x0a0ac000 0x0 0x4000>,
+			      <0x2 0x0a000000 0x0 0x4000>,
+			      <0x2 0x0a100000 0x0 0x1000>;
+			reg-names = "mca", "wrapper", "shim1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 172 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&nco 3>;
+			power-domains = <&ps_mca3>;
+			#sound-dai-cells = <1>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@20a110000 {
 			compatible = "apple,t7000-i2c", "apple,i2c";
 			reg = <0x2 0x0a110000 0x0 0x1000>;
