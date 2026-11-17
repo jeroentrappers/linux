@@ -79,8 +79,11 @@
 		};
 
 		/*
-		 * hw:0,1: headset codec XSP on the same I2S bus (ADT xsp_active
-		 * = pin2), MCA2 still the clock master. Capture = slots 4-7.
+		 * hw:0,1: headset codec XSP (its 0x013 port, iOS "vsp", the only
+		 * one that feeds the DAC: headphones + earpiece) on pin4 / MCA4
+		 * (ADT vsp_active = pin4, mca4/audio-codec-voice: 8 x 16-bit,
+		 * MCA4 the clock master). Pin2 carries the codec's other port
+		 * (iOS "xsp"), which cannot reach the DAC. Capture = slots 4-7.
 		 */
 		simple-audio-card,dai-link@1 {
 			reg = <1>;
@@ -89,7 +92,7 @@
 			frame-master = <&codec_cpu>;
 
 			codec_cpu: cpu {
-				sound-dai = <&mca2 1>;
+				sound-dai = <&mca4 1>;
 			};
 
 			codec {
@@ -158,6 +161,12 @@
 &mca3 {
 	/* after MCA2 (0-0xcb) and MCA0 (0x100-0x1cb) in both shim SRAM pools */
 	apple,shim-sram-offset = <0x200>;
+	status = "okay";
+};
+
+&mca4 {
+	/* after MCA2, MCA0 and MCA3 in both shim SRAM pools */
+	apple,shim-sram-offset = <0x300>;
 	status = "okay";
 };
 

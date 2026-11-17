@@ -324,6 +324,21 @@
 			status = "disabled";
 		};
 
+		/* MCA4 / pin4: the CS42L67 port that feeds its DAC (ADT spi1/audio-codec vsp_active, mca4/audio-codec-voice) */
+		mca4: i2s@20a0b0000 {
+			compatible = "apple,t7000-mca";
+			reg = <0x2 0x0a0b0000 0x0 0x4000>,
+			      <0x2 0x0a000000 0x0 0x4000>,
+			      <0x2 0x0a100000 0x0 0x1000>;
+			reg-names = "mca", "wrapper", "shim1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 173 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&nco 4>;
+			power-domains = <&ps_mca4>;
+			#sound-dai-cells = <1>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@20a110000 {
 			compatible = "apple,t7000-i2c", "apple,i2c";
 			reg = <0x2 0x0a110000 0x0 0x1000>;

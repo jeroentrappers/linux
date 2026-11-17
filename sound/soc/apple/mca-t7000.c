@@ -373,8 +373,13 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
 	void __iomem *rx = mca->base + SHIM_RX;
 	u32 val;
 
-	/* MCLK pad = nclk / 2 = 12 MHz for the amp, pad driven */
-	writel(MCLK_CTL_PIN_EN | MCLK_CTL_NCLK_DIV2,
+	/*
+	 * MCLK pad = nclk / 2 = 12 MHz for the amp, pad driven. Only MCA0 and
+	 * MCA2 have an MCLK user; iOS writes 0 for MCA3 (baseband) and MCA4
+	 * (codec voice port, re/CODEC-VOICE-PATH.md).
+	 */
+	writel(mca->index == 3 || mca->index == 4 ? 0 :
+	       MCLK_CTL_PIN_EN | MCLK_CTL_NCLK_DIV2,
 	       mca->wrap + WRAP_MCLK_CTL(mca->index));
 
 	/* what the SIO firmware does at boot */
