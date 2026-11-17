@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/ti,sn2400.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: TI SN2400 USB charger
+
+maintainers:
+  - Jeroen Trappers <jeroen.trappers@gmail.com>
+
+description:
+  The SN2400 is a single-cell Li-ion battery charger with a USB input,
+  made by TI for Apple and used in the iPhone 6. It is controlled over
+  I2C; it limits the current drawn from VBUS, sets the battery charge
+  current and has an ADC for the input voltage and current. Its
+  interrupt output signals events such as cable plug and unplug. The
+  battery gauge's single-wire (HDQ) bus is routed through the charger,
+  which hands it to the host on request.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: ti,sn2400
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  wakeup-source: true
+
+  input-current-limit-microamp:
+    description:
+      Current limit for the USB input, applied at probe time.
+    minimum: 90000
+    maximum: 2000000
+    default: 500000
+
+  constant-charge-current-max-microamp:
+    description:
+      Battery charge current, applied at probe time.
+    maximum: 2550000
+    default: 1000000
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@75 {
+            compatible = "ti,sn2400";
+            reg = <0x75>;
+            interrupt-parent = <&pmic>;
+            interrupts = <24 IRQ_TYPE_LEVEL_LOW>;
+            wakeup-source;
+            input-current-limit-microamp = <500000>;
+            constant-charge-current-max-microamp = <1000000>;
+        };
+    };
