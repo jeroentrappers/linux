@@ -254,6 +254,32 @@ static unsigned int mca_t7000_fill(struct mca_t7000 *mca)
 	unsigned int done = 0;
 	u8 *area = runtime->dma_area;
 
+	/*
+	 * Mono on a 2-slot I2S link (the baseband): every sample goes out in both
+	 * slots, so the far end hears it whichever slot it reads (or mixes); an
+	 * idle slot otherwise carries whatever the MCA drives there. One ring word
+	 * (two samples) takes two shim words.
+	 */
+	if (mca->slave && mca->tx_ch == 1) {
+		unsigned int shim_words = free / 4;
+
+		while (done + 4 <= buf_bytes && shim_words >= 2) {
+			u32 w = *(u32 *)(area + d->pos);
+			u32 a = w & 0xffff, b = w >> 16;
+
+			writel_relaxed(a | a << 16, mca->base + SHIM_TX_PORT + 4 * d->word);
+			d->word = (d->word + 1) % SHIM_PORT_WORDS;
+			writel_relaxed(b | b << 16, mca->base + SHIM_TX_PORT + 4 * d->word);
+			d->word = (d->word + 1) % SHIM_PORT_WORDS;
+			shim_words -= 2;
+			d->pos += 4;
+			if (d->pos >= buf_bytes)
+				d->pos = 0;
+			done += 4;
+		}
+		return done;
+	}
+
 	while (done < free) {
 		writel_relaxed(*(u32 *)(area + d->pos),
 			       mca->base + SHIM_TX_PORT + 4 * d->word);
@@ -393,7 +419,7 @@ static void mca_t7000_hw_init(struct mca_t7000 *mca)
 	writel(0x00170018, mca->base + MCA_TX_FIFO);
 	writel(0x00030004, mca->base + MCA_RX_FIFO);
 	writel(0, mca->base + MCA_PAD_BITS);
-	writel(GENMASK(max(mca->tx_ch, 1u) - 1, 0), mca->base + MCA_TX_MASK);
+	writel(mca->slave ? 0x3 : GENMASK(max(mca->tx_ch, 1u) - 1, 0), mca->base + MCA_TX_MASK);
 	writel(mca->i2s ? 0x3 : 0xf, mca->base + MCA_RX_MASK);
 	writel(mca_t7000_tx_ctl(mca), mca->base + MCA_TX_CTL);
 	writel(RX_CTL_IDLE, mca->base + MCA_RX_CTL);
