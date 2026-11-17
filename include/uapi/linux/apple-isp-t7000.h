@@ -74,7 +74,7 @@ struct isp_frame {
  * mirrored); w = 0 or h = 0 keeps the fw's current window; clamped into the frame.
  * -EAGAIN when no camera is streaming. Blocks for the fw round trips (a few ms).
  */
-#define ISP_UAPI_MINOR		1
+#define ISP_UAPI_MINOR		2
 
 struct isp_focus {
 	__u32 mode;		/* ISP_FOCUS_* */
@@ -95,5 +95,23 @@ struct isp_focus {
 #define ISP_FOCUS_F_AE		0x1	/* also meter exposure on the window */
 
 #define ISP_IOC_FOCUS		_IOWR('I', 0x20, struct isp_focus)
+
+/*
+ * ISP_IOC_TORCH (minor 2): the rear flash LEDs (white + amber) in torch mode, through the ISP
+ * firmware, which owns the flash chip on the rear sensor's I2C bus. Needs a camera streaming
+ * (-EAGAIN otherwise). level 0 = off, 1..5 = brightness steps (fw: 6 and up = full);
+ * split: -1 = leave the colour mix alone, 0..100 = % of the current on LED2 (fw manual mode;
+ * measured on n61: 0 = LED1 only, 100 = LED2 only).
+ * The currents the fw reports (mA) come back after the call; both 0 also when it found no chip.
+ */
+struct isp_torch {
+	__u32 level;
+	__s32 split;
+	__u16 led1_ma, led2_ma;	/* out */
+	__u32 fw_status;	/* out: first non-zero fw status, 0 = all ok */
+	__u32 reserved[2];
+};
+
+#define ISP_IOC_TORCH		_IOWR('I', 0x21, struct isp_torch)
 
 #endif /* _UAPI_LINUX_APPLE_ISP_T7000_H */

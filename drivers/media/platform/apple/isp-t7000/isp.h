@@ -142,7 +142,7 @@ enum { CHAN_CMD = 0, CHAN_REPLY = 1, CHAN_REPORT = 2 };
 #define CISP_CMD_CH_OUTPUT_CONFIG_SET	0xb01
 #define CISP_CMD_CH_PREVIEW_STREAM_SET	0xb0d
 
-#define ISP_SENS_GPIOS		3	/* avdd, rear shutdown, front shutdown */
+#define ISP_SENS_GPIOS		4	/* avdd, rear shutdown, front shutdown, torch enable */
 #define ISP_MAX_BUFS		8
 #define ISP_POOL_META		0
 #define ISP_POOL_RENDERED	1
@@ -415,6 +415,7 @@ void isp_af_prestop(struct t7000_isp *isp);
 void isp_af_forget(struct t7000_isp *isp);
 void isp_af_stream_on(struct t7000_isp *isp);
 long isp_af_ioctl(struct t7000_isp *isp, void __user *up);
+long isp_torch_ioctl(struct t7000_isp *isp, void __user *up);
 
 /* isp-cdev.c */
 int isp_cdev_init(struct t7000_isp *isp);

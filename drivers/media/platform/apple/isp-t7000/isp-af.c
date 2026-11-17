@@ -361,3 +361,61 @@ void isp_af_power(struct t7000_isp *isp, bool on)
 	dev_info(isp->dev, "af: focus_ldo (PMIC 0x%x = 0x%02x) %s\n", PMIC_LDO20_REG, v,
 		 af_ldo_set ? "switched on" : "already on");
 }
+
+/*
+ * ISP_IOC_TORCH (isp-cdev.c): the fw's LED torch commands on channel 0 (rear), as iOS sends them:
+ *   0x0606 CH_LED_TORCH_COLOR_MODE_SET  +0xc u16 mode (2 = manual split), +0xe u16 % on LED2 (0 = LED1 only)
+ *   0x0603 CH_LED_TORCH_ON              +0xc u32 level 1..5
+ *   0x0602 CH_LED_TORCH_OFF
+ *   0x0607 CH_LED_TORCH_CURRENTS_GET    reply +0xc u16 LED1 mA, +0xe u16 LED2 mA
+ * Levels above 5 are clamped to 5: the fw's "full" is the chip's 187 mA total, without a timeout.
+ */
+long isp_torch_ioctl(struct t7000_isp *isp, void __user *up)
+{
+	struct isp_torch t;
+	u16 fwst = 0;
+	u8 pkt[0x20];
+	int ret = 0;
+
+	if (copy_from_user(&t, up, sizeof(t)))
+		return -EFAULT;
+	if (t.split > 100 || t.split < -1)
+		return -EINVAL;
+	if (t.level > 5)
+		t.level = 5;
+
+	mutex_lock(&isp->lock);
+	if (!isp->st.on || isp->st.stopping) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	if (t.split >= 0) {
+		af_pkt(pkt, 0x606, 0);
+		put_unaligned_le16(2, pkt + 0xc);
+		put_unaligned_le16(t.split, pkt + 0xe);
+		ret = af_cmd(isp, "LED_TORCH_COLOR_MODE_SET", pkt, 0x10, &fwst);
+	}
+	if (!ret) {
+		af_pkt(pkt, t.level ? 0x603 : 0x602, 0);
+		put_unaligned_le32(t.level, pkt + 0xc);
+		ret = af_cmd(isp, t.level ? "LED_TORCH_ON" : "LED_TORCH_OFF", pkt, 0x10, &fwst);
+	}
+	t.led1_ma = t.led2_ma = 0;
+	if (!ret) {
+		u16 st = 0;
+
+		af_pkt(pkt, 0x607, 0);
+		if (!af_cmd(isp, "LED_TORCH_CURRENTS_GET", pkt, 0x10, &st) && !st) {
+			t.led1_ma = get_unaligned_le16(pkt + 0xc);
+			t.led2_ma = get_unaligned_le16(pkt + 0xe);
+		}
+	}
+	dev_info(isp->dev, "torch: level %u split %d -> LED1 %u mA, LED2 %u mA, fw status 0x%04x\n",
+		 t.level, t.split, t.led1_ma, t.led2_ma, fwst);
+	t.fw_status = fwst;
+out:
+	mutex_unlock(&isp->lock);
+	if (ret)
+		return ret;
+	return copy_to_user(up, &t, sizeof(t)) ? -EFAULT : 0;
+}

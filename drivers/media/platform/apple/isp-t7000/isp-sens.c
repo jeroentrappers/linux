@@ -33,6 +33,7 @@
 #define PIN_AVDD		198
 #define PIN_SHUT_REAR		190
 #define PIN_SHUT_FRONT		196
+#define PIN_TORCH		8	/* ADT isp function-torch_enable: the flash chip's enable */
 #define PIN_CLK_REAR		191
 #define PIN_CLK_FRONT		197
 
@@ -163,6 +164,11 @@ int isp_sensor_power_on(struct t7000_isp *isp)
 		isp_extclk_set(isp, 1, PIN_CLK_FRONT);
 	}
 	ret = isp_pin_out(isp, 1, PIN_SHUT_REAR, "isp-rear-shutdown");
+	/* iOS EnableSensor0: the flash chip's enable right after the rear shutdown pin, while the rear
+	 * sensor is powered (the n61 platform row has a strobe on channel 0 only); the fw finds the
+	 * chip on the rear sensor's I2C bus when it boots, so it must be up before that */
+	if (!ret)
+		ret = isp_pin_out(isp, 3, PIN_TORCH, "isp-torch-enable");
 	if (!ret)
 		ret = isp_pin_out(isp, 2, PIN_SHUT_FRONT, "isp-front-shutdown");
 	if (ret)
@@ -190,6 +196,7 @@ void isp_sensor_power_off(struct t7000_isp *isp)
 	if (!isp->sens_on)
 		return;
 	isp_pin_release(isp, 2);
+	isp_pin_release(isp, 3);
 	isp_pin_release(isp, 1);
 	for (n = 1; n >= 0; n--) {
 		if (isp->extclk_saved & BIT(n) && READ_ONCE(isp_trace))

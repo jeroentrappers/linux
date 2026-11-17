@@ -119,6 +119,8 @@ static long isp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return 0;
 	case ISP_IOC_FOCUS:
 		return isp_af_ioctl(isp, up);
+	case ISP_IOC_TORCH:
+		return isp_torch_ioctl(isp, up);
 	}
 	return -ENOTTY;
 }
