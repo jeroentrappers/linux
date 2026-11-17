@@ -499,8 +499,14 @@ static int cs42l67_rcv_event(struct snd_soc_dapm_widget *w, struct snd_kcontrol 
 	return 0;
 }
 
+/*
+ * Virtual (register-less) switches: the argument is the maximum, and they start
+ * disconnected (DAPM connects a virtual path at init only when inverted). The
+ * earpiece one had max 0 and could never be switched on; userspace turns the
+ * headphone path on at boot (rd 42-codec.sh) and callaudio flips the two.
+ */
 static const struct snd_kcontrol_new hp_switch = SOC_DAPM_SINGLE_VIRT("Switch", 1);
-static const struct snd_kcontrol_new rcv_switch = SOC_DAPM_SINGLE_VIRT("Switch", 0);
+static const struct snd_kcontrol_new rcv_switch = SOC_DAPM_SINGLE_VIRT("Switch", 1);
 
 /* ---- DAPM ---- */
 
