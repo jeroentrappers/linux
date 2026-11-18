@@ -419,14 +419,27 @@
 };
 
 &pmic_gpio {
-	/* ADT oscar function-reset: PMU GPIO 5, active low */
-	gpio-line-names = "", "", "", "", "", "OSCAR_RESET_L",
-			  "", "", "BT_REG_ON", "", "WL_REG_ON", "OSCAR_CLK32K";
 	/*
-	 * PMU GPIO 11: LLB programs cfg 0x08 and iOS never writes it again;
-	 * presumably the M8's 32 kHz clock. Keep it away from gpiolib: an
-	 * output request would rewrite the cfg, and a cfg with bits 6:3 =
-	 * 1000 (0x41) wedged the PMU's I2C bus on hw.
+	 * Net names from the N61 board schematic (PMU sheet; its GPIOn is
+	 * line n-1 here). PMU GPIO 5 is both the M8's reset and its 32.768 kHz
+	 * clock: the PMU's clock function on that pin releases the reset and
+	 * clocks the M8's RTC, a plain high level only releases the reset.
+	 */
+	gpio-line-names = "CHG_TO_PMU_INT_L", "BB_TO_PMU_HOST_WAKE_L",
+			  "PMU_TO_BB_RST_R_L", "TRISTAR_TO_AP_INT",
+			  "STOCKHOLM_TO_PMU_HOST_WAKE",
+			  "PMU_TO_OSCAR_RESET_CLK32K_L",
+			  "WLAN_TO_PMU_HOST_WAKE", "CODEC_TO_PMU_MIKEY_INT_L",
+			  "PMU_TO_BT_REG_ON", "BT_TO_PMU_HOST_WAKE",
+			  "PMU_TO_WLAN_REG_ON", "AP_TO_I2C0_SCL",
+			  "OSCAR_TO_PMU_HOST_WAKE", "", "PMU_TO_BB_VBUS_DET", "",
+			  "WLAN_TO_PMU_PCIE_WAKE_L", "PMU_TO_ACC_SW_ON",
+			  "", "", "";
+	/*
+	 * PMU GPIO 11 sits on the AP's I2C0 SCL net, and the PMU itself is on
+	 * I2C0. LLB programs it to cfg 0x08 and iOS never writes it again; a
+	 * cfg with bits 6:3 = 1000 (0x41) wedged the PMU's I2C bus on hw. Keep
+	 * it away from gpiolib.
 	 */
 	gpio-reserved-ranges = <11 1>;
 };
