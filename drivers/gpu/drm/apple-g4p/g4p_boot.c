@@ -36,6 +36,10 @@
 #define RGX_CR_MTS_SCHEDULE_DM2	0x12	/* DM 2 = CL (0x…850122c, re/GPU-FIRST-JOB.md 2.2) */
 
 #define G4P_CHAN_RING_SIZE	144	/* 9 x 16, as AGXChannel::init */
+
+static unsigned int cl_kick = RGX_CR_MTS_SCHEDULE_DM2;
+module_param(cl_kick, uint, 0644);
+MODULE_PARM_DESC(cl_kick, "MTS_SCHEDULE value for the C1 kick (bring-up experiments; AGX uses 0x12 for CL)");
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
@@ -384,7 +388,7 @@ int g4p_boot_cl_c1(struct g4p *g)
 	wr = g4p_fwinit_ring_push(&b->fi, 2, entry);
 	if (wr < 0)
 		return wr;
-	writel(RGX_CR_MTS_SCHEDULE_DM2, g->rgx + RGX_CR_MTS_SCHEDULE);
+	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 	b->cl_ret = -ETIMEDOUT;
 	for (b->cl_us = 0; b->cl_us < 100000; b->cl_us += 10) {
@@ -400,8 +404,8 @@ int g4p_boot_cl_c1(struct g4p *g)
 	b->cl_state_1c = READ_ONCE(*(u32 *)(st + 0x1c));
 	b->cl_state_38 = READ_ONCE(*(u32 *)(st + 0x38));
 	b->cl_ring_30 = READ_ONCE(*(u32 *)(ctl + 0x30));
-	dev_info(g->dev, "C1: ring 2 entry %s after %u us (read %u, write %d); chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u +0x00 %u +0x10 %u\n",
-		 b->cl_ret ? "NOT consumed" : "consumed", b->cl_us, b->cl_rd, wr, b->cl_state_1c, b->cl_state_38,
+	dev_info(g->dev, "C1 (kick 0x%02x): ring 2 entry %s after %u us (read %u, write %d); chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u +0x00 %u +0x10 %u\n",
+		 cl_kick & 0xff, b->cl_ret ? "NOT consumed" : "consumed", b->cl_us, b->cl_rd, wr, b->cl_state_1c, b->cl_state_38,
 		 b->cl_ring_30, READ_ONCE(*(u32 *)ctl), READ_ONCE(*(u32 *)(ctl + 0x10)));
 	return b->cl_ret;
 }
