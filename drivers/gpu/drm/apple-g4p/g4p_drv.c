@@ -176,6 +176,8 @@ static irqreturn_t g4p_irq(int irq, void *data)
 		return IRQ_NONE;
 	writel(0, g->rgx + 0x0ac8);	/* AGXMetaFirmware::clearOutstandingFirmwareInterrupts */
 	atomic_inc(&g->irq_count);
+	if (g->boot)	/* memory only: the firmware blocks once the trace/statistics rings are full */
+		g4p_boot_irq_rings(g);
 	wake_up(&g->irq_wq);
 	return IRQ_HANDLED;
 }

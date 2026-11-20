@@ -331,6 +331,36 @@ u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring)
 	return READ_ONCE(*(u32 *)(fi->list_b.cpu + LB_RING_CTL(ring))) & 0xff;
 }
 
+/*
+ * Tell the firmware the GPU page tables changed (re/GPU-C1-DEBUG.md): at each kick it compares root B's
+ * per-context word B#18[0] with its own copy and, on a change in the low field, invalidates the BIF PT
+ * cache and TLB (BIF_CTRL_INVAL 0x9), as iOS's AGXFirmware::requestGartInval arranges.
+ */
+void g4p_fwinit_gart_inval(struct g4p_fwinit *fi)
+{
+	void *p = fi->list_b.cpu + LB_CTX_U32;
+	u32 v = get_unaligned_le32(p);
+
+	w32(p, 0, (v & ~0xfffu) | ((v + 1) & 0xfff));
+	wmb();	/* before the kick that makes the firmware compare it */
+}
+
+/* host-bound rings the firmware blocks on when full (trace B#3, statistics B#4): mark everything read */
+void g4p_fwinit_ack_trace_stats(struct g4p_fwinit *fi)
+{
+	void *b = fi->list_b.cpu;
+
+	w32(b, LB_TRACE_CTL, READ_ONCE(*(u32 *)(b + LB_TRACE_CTL + 0x10)));
+	w32(b, LB_STAT_CTL, READ_ONCE(*(u32 *)(b + LB_STAT_CTL + 0x10)));
+}
+
+u32 g4p_fwinit_ring_ctl(struct g4p_fwinit *fi, unsigned int which, unsigned int off)
+{
+	static const u32 ctl[] = { LB_TRACE_CTL, LB_STAT_CTL };
+
+	return READ_ONCE(*(u32 *)(fi->list_b.cpu + ctl[which] + off));
+}
+
 /* every event-ring entry the firmware has written so far (non-destructive): type and payload words */
 void g4p_fwinit_show_events(struct seq_file *s, struct g4p_fwinit *fi)
 {

@@ -40,6 +40,14 @@
 static unsigned int cl_kick = RGX_CR_MTS_SCHEDULE_DM2;
 module_param(cl_kick, uint, 0644);
 MODULE_PARM_DESC(cl_kick, "MTS_SCHEDULE value for the C1 kick (bring-up experiments; AGX uses 0x12 for CL)");
+
+static bool gart_inval = true;
+module_param(gart_inval, bool, 0644);
+MODULE_PARM_DESC(gart_inval, "ask the firmware to invalidate the GPU MMU caches after post-boot mappings");
+
+static bool ack_rings = true;
+module_param(ack_rings, bool, 0644);
+MODULE_PARM_DESC(ack_rings, "consume the trace/statistics rings so the firmware does not block on them");
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
@@ -80,7 +88,8 @@ struct g4p_boot {
 	/* CL channel (re/GPU-FIRST-JOB.md 2.1): state in heap 7, ring ctl + command pointers in heap 6 */
 	struct g4p_bo cl_state, cl_ring;
 	int cl_ret;
-	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd;
+	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd, cl_state_24;
+	u64 cl_fault[4], cl_event_status;
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -171,6 +180,13 @@ void g4p_boot_irq_off(struct g4p *g)
 		disable_irq(g->irq);
 		g->irq_on = false;
 	}
+}
+
+/* from the IRQ handler: keep the host-bound trace/statistics rings drained */
+void g4p_boot_irq_rings(struct g4p *g)
+{
+	if (ack_rings && g->boot->fi.list_b.cpu)
+		g4p_fwinit_ack_trace_stats(&g->boot->fi);
 }
 
 /* only once the GPU is powered off: until then it may still access these pages */
@@ -265,6 +281,8 @@ int g4p_boot_start(struct g4p *g)
 			usleep_range(10000, 11000);
 	}
 	b->irqs = atomic_read(&g->irq_count);
+	if (ack_rings)
+		g4p_fwinit_ack_trace_stats(&b->fi);
 
 	/* RGX reads only while the Fender still reports a non-zero perf state with no request pending */
 	b->fender_perf = readl(g->fender + 0x1000);
@@ -381,6 +399,8 @@ int g4p_boot_cl_c1(struct g4p *g)
 	*(u32 *)(st + 0x04) = g4p_fw_addr(b->cl_ring.gpuva + 0x60, false);
 	*(u32 *)(st + 0x18) = 0xffffffff;
 	wmb();	/* channel objects before the ring entry that names them */
+	if (gart_inval)	/* new pages after boot: the BIF has a stale PT line (re/GPU-C1-DEBUG.md) */
+		g4p_fwinit_gart_inval(&b->fi);
 
 	entry[1] = g4p_fw_addr(b->cl_state.gpuva, false);
 	entry[2] = 0;	/* channel ring write index: no commands */
@@ -404,6 +424,19 @@ int g4p_boot_cl_c1(struct g4p *g)
 	b->cl_state_1c = READ_ONCE(*(u32 *)(st + 0x1c));
 	b->cl_state_38 = READ_ONCE(*(u32 *)(st + 0x38));
 	b->cl_ring_30 = READ_ONCE(*(u32 *)(ctl + 0x30));
+	b->cl_state_24 = READ_ONCE(*(u32 *)(st + 0x24));
+	/* live MMU fault state after C1 (b->fault[] is the boot-time snapshot) */
+	perf = readl(g->fender + 0x1000);
+	if ((perf & 0xf) && !(perf & BIT(4))) {
+		b->cl_fault[0] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
+		b->cl_fault[1] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ);
+		b->cl_fault[2] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
+		b->cl_fault[3] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ);
+		b->cl_event_status = readq(g->rgx + RGX_CR_EVENT_STATUS);
+	}
+	dev_info(g->dev, "C1: gart_inval %d; live BIF fault 0x%llx/0x%llx 0x%llx/0x%llx, event_status 0x%llx; state +0x24 %u\n",
+		 gart_inval, b->cl_fault[0], b->cl_fault[1], b->cl_fault[2], b->cl_fault[3], b->cl_event_status,
+		 b->cl_state_24);
 	dev_info(g->dev, "C1 (kick 0x%02x): ring 2 entry %s after %u us (read %u, write %d); chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u +0x00 %u +0x10 %u\n",
 		 cl_kick & 0xff, b->cl_ret ? "NOT consumed" : "consumed", b->cl_us, b->cl_rd, wr, b->cl_state_1c, b->cl_state_38,
 		 b->cl_ring_30, READ_ONCE(*(u32 *)ctl), READ_ONCE(*(u32 *)(ctl + 0x10)));
@@ -435,6 +468,13 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	if (b->cl_state.cpu)
 		seq_printf(s, "  C1: %d after %u us, ring 2 read %u; chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u\n",
 			   b->cl_ret, b->cl_us, b->cl_rd, b->cl_state_1c, b->cl_state_38, b->cl_ring_30);
+	seq_printf(s, "  trace ring rd %u wr %u, statistics ring rd %u wr %u\n", g4p_fwinit_ring_ctl(&b->fi, 0, 0),
+		   g4p_fwinit_ring_ctl(&b->fi, 0, 0x10), g4p_fwinit_ring_ctl(&b->fi, 1, 0),
+		   g4p_fwinit_ring_ctl(&b->fi, 1, 0x10));
+	if (b->cl_state.cpu)
+		seq_printf(s, "  C1 live: BIF fault 0x%llx/0x%llx 0x%llx/0x%llx event_status 0x%llx state +0x24 %u\n",
+			   b->cl_fault[0], b->cl_fault[1], b->cl_fault[2], b->cl_fault[3], b->cl_event_status,
+			   b->cl_state_24);
 	g4p_fwinit_show_events(s, &b->fi);
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],

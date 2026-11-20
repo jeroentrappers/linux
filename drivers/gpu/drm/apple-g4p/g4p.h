@@ -111,6 +111,9 @@ void g4p_fwinit_free(struct device *dev, struct g4p_fwinit *fi);
 bool g4p_fwinit_event(struct g4p_fwinit *fi, u32 *type, u32 *payload);
 void g4p_fwinit_show_log(struct seq_file *s, struct g4p_fwinit *fi);
 void g4p_fwinit_show_events(struct seq_file *s, struct g4p_fwinit *fi);
+void g4p_fwinit_gart_inval(struct g4p_fwinit *fi);
+void g4p_fwinit_ack_trace_stats(struct g4p_fwinit *fi);
+u32 g4p_fwinit_ring_ctl(struct g4p_fwinit *fi, unsigned int which, unsigned int off);
 int g4p_fwinit_ring_push(struct g4p_fwinit *fi, unsigned int ring, const u32 *entry);
 u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring);
 
@@ -121,6 +124,7 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g);
 int g4p_boot_devctl_nop(struct g4p *g, u32 type);
 int g4p_boot_cl_c1(struct g4p *g);
 void g4p_boot_irq_off(struct g4p *g);
+void g4p_boot_irq_rings(struct g4p *g);
 
 
 #endif
