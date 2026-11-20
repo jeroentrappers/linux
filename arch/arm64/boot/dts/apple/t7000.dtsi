@@ -146,6 +146,8 @@
 			      <0x2 0x0e032000 0x0 0x4>;
 			reg-names = "rgx", "fender", "bridge10", "bridge11", "misc-acg";
 			power-domains = <&ps_gfx>;
+			/* firmware -> host (META_SP_MSLVIRQSTATUS TRIGVECT2); ADT sgx interrupts[0] */
+			interrupts = <AIC_IRQ 0x86 IRQ_TYPE_LEVEL_HIGH>;
 			apple,bridge10-settings = <0x18 0x80010004>;
 			apple,bridge11-settings =
 				<0x007c7c01 0x007c7c01 0x007c7c01 0x007c7901 0x007c7901 0x007c7c01 0x007c7c01 0x007c7c01>,

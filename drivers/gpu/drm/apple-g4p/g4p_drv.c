@@ -18,6 +18,9 @@
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/of_irq.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -35,6 +38,27 @@
 static bool experimental;
 module_param(experimental, bool, 0444);
 MODULE_PARM_DESC(experimental, "allow GPU power-up through debugfs (the sequence is not complete yet)");
+
+static unsigned int fw_irq;
+module_param(fw_irq, uint, 0444);
+MODULE_PARM_DESC(fw_irq, "AIC IRQ number of the firmware interrupt when the DT has none (bring-up; 0x86 on T7000)");
+
+/* bring-up fallback for images whose GPU node has no interrupts property: map AIC_IRQ fw_irq ourselves */
+static int g4p_irq_from_param(struct device *dev)
+{
+	struct of_phandle_args spec = { .args_count = 3, .args = { 0 /* AIC_IRQ */, fw_irq, IRQ_TYPE_LEVEL_HIGH } };
+	int irq;
+
+	spec.np = of_find_compatible_node(NULL, NULL, "apple,aic");
+	if (!spec.np)
+		return -ENODEV;
+	irq = irq_create_of_mapping(&spec);
+	of_node_put(spec.np);
+	if (!irq)
+		return -EINVAL;
+	dev_info(dev, "no interrupts in the DT: using AIC IRQ 0x%x (fw_irq) as virq %d\n", fw_irq, irq);
+	return irq;
+}
 
 static bool read_id = true;
 module_param(read_id, bool, 0644);
@@ -106,6 +130,7 @@ static void g4p_power_off_locked(struct g4p *g)
 	if (g4p_fender_perf(g, FNDR_PERF_CTL_BUSY | 0))
 		dev_warn(g->dev, "Fender: power-down request not acknowledged\n");
 	/* TODO (8.12): turn GFX DVFM off as gpuprobe "off" does; a stuck transition left on crashes the SoC */
+	g4p_boot_irq_off(g);	/* before the power goes: the handler reads RGX */
 	pm_runtime_put_sync(g->dev);
 	g->powered = false;
 	g4p_boot_free(g);	/* the GPU is off: its memory can go */
@@ -139,6 +164,20 @@ static int g4p_power_on_locked(struct g4p *g)
 	dev_info(g->dev, "powered up: Fender ctrl 0x%08x perf 0x%08x next 0x%08x\n",
 		 readl(g->fender + FNDR_CTRL), readl(g->fender + FNDR_PERF_CTL), readl(g->fender + FNDR_PERF_NEXT));
 	return 0;
+}
+
+/* firmware -> host: META slave-port trigger 2 on AIC 0x86 (GPU-BRINGUP 8.28); only enabled while booted */
+static irqreturn_t g4p_irq(int irq, void *data)
+{
+	struct g4p *g = data;
+	u32 st = readl(g->rgx + 0x0ac8);
+
+	if (!(st & BIT(2)))
+		return IRQ_NONE;
+	writel(0, g->rgx + 0x0ac8);	/* AGXMetaFirmware::clearOutstandingFirmwareInterrupts */
+	atomic_inc(&g->irq_count);
+	wake_up(&g->irq_wq);
+	return IRQ_HANDLED;
 }
 
 /* ------------------------------------------------------------------------------------------------ */
@@ -313,6 +352,18 @@ static int g4p_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
 	if (ret)
 		return ret;
+
+	init_waitqueue_head(&g->irq_wq);
+	g->irq = platform_get_irq_optional(pdev, 0);
+	if (g->irq == -ENXIO && fw_irq)
+		g->irq = g4p_irq_from_param(dev);
+	if (g->irq >= 0) {
+		ret = devm_request_irq(dev, g->irq, g4p_irq, IRQF_NO_AUTOEN, dev_name(dev), g);
+		if (ret)
+			return dev_err_probe(dev, ret, "irq\n");
+	} else if (g->irq != -ENXIO) {
+		return dev_err_probe(dev, g->irq, "irq\n");
+	}
 
 	platform_set_drvdata(pdev, g);
 	ret = devm_pm_runtime_enable(dev);

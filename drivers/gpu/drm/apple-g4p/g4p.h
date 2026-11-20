@@ -6,7 +6,9 @@
 #define G4P_H
 
 #include <linux/bits.h>
+#include <linux/atomic.h>
 #include <linux/mutex.h>
+#include <linux/wait.h>
 #include <linux/types.h>
 
 #include "g4p_fw.h"
@@ -48,6 +50,10 @@ struct g4p {
 	struct dentry *debugfs;
 	struct g4p_fw fw;			/* loaded on first read of debugfs firmware */
 	void *fw_image;				/* host copy (vmalloc), for debugfs firmware */
+	int irq;				/* firmware -> host, < 0 if not described */
+	atomic_t irq_count;
+	wait_queue_head_t irq_wq;
+	bool irq_on;
 	struct g4p_boot *boot;			/* GPU memory of a META boot; freed after power-off */
 };
 
@@ -112,6 +118,7 @@ int g4p_boot_start(struct g4p *g);
 void g4p_boot_free(struct g4p *g);
 void g4p_boot_show(struct seq_file *s, struct g4p *g);
 int g4p_boot_devctl_nop(struct g4p *g, u32 type);
+void g4p_boot_irq_off(struct g4p *g);
 
 
 #endif

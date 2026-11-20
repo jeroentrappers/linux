@@ -14,6 +14,7 @@
 
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/seq_file.h>
@@ -33,6 +34,7 @@
 #define RGX_CR_MTS_SCHEDULE		0x0b00
 #define RGX_CR_MTS_SCHEDULE_DM0	0x10	/* TASK_COUNTED, DM 0: AGX's kick (0x…8501704) */
 #define RGX_CR_META_BOOT		0x0bf8
+#define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
 #define RGX_CR_BIF_FAULT_BANK0_MMU	0x12b0
 #define RGX_CR_BIF_FAULT_BANK0_REQ	0x12b8
@@ -67,6 +69,7 @@ struct g4p_boot {
 	unsigned int alive_ms;
 	u32 fender_perf;
 	u32 devctl_sent, devctl_done, devctl_last_us;
+	int irqs;	/* firmware interrupts seen by the end of the alive wait */
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -148,6 +151,15 @@ static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 	kfree(b);
 }
 
+/* the IRQ handler reads RGX: on only between a boot and the power-off */
+void g4p_boot_irq_off(struct g4p *g)
+{
+	if (g->irq_on) {
+		disable_irq(g->irq);
+		g->irq_on = false;
+	}
+}
+
 /* only once the GPU is powered off: until then it may still access these pages */
 void g4p_boot_free(struct g4p *g)
 {
@@ -196,6 +208,11 @@ int g4p_boot_start(struct g4p *g)
 
 	wmb();	/* tables and image in memory before the GPU can fetch them */
 	g->boot = b;
+	if (g->irq >= 0 && !g->irq_on) {
+		atomic_set(&g->irq_count, 0);
+		enable_irq(g->irq);
+		g->irq_on = true;
+	}
 
 	dev_info(g->dev, "META boot: image %pad (0x%zx), PC %pad, %u boot args\n", &b->image.dma, b->image.size,
 		 &b->mmu.pc_dma, fw->nr_cfg + 12);
@@ -215,6 +232,8 @@ int g4p_boot_start(struct g4p *g)
 	udelay(3);
 	/* waitForFWAlive: iOS waits up to 10 s; event type 0 = alive (re/GPU-FW-INIT.md 7) */
 	for (b->alive_ms = 0; b->alive_ms < 2000 && !b->alive; b->alive_ms += 10) {
+		int seen = atomic_read(&g->irq_count);
+
 		u32 type, payload;
 
 		while (g4p_fwinit_event(&b->fi, &type, &payload)) {
@@ -225,9 +244,14 @@ int g4p_boot_start(struct g4p *g)
 			if (type == 0)
 				b->alive = true;
 		}
-		if (!b->alive)
+		if (b->alive)
+			break;
+		if (g->irq_on)	/* the event producer raises the IRQ (GPU-BRINGUP 8.28); poll as fallback */
+			wait_event_timeout(g->irq_wq, atomic_read(&g->irq_count) != seen, msecs_to_jiffies(10));
+		else
 			usleep_range(10000, 11000);
 	}
+	b->irqs = atomic_read(&g->irq_count);
 
 	/* RGX reads only while the Fender still reports a non-zero perf state with no request pending */
 	b->fender_perf = readl(g->fender + 0x1000);
@@ -261,6 +285,7 @@ int g4p_boot_start(struct g4p *g)
 	}
 	dev_info(g->dev, "META boot: soft_reset 0x%llx mslvctrl1 0x%08x T0 en 0x%x st 0x%x T1 en 0x%x st 0x%x (sp %d)\n",
 		 b->soft_reset, b->mslvctrl1, b->txenable[0], b->txstatus[0], b->txenable[1], b->txstatus[1], b->ret);
+	dev_info(g->dev, "META boot: %d firmware IRQs during the alive wait\n", b->irqs);
 	dev_info(g->dev, "META boot: %s after %u ms (%u events, first type %u payload 0x%x), roots 0x%08x 0x%08x\n",
 		 b->alive ? "firmware ALIVE" : "no alive event", b->alive_ms, b->nr_events, b->ev_type, b->ev_payload,
 		 b->roots[0], b->roots[1]);
@@ -327,6 +352,7 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	seq_printf(s, "  fender perf after boot 0x%08x\n", b->fender_perf);
 	seq_printf(s, "  alive %d after %u ms, %u events (type %u payload 0x%x), roots 0x%08x 0x%08x\n", b->alive,
 		   b->alive_ms, b->nr_events, b->ev_type, b->ev_payload, b->roots[0], b->roots[1]);
+	seq_printf(s, "  irq %d: %d during the alive wait, %d total\n", g->irq, b->irqs, atomic_read(&g->irq_count));
 	seq_printf(s, "  devctl: %u sent, %u consumed (last %u us), read index %u\n", b->devctl_sent, b->devctl_done,
 		   b->devctl_last_us, g4p_fwinit_devctl_read_index(&b->fi));
 	g4p_fwinit_show_log(s, &b->fi);
