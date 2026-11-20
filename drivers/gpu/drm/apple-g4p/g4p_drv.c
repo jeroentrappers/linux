@@ -303,6 +303,23 @@ static int g4p_devctl_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_devctl_fops, NULL, g4p_devctl_set, "%llu\n");
 
+/* M5 checkpoints: echo 1 > cl runs C1 (empty CL channel, re/GPU-FIRST-JOB.md 7) */
+static int g4p_cl_set(void *data, u64 val)
+{
+	struct g4p *g = data;
+	int ret;
+
+	if (!experimental)
+		return -EPERM;
+	if (val != 1)
+		return -EINVAL;
+	mutex_lock(&g->lock);
+	ret = g4p_boot_cl_c1(g);
+	mutex_unlock(&g->lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(g4p_cl_fops, NULL, g4p_cl_set, "%llu\n");
+
 /* ------------------------------------------------------------------------------------------------ */
 /* probe: map and parse only, no register access */
 
@@ -376,6 +393,7 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("firmware", 0400, g->debugfs, g, &g4p_firmware_fops);
 	debugfs_create_file("boot", 0200, g->debugfs, g, &g4p_boot_fops);
 	debugfs_create_file("devctl", 0200, g->debugfs, g, &g4p_devctl_fops);
+	debugfs_create_file("cl", 0200, g->debugfs, g, &g4p_cl_fops);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }

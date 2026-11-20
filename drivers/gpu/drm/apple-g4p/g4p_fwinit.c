@@ -304,21 +304,21 @@ bool g4p_fwinit_event(struct g4p_fwinit *fi, u32 *type, u32 *payload)
 }
 
 /*
- * Queue one 0x14-byte entry on the device-control ring (list B #13 ctl, #17 ring; re/GPU-FW-PROTO.md):
- * ctl +0x00 = firmware read index, +0x10 = host write index, 256 entries. Returns the new write index,
- * or -EBUSY when the ring is full. The caller kicks the firmware afterwards.
+ * Queue one 0x14-byte entry on host->firmware ring @ring (0 TA, 1 3D, 2 CL, 3 device control; list B
+ * #10..#13 ctl, #14..#17 entries; re/GPU-FW-PROTO.md): ctl +0x00 = firmware read index, +0x10 = host write
+ * index, 256 entries. Returns the new write index, or -EBUSY when the ring is full. The caller kicks.
  */
-int g4p_fwinit_devctl_push(struct g4p_fwinit *fi, const u32 *entry)
+int g4p_fwinit_ring_push(struct g4p_fwinit *fi, unsigned int ring, const u32 *entry)
 {
 	void *b = fi->list_b.cpu;
-	void *ctl = b + LB_RING_CTL(3);
+	void *ctl = b + LB_RING_CTL(ring);
 	u32 rd = READ_ONCE(*(u32 *)ctl) & 0xff;
 	u32 wr = get_unaligned_le32(ctl + 0x10) & 0xff;
 
 	if (((wr + 1) & 0xff) == rd)
 		return -EBUSY;
 	for (unsigned int i = 0; i < 5; i++)
-		w32(b, LB_RING(3) + 0x14 * wr + 4 * i, entry[i]);
+		w32(b, LB_RING(ring) + 0x14 * wr + 4 * i, entry[i]);
 	wmb();	/* the entry before the index that publishes it */
 	wr = (wr + 1) & 0xff;
 	w32(ctl, 0x10, wr);
@@ -326,9 +326,9 @@ int g4p_fwinit_devctl_push(struct g4p_fwinit *fi, const u32 *entry)
 	return wr;
 }
 
-u32 g4p_fwinit_devctl_read_index(struct g4p_fwinit *fi)
+u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring)
 {
-	return READ_ONCE(*(u32 *)(fi->list_b.cpu + LB_RING_CTL(3))) & 0xff;
+	return READ_ONCE(*(u32 *)(fi->list_b.cpu + LB_RING_CTL(ring))) & 0xff;
 }
 
 /* first messages of log sub-ring 0, as text (§7: message +0 level, +4 seq, +8 time, +0x10 text) */

@@ -33,6 +33,9 @@
 #define RGX_CR_META_SP_MSLVCTRL1_IDLE	(BIT(24) | BIT(26))	/* READY | GBLPORT_IDLE */
 #define RGX_CR_MTS_SCHEDULE		0x0b00
 #define RGX_CR_MTS_SCHEDULE_DM0	0x10	/* TASK_COUNTED, DM 0: AGX's kick (0x…8501704) */
+#define RGX_CR_MTS_SCHEDULE_DM2	0x12	/* DM 2 = CL (0x…850122c, re/GPU-FIRST-JOB.md 2.2) */
+
+#define G4P_CHAN_RING_SIZE	144	/* 9 x 16, as AGXChannel::init */
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
@@ -70,6 +73,10 @@ struct g4p_boot {
 	u32 fender_perf;
 	u32 devctl_sent, devctl_done, devctl_last_us;
 	int irqs;	/* firmware interrupts seen by the end of the alive wait */
+	/* CL channel (re/GPU-FIRST-JOB.md 2.1): state in heap 7, ring ctl + command pointers in heap 6 */
+	struct g4p_bo cl_state, cl_ring;
+	int cl_ret;
+	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd;
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -145,6 +152,8 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
+	g4p_bo_free(dev, &b->cl_state);
+	g4p_bo_free(dev, &b->cl_ring);
 	g4p_fwinit_free(dev, &b->fi);
 	g4p_bo_free(dev, &b->image);
 	g4p_mmu_fini(dev, &b->mmu);
@@ -314,14 +323,14 @@ int g4p_boot_devctl_nop(struct g4p *g, u32 type)
 	perf = readl(g->fender + 0x1000);
 	if (!(perf & 0xf) || (perf & BIT(4)))
 		return -EIO;	/* GPU not in a running perf state: no RGX access */
-	wr = g4p_fwinit_devctl_push(&b->fi, entry);
+	wr = g4p_fwinit_ring_push(&b->fi, 3, entry);
 	if (wr < 0)
 		return wr;
 	writel(RGX_CR_MTS_SCHEDULE_DM0, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 	b->devctl_sent++;
 	for (b->devctl_last_us = 0; b->devctl_last_us < 100000; b->devctl_last_us += 10) {
-		if (g4p_fwinit_devctl_read_index(&b->fi) == (u32)wr) {
+		if (g4p_fwinit_ring_read_index(&b->fi, 3) == (u32)wr) {
 			b->devctl_done++;
 			dev_info(g->dev, "devctl type %u: consumed after %u us (index %d)\n", type, b->devctl_last_us, wr);
 			return 0;
@@ -329,8 +338,72 @@ int g4p_boot_devctl_nop(struct g4p *g, u32 type)
 		udelay(10);
 	}
 	dev_warn(g->dev, "devctl type %u: not consumed in 100 ms (read %u, write %d)\n", type,
-		 g4p_fwinit_devctl_read_index(&b->fi), wr);
+		 g4p_fwinit_ring_read_index(&b->fi, 3), wr);
 	return -ETIMEDOUT;
+}
+
+/*
+ * M5 checkpoint C1 (re/GPU-FIRST-JOB.md 7): an empty CL channel. Channel state + a channel ring with no
+ * commands, one ring 2 entry {2, FW(state), write index 0, first submit}, kick DM 2. Expected: ring 2's
+ * read index advances; the firmware queues the channel (state +0x1c = 1, +0x38 = 1, ring ctl +0x30 = 0)
+ * and its scheduler finds no command (ctl +0x00 == +0x40). Everything the firmware writes back is passed
+ * in the uncached address form so the host sees it (META's data cache is on).
+ */
+int g4p_boot_cl_c1(struct g4p *g)
+{
+	struct g4p_boot *b = g->boot;
+	u32 entry[5] = { 2 };
+	void *st, *ctl;
+	u32 perf;
+	int wr, ret;
+
+	if (!b || !b->alive || !g->powered)
+		return -ENODEV;
+	if (b->cl_state.cpu)
+		return -EBUSY;	/* one C1 per boot */
+	perf = readl(g->fender + 0x1000);
+	if (!(perf & 0xf) || (perf & BIT(4)))
+		return -EIO;
+	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, 0x80, &b->cl_state);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, 0x60 + 4 * G4P_CHAN_RING_SIZE, &b->cl_ring);
+	if (ret)
+		return ret;
+	st = b->cl_state.cpu;
+	ctl = b->cl_ring.cpu;
+	/* resetChannelState: ring ctl indices 0, +0x50 = size; state +0 ctl, +4 pointer array, +0x18 = ~0 */
+	*(u32 *)(ctl + 0x50) = G4P_CHAN_RING_SIZE;
+	*(u32 *)(st + 0x00) = g4p_fw_addr(b->cl_ring.gpuva, false);
+	*(u32 *)(st + 0x04) = g4p_fw_addr(b->cl_ring.gpuva + 0x60, false);
+	*(u32 *)(st + 0x18) = 0xffffffff;
+	wmb();	/* channel objects before the ring entry that names them */
+
+	entry[1] = g4p_fw_addr(b->cl_state.gpuva, false);
+	entry[2] = 0;	/* channel ring write index: no commands */
+	entry[3] = 1;	/* first submission */
+	wr = g4p_fwinit_ring_push(&b->fi, 2, entry);
+	if (wr < 0)
+		return wr;
+	writel(RGX_CR_MTS_SCHEDULE_DM2, g->rgx + RGX_CR_MTS_SCHEDULE);
+	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
+	b->cl_ret = -ETIMEDOUT;
+	for (b->cl_us = 0; b->cl_us < 100000; b->cl_us += 10) {
+		if (g4p_fwinit_ring_read_index(&b->fi, 2) == (u32)wr) {
+			b->cl_ret = 0;
+			break;
+		}
+		udelay(10);
+	}
+	udelay(100);	/* let the scheduler pass run before reading the channel back */
+	rmb();
+	b->cl_rd = g4p_fwinit_ring_read_index(&b->fi, 2);
+	b->cl_state_1c = READ_ONCE(*(u32 *)(st + 0x1c));
+	b->cl_state_38 = READ_ONCE(*(u32 *)(st + 0x38));
+	b->cl_ring_30 = READ_ONCE(*(u32 *)(ctl + 0x30));
+	dev_info(g->dev, "C1: ring 2 entry %s after %u us (read %u, write %d); chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u +0x00 %u +0x10 %u\n",
+		 b->cl_ret ? "NOT consumed" : "consumed", b->cl_us, b->cl_rd, wr, b->cl_state_1c, b->cl_state_38,
+		 b->cl_ring_30, READ_ONCE(*(u32 *)ctl), READ_ONCE(*(u32 *)(ctl + 0x10)));
+	return b->cl_ret;
 }
 
 void g4p_boot_show(struct seq_file *s, struct g4p *g)
@@ -354,7 +427,10 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 		   b->alive_ms, b->nr_events, b->ev_type, b->ev_payload, b->roots[0], b->roots[1]);
 	seq_printf(s, "  irq %d: %d during the alive wait, %d total\n", g->irq, b->irqs, atomic_read(&g->irq_count));
 	seq_printf(s, "  devctl: %u sent, %u consumed (last %u us), read index %u\n", b->devctl_sent, b->devctl_done,
-		   b->devctl_last_us, g4p_fwinit_devctl_read_index(&b->fi));
+		   b->devctl_last_us, g4p_fwinit_ring_read_index(&b->fi, 3));
+	if (b->cl_state.cpu)
+		seq_printf(s, "  C1: %d after %u us, ring 2 read %u; chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u\n",
+			   b->cl_ret, b->cl_us, b->cl_rd, b->cl_state_1c, b->cl_state_38, b->cl_ring_30);
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
 		   ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[1]);
