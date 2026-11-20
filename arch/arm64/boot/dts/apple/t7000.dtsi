@@ -132,6 +132,28 @@
 		nonposted-mmio;
 		ranges;
 
+		/*
+		 * GPU (PowerVR Rogue "G4P"): Rogue core, the Fender power controller and the two fabric bridges that
+		 * ApplePMGR configures on every GFX power-on (ADT pmgr bridge-settings-10/-11). Bring-up only
+		 * (drivers/gpu/drm/apple-g4p); the power-up sequence is not complete yet.
+		 */
+		gpu: gpu@201000000 {
+			compatible = "apple,t7000-g4p";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01e00000 0x0 0x100000>,
+			      <0x2 0x01f00000 0x0 0x1000>,
+			      <0x2 0x01f80000 0x0 0x1000>;
+			reg-names = "rgx", "fender", "bridge10", "bridge11";
+			power-domains = <&ps_gfx>;
+			apple,bridge10-settings = <0x18 0x80010004>;
+			apple,bridge11-settings =
+				<0x007c7c01 0x007c7c01 0x007c7c01 0x007c7901 0x007c7901 0x007c7c01 0x007c7c01 0x007c7c01>,
+				<0x007c7c01 0x007c7c01 0x007c7c01 0x007c7c01 0x006c6901 0x007c7901 0x007c7c01 0x007c7c01>,
+				<0x00747201 0x00747201 0x00747201 0x00747201 0x007c7c01 0x007c7c01 0x007c7c01 0x006c6901>,
+				<0x007c7c01 0x00797901 0x00797901 0x007c7c01 0x006c6901 0x00797901 0x00797901 0x00797901>;
+			status = "disabled";
+		};
+
 		cpufreq: performance-controller@202220000 {
 			compatible = "apple,t7000-cluster-cpufreq", "apple,s5l8960x-cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;

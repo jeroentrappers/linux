@@ -483,3 +483,8 @@
 	device-ready-gpios = <&pinctrl 56 GPIO_ACTIVE_HIGH>;
 	status = "okay";
 };
+
+/* GPU bring-up driver (drivers/gpu/drm/apple-g4p): binds without touching the hardware; power-up only on request */
+&gpu {
+	status = "okay";
+};
