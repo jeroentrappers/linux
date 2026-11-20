@@ -4,14 +4,14 @@
  *
  * Milestones M0-M2 of the bring-up (linux-on-iphone6 re/GPU-DRIVER.md): bind without touching the
  * hardware, power the GPU up on request (PMGR ps_gfx through genpd, fabric bridges 10/11, the Fender
- * power controller), and read the Rogue core ID once that is known to be safe.
+ * power controller), and read the Rogue core ID.
  *
- * The GPU does not complete its first GFX DVFM transition under Linux yet (re/GPU-BRINGUP.md 8.10-8.12),
- * and a read of an unclocked Rogue core hangs the SoC. So:
+ * Any Rogue register read hangs the SoC while PMGR MiscACG (auto clock gating, 0x20e032000) is 0. iBoot
+ * clears it before hand-off and XNU's ApplePMGR::enableACG sets it again; nothing on the Linux boot path
+ * does (re/GPU-BRINGUP.md 8.19, 8.20). Until PMGR/SoC init owns it, this driver sets it before the first
+ * RGX access, and refuses RGX access when the "misc-acg" range is missing. So:
  *  - nothing is written at probe; power-up only through debugfs, and only with experimental=1;
- *  - the Rogue core ID is read once, right after the Fender wake as iOS does (AGX probe reads it 10 us
- *    later in the same function), and only with unsafe_rgx=1: a read some 100 ms later hung the SoC
- *    (re/GPU-BRINGUP.md test D), most likely because the idle core is gated again by then;
+ *  - at power-up: MiscACG on, ps_gfx, bridges, Fender wake, then CORE_REVISION / CORE_ID as AGX probe;
  *  - a power-up that fails is always undone.
  */
 
@@ -40,12 +40,16 @@
 
 #define G4P_BRIDGE11_WORDS	32
 
+/* PMGR MiscACG (XNU _regGroups[kRegGroupMiscACG]); bit 0 = auto clock gating enable */
+#define PMGR_MISC_ACG_EN	BIT(0)
+
 struct g4p {
 	struct device *dev;
 	void __iomem *rgx;
 	void __iomem *fender;
 	void __iomem *bridge10;
 	void __iomem *bridge11;
+	void __iomem *misc_acg;			/* NULL: not described, RGX access refused */
 	u32 bridge10_cfg[2];			/* offset, value */
 	u32 bridge11_cfg[G4P_BRIDGE11_WORDS];	/* words from offset 0 */
 	struct mutex lock;
@@ -59,13 +63,9 @@ static bool experimental;
 module_param(experimental, bool, 0444);
 MODULE_PARM_DESC(experimental, "allow GPU power-up through debugfs (the sequence is not complete yet)");
 
-static bool rgx_posted;
-module_param(rgx_posted, bool, 0444);
-MODULE_PARM_DESC(rgx_posted, "map the Rogue registers posted (Device-nGnRE) instead of the bus default non-posted");
-
-static bool unsafe_rgx;
-module_param(unsafe_rgx, bool, 0644);
-MODULE_PARM_DESC(unsafe_rgx, "read the Rogue core ID right after the Fender wake (can hang the SoC)");
+static bool read_id = true;
+module_param(read_id, bool, 0644);
+MODULE_PARM_DESC(read_id, "read the Rogue core ID at power-up (needs the misc-acg range)");
 
 /* ------------------------------------------------------------------------------------------------ */
 /* power layer */
@@ -98,6 +98,33 @@ static int g4p_fender_wake(struct g4p *g)
 	return ret;
 }
 
+/* XNU ApplePMGR::enableACG(true), PMGR part: the Rogue register bus needs it (re/GPU-BRINGUP.md 8.20) */
+static void g4p_misc_acg(struct g4p *g)
+{
+	u32 v = readl(g->misc_acg);
+
+	if (v & PMGR_MISC_ACG_EN)
+		return;
+	writel(v | PMGR_MISC_ACG_EN, g->misc_acg);
+	dev_info(g->dev, "PMGR MiscACG was off (0x%08x), enabled (0x%08x)\n", v, readl(g->misc_acg));
+}
+
+static void g4p_read_id(struct g4p *g)
+{
+	unsigned long major, minor;
+
+	/* as AGX readChipInfo: 32-bit reads, CORE_REVISION then CORE_ID, straight after the wake */
+	g->core_rev = readl(g->rgx + RGX_CR_CORE_REVISION);
+	g->core_id = readl(g->rgx + RGX_CR_CORE_ID);
+	g->have_id = true;
+	major = FIELD_GET(GENMASK(23, 16), g->core_rev);
+	minor = FIELD_GET(GENMASK(15, 8), g->core_rev);
+	dev_info(g->dev, "core revision 0x%08x (major %lu minor %lu maint %lu) id 0x%08x (%lu)\n",
+		 g->core_rev, major, minor, FIELD_GET(GENMASK(7, 0), g->core_rev), g->core_id,
+		 FIELD_GET(GENMASK(15, 8), g->core_id));
+	if (major != 3 || (minor != 8 && minor != 10))	/* AGX G4P_B0 readChipInfo accepts 3.8 and 3.10 */
+		dev_warn(g->dev, "unexpected core revision\n");
+}
 
 static void g4p_power_off_locked(struct g4p *g)
 {
@@ -121,21 +148,14 @@ static int g4p_power_on_locked(struct g4p *g)
 	if (ret)
 		return ret;
 	g->powered = true;
+	if (g->misc_acg)
+		g4p_misc_acg(g);
 	g4p_bridges(g);
 	ret = g4p_fender_wake(g);
-	if (!ret && unsafe_rgx) {
-		/* logged first: if the read below hangs, this is the last line in the log */
-		dev_info(g->dev, "woken (Fender ctrl 0x%08x perf 0x%08x); reading the core ID (%s mapping)\n",
-			 readl(g->fender + FNDR_CTRL), readl(g->fender + FNDR_PERF_CTL),
-			 rgx_posted ? "posted" : "non-posted");
-		/* as AGX probe: CORE_REVISION, then CORE_ID, straight after the wake (re/GPU-IOS-TRACE.md 4) */
-		g->core_rev = readl(g->rgx + RGX_CR_CORE_REVISION);
-		g->core_id = readl(g->rgx + RGX_CR_CORE_ID);
-		g->have_id = true;
-		dev_info(g->dev, "core revision 0x%08x (major %lu minor %lu maint %lu) id 0x%08x (clusters %lu)\n",
-			 g->core_rev, FIELD_GET(GENMASK(23, 16), g->core_rev), FIELD_GET(GENMASK(15, 8), g->core_rev),
-			 FIELD_GET(GENMASK(7, 0), g->core_rev), g->core_id, FIELD_GET(GENMASK(15, 8), g->core_id));
-	}
+	if (!ret && read_id && g->misc_acg)
+		g4p_read_id(g);
+	else if (!ret && read_id)
+		dev_warn(g->dev, "no misc-acg range: not reading RGX (it hangs the SoC with MiscACG off)\n");
 	if (ret) {
 		dev_err(g->dev, "Fender: wake request not acknowledged (perf ctl 0x%08x)\n",
 			readl(g->fender + FNDR_PERF_CTL));
@@ -180,7 +200,9 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 	struct g4p *g = s->private;
 
 	mutex_lock(&g->lock);
-	seq_printf(s, "powered %d experimental %d unsafe_rgx %d\n", g->powered, experimental, unsafe_rgx);
+	seq_printf(s, "powered %d experimental %d read_id %d\n", g->powered, experimental, read_id);
+	if (g->misc_acg)
+		seq_printf(s, "pmgr misc-acg 0x%08x\n", readl(g->misc_acg));
 	if (g->powered) {	/* the Fender reads fine while ps_gfx is on (re/GPU-IOS-READS.md) */
 		seq_printf(s, "fender ctrl 0x%08x perf 0x%08x next 0x%08x\n", readl(g->fender + FNDR_CTRL),
 			   readl(g->fender + FNDR_PERF_CTL), readl(g->fender + FNDR_PERF_NEXT));
@@ -190,7 +212,7 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 	if (g->have_id)
 		seq_printf(s, "core revision 0x%08x id 0x%08x (read at power-up)\n", g->core_rev, g->core_id);
 	else
-		seq_puts(s, "core id: not read (needs unsafe_rgx=1 at power-up)\n");
+		seq_puts(s, "core id: not read yet\n");
 	mutex_unlock(&g->lock);
 	return 0;
 }
@@ -207,6 +229,7 @@ static void __iomem *g4p_map(struct platform_device *pdev, const char *name)
 static int g4p_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct resource *res;
 	struct g4p *g;
 	int ret;
 
@@ -216,20 +239,19 @@ static int g4p_probe(struct platform_device *pdev)
 	g->dev = dev;
 	mutex_init(&g->lock);
 
-	if (rgx_posted) {	/* plain ioremap = Device-nGnRE; the bus's nonposted-mmio would give nGnRnE */
-		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rgx");
-
-		g->rgx = res ? devm_ioremap(dev, res->start, resource_size(res)) : NULL;
-		if (!g->rgx)
-			g->rgx = IOMEM_ERR_PTR(-ENOMEM);
-	} else {
-		g->rgx = g4p_map(pdev, "rgx");
-	}
+	g->rgx = g4p_map(pdev, "rgx");
 	g->fender = g4p_map(pdev, "fender");
 	g->bridge10 = g4p_map(pdev, "bridge10");
 	g->bridge11 = g4p_map(pdev, "bridge11");
 	if (IS_ERR(g->rgx) || IS_ERR(g->fender) || IS_ERR(g->bridge10) || IS_ERR(g->bridge11))
 		return dev_err_probe(dev, -ENODEV, "missing register range\n");
+	/* inside the PMGR block, which the PMGR drivers own: map without claiming it */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "misc-acg");
+	if (res) {
+		g->misc_acg = devm_ioremap(dev, res->start, resource_size(res));
+		if (!g->misc_acg)
+			return -ENOMEM;
+	}
 
 	ret = of_property_read_u32_array(dev->of_node, "apple,bridge10-settings", g->bridge10_cfg, 2);
 	if (!ret)
