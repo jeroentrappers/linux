@@ -5,12 +5,14 @@
 #ifndef G4P_H
 #define G4P_H
 
+#include <linux/bits.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 
 #include "g4p_fw.h"
 
 struct dentry;
+struct device;
 struct seq_file;
 
 /* Fender, Apple's GPU power controller (AGX_CR_FNDR_*; re/GPU-BRINGUP.md 1, 8.11) */
@@ -48,6 +50,46 @@ struct g4p {
 	void *fw_image;				/* host copy (vmalloc), for debugfs firmware */
 	struct g4p_boot *boot;			/* GPU memory of a META boot; freed after power-off */
 };
+
+/* g4p_mmu.c: GPU MMU and buffers in the firmware heaps (AGXGart heaps 5..8) */
+enum g4p_heap {
+	G4P_HEAP_FW,		/* 0xe1c0000000, the firmware image */
+	G4P_HEAP_SHARED,	/* 0xe1c0200000, "Firmware/Driver Shared" (list B) */
+	G4P_HEAP_PRIVATE,	/* 0xe1c3200000, "Cached Firmware Private" (list A, pools) */
+	G4P_HEAP_PIO,		/* 0xe1c4200000, register windows for the firmware */
+	G4P_NR_HEAPS
+};
+
+#define G4P_PTE_VALID		BIT_ULL(0)
+#define G4P_PTE_READ_ONLY	BIT_ULL(1)
+#define G4P_PTE_CC		BIT_ULL(2)
+#define G4P_PTE_SLC_BYPASS	BIT_ULL(3)
+#define G4P_PTE_PM_META_PROTECT	BIT_ULL(62)
+
+struct g4p_mmu {
+	u32 *pc;
+	u64 *pd;
+	dma_addr_t pc_dma, pd_dma;
+	unsigned int pc_index;
+	u64 *pt[512];
+	dma_addr_t pt_dma[512];
+	u64 heap_next[G4P_NR_HEAPS];
+};
+
+struct g4p_bo {
+	void *cpu;
+	dma_addr_t dma;
+	size_t size;
+	u64 gpuva;
+};
+
+int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
+void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu);
+int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, size_t size, u64 flags);
+int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, size_t size, u64 *gpuva);
+int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo);
+void g4p_bo_free(struct device *dev, struct g4p_bo *bo);
+u32 g4p_fw_addr(u64 gpuva, bool cached);
 
 /* g4p_boot.c */
 int g4p_boot_start(struct g4p *g);

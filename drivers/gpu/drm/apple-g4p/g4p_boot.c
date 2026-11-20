@@ -49,28 +49,15 @@
 #define META_CR_TXSTATUS(t)		(0x04800010 + 0x1000 * (t))
 #define META_CR_MMCU_SEGMENT_BASE(n)	(0x04850000 + 0x10 * (n))
 
-/* GPU MMU (stock Rogue, 4 KiB pages; re/GPU-META-BOOT.md 1.2) */
-#define G4P_FW_HEAP_GPUVA		0xe1c0000000ULL
-#define G4P_FW_HEAP_SIZE		SZ_2M
-#define MMU_PC_VALID			BIT(0)
-#define MMU_PD_VALID			BIT_ULL(0)
-#define MMU_PT_VALID			BIT_ULL(0)
-#define MMU_PT_PM_META_PROTECT		BIT_ULL(62)
-#define MMU_PA_MASK			GENMASK_ULL(39, 12)
 
 /* boot arguments (re/GPU-META-BOOT.md 3) */
 #define G4P_BOOTARG_OFFSET		0x200
 #define G4P_ROOTS_OFFSET		0xff8	/* u32 root A, u32 root B (FW addresses); 0 for M3 */
 #define G4P_SEG_BIFDM			7
-#define G4P_FW_ADDR_UNCACHED		0xc0000000
 
 struct g4p_boot {
-	void *image;
-	dma_addr_t image_dma;
-	size_t image_size;
-	u32 *pc;
-	u64 *pd, *pt;
-	dma_addr_t pc_dma, pd_dma, pt_dma;
+	struct g4p_mmu mmu;
+	struct g4p_bo image;	/* the only buffer in the FW heap: GPU VA 0xe1c0000000 */
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -105,24 +92,18 @@ static void g4p_wr64_fenced(struct g4p *g, u64 val, u32 reg)
 	readq(g->rgx + reg);
 }
 
-/* GPU VA of an image offset in the firmware's uncached (global) form, as convertGPUVA(…, uncached) */
-static u32 g4p_fw_addr(size_t image_off)
-{
-	return (u32)(G4P_FW_HEAP_GPUVA + image_off + 0x40000000) | G4P_FW_ADDR_UNCACHED;
-}
-
 static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 {
 	static const unsigned int seg_region[] = { 0, 1, 3 };	/* segment n = region n; region 2 is the default */
-	u32 *arg = b->image + G4P_BOOTARG_OFFSET;
-	u32 *end = b->image + G4P_ROOTS_OFFSET;
+	u32 *arg = b->image.cpu + G4P_BOOTARG_OFFSET;
+	u32 *end = b->image.cpu + G4P_ROOTS_OFFSET;
 	const struct g4p_fw *fw = &g->fw;
 
 	if (fw->region[0].offset < G4P_ROOTS_OFFSET + 8)	/* args + roots live in region 2's page */
 		return -EINVAL;
 	for (unsigned int i = 0; i < ARRAY_SIZE(seg_region); i++) {
 		const struct g4p_fw_region *r = &fw->region[seg_region[i]];
-		u64 va = G4P_FW_HEAP_GPUVA + r->offset;
+		u64 va = b->image.gpuva + r->offset;
 		u32 seg = META_CR_MMCU_SEGMENT_BASE(seg_region[i]);
 
 		if (!r->used)
@@ -144,7 +125,7 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 		return -ENOSPC;
 	*arg++ = 0;
 	*arg++ = 0;
-	*arg++ = g4p_fw_addr(G4P_ROOTS_OFFSET);
+	*arg++ = g4p_fw_addr(b->image.gpuva + G4P_ROOTS_OFFSET, false);
 	end[0] = 0;	/* root A: none yet (M4) */
 	end[1] = 0;	/* root B */
 	return 0;
@@ -152,14 +133,8 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
-	if (b->image)
-		dma_free_coherent(dev, b->image_size, b->image, b->image_dma);
-	if (b->pc)
-		dma_free_coherent(dev, SZ_4K, b->pc, b->pc_dma);
-	if (b->pd)
-		dma_free_coherent(dev, SZ_4K, b->pd, b->pd_dma);
-	if (b->pt)
-		dma_free_coherent(dev, SZ_4K, b->pt, b->pt_dma);
+	g4p_bo_free(dev, &b->image);
+	g4p_mmu_fini(dev, &b->mmu);
 	kfree(b);
 }
 
@@ -188,7 +163,6 @@ int g4p_boot_start(struct g4p *g)
 {
 	const struct g4p_fw *fw = &g->fw;
 	struct g4p_boot *b;
-	size_t pages;
 	int ret;
 
 	if (g->boot)
@@ -196,22 +170,11 @@ int g4p_boot_start(struct g4p *g)
 	b = kzalloc_obj(*b);
 	if (!b)
 		return -ENOMEM;
-	b->image_size = ALIGN(fw->image_size, SZ_4K);
-	pages = b->image_size / SZ_4K;
-	if (b->image_size > G4P_FW_HEAP_SIZE) {
-		kfree(b);
-		return -E2BIG;
-	}
-	b->image = dma_alloc_coherent(g->dev, b->image_size, &b->image_dma, GFP_KERNEL);
-	b->pc = dma_alloc_coherent(g->dev, SZ_4K, &b->pc_dma, GFP_KERNEL);
-	b->pd = dma_alloc_coherent(g->dev, SZ_4K, &b->pd_dma, GFP_KERNEL);
-	b->pt = dma_alloc_coherent(g->dev, SZ_4K, &b->pt_dma, GFP_KERNEL);
-	if (!b->image || !b->pc || !b->pd || !b->pt) {
-		g4p_boot_free_mem(g->dev, b);
-		return -ENOMEM;
-	}
-
-	ret = g4p_fw_build_image(fw, b->image, b->image_size);
+	ret = g4p_mmu_init(g->dev, &b->mmu);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_FW, fw->image_size, &b->image);
+	if (!ret)
+		ret = g4p_fw_build_image(fw, b->image.cpu, b->image.size);
 	if (!ret)
 		ret = g4p_boot_args(g, b);
 	if (ret) {
@@ -219,16 +182,11 @@ int g4p_boot_start(struct g4p *g)
 		return ret;
 	}
 
-	/* PC[39:30] -> PD[29:21] -> PT[20:12]; 0xe1c0000000 is PC 0x387, PD 0, PT 0 */
-	b->pc[(G4P_FW_HEAP_GPUVA >> 30) & 0x3ff] = ((b->pd_dma >> 12) << 4) | MMU_PC_VALID;
-	b->pd[(G4P_FW_HEAP_GPUVA >> 21) & 0x1ff] = (b->pt_dma & MMU_PA_MASK) | MMU_PD_VALID;
-	for (size_t i = 0; i < pages; i++)
-		b->pt[i] = ((b->image_dma + i * SZ_4K) & MMU_PA_MASK) | MMU_PT_PM_META_PROTECT | MMU_PT_VALID;
 	wmb();	/* tables and image in memory before the GPU can fetch them */
 	g->boot = b;
 
-	dev_info(g->dev, "META boot: image %pad (0x%zx), PC %pad, %u boot args\n", &b->image_dma, b->image_size,
-		 &b->pc_dma, fw->nr_cfg + 12);
+	dev_info(g->dev, "META boot: image %pad (0x%zx), PC %pad, %u boot args\n", &b->image.dma, b->image.size,
+		 &b->mmu.pc_dma, fw->nr_cfg + 12);
 
 	/* AGX prepareFirmwareForBoot, direct path, with upstream pvr_fw_start()'s read-back fences */
 	g4p_wr64_fenced(g, G4P_SOFT_RESET_ALL, RGX_CR_SOFT_RESET);
@@ -236,7 +194,7 @@ int g4p_boot_start(struct g4p *g)
 	g4p_wr64_fenced(g, G4P_SOFT_RESET_GARTEN, RGX_CR_SOFT_RESET);
 	writel(1, g->rgx + RGX_CR_META_BOOT);
 	readl(g->rgx + RGX_CR_META_BOOT);
-	g4p_wr64_fenced(g, b->pc_dma, RGX_CR_BIF_CAT_BASE0);
+	g4p_wr64_fenced(g, b->mmu.pc_dma, RGX_CR_BIF_CAT_BASE0);
 	g4p_wr64_fenced(g, G4P_SLC_CTRL_MISC, RGX_CR_SLC_CTRL_MISC);
 	g4p_wr64_fenced(g, 1, RGX_CR_SLC_3808);
 	udelay(3);
@@ -265,8 +223,8 @@ int g4p_boot_start(struct g4p *g)
 		const struct g4p_fw_region *r = &fw->region[(t->sp >> 29) & 3];
 		size_t off = r->offset + (t->sp & ~BIT(31)) - r->lo;
 
-		if (t->thread < 2 && off + SZ_4K <= b->image_size)
-			b->stack_dirty[t->thread] = g4p_count_nonzero(b->image + off, SZ_4K);
+		if (t->thread < 2 && off + SZ_4K <= b->image.size)
+			b->stack_dirty[t->thread] = g4p_count_nonzero(b->image.cpu + off, SZ_4K);
 	}
 	dev_info(g->dev, "META boot: soft_reset 0x%llx mslvctrl1 0x%08x T0 en 0x%x st 0x%x T1 en 0x%x st 0x%x (sp %d)\n",
 		 b->soft_reset, b->mslvctrl1, b->txenable[0], b->txstatus[0], b->txenable[1], b->txstatus[1], b->ret);
@@ -284,7 +242,7 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 		seq_puts(s, "boot: none\n");
 		return;
 	}
-	seq_printf(s, "boot: image %pad size 0x%zx pc %pad\n", &b->image_dma, b->image_size, &b->pc_dma);
+	seq_printf(s, "boot: image %pad size 0x%zx pc %pad\n", &b->image.dma, b->image.size, &b->mmu.pc_dma);
 	seq_printf(s, "  soft_reset 0x%016llx event_status 0x%016llx mslvctrl1 0x%08x\n", b->soft_reset,
 		   b->event_status, b->mslvctrl1);
 	seq_printf(s, "  slave port %s: T0 enable 0x%08x status 0x%08x, T1 enable 0x%08x status 0x%08x\n",
@@ -292,6 +250,6 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	seq_printf(s, "  stack words written: t0 %u t1 %u (of 1024)\n", b->stack_dirty[0], b->stack_dirty[1]);
 	seq_printf(s, "  BIF fault bank0 mmu 0x%016llx req 0x%016llx bank1 mmu 0x%016llx req 0x%016llx\n",
 		   b->fault[0], b->fault[1], b->fault[2], b->fault[3]);
-	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image + G4P_BOOTARG_OFFSET))[0],
-		   ((u32 *)(b->image + G4P_BOOTARG_OFFSET))[1]);
+	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
+		   ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[1]);
 }
