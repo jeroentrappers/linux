@@ -331,6 +331,23 @@ u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring)
 	return READ_ONCE(*(u32 *)(fi->list_b.cpu + LB_RING_CTL(ring))) & 0xff;
 }
 
+/* every event-ring entry the firmware has written so far (non-destructive): type and payload words */
+void g4p_fwinit_show_events(struct seq_file *s, struct g4p_fwinit *fi)
+{
+	void *b = fi->list_b.cpu;
+	u32 wr = READ_ONCE(*(u32 *)(b + LB_EVENT_CTL + 0x10)) & 0xff;
+
+	seq_printf(s, "  event ring: write %u, host read %u\n", wr, get_unaligned_le32(b + LB_EVENT_CTL) & 0xff);
+	for (u32 i = 0; i < wr; i++) {
+		const void *e = b + LB_EVENT + EVENT_ENTRY * i;
+
+		seq_printf(s, "  event %u:", i);
+		for (unsigned int w = 0; w < EVENT_ENTRY / 4; w++)
+			seq_printf(s, " %08x", get_unaligned_le32(e + 4 * w));
+		seq_putc(s, '\n');
+	}
+}
+
 /* first messages of log sub-ring 0, as text (§7: message +0 level, +4 seq, +8 time, +0x10 text) */
 void g4p_fwinit_show_log(struct seq_file *s, struct g4p_fwinit *fi)
 {

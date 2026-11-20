@@ -431,6 +431,7 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	if (b->cl_state.cpu)
 		seq_printf(s, "  C1: %d after %u us, ring 2 read %u; chan state +0x1c %u +0x38 %u, ring ctl +0x30 %u\n",
 			   b->cl_ret, b->cl_us, b->cl_rd, b->cl_state_1c, b->cl_state_38, b->cl_ring_30);
+	g4p_fwinit_show_events(s, &b->fi);
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
 		   ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[1]);
