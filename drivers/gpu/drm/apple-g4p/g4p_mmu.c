@@ -132,6 +132,11 @@ void g4p_bo_free(struct device *dev, struct g4p_bo *bo)
 	bo->cpu = NULL;
 }
 
+u64 g4p_fw_heap_base(void)
+{
+	return g4p_heap_cfg[G4P_HEAP_FW].base;
+}
+
 /* the firmware's address for a GPU VA in its heaps (convertGPUVA, re/GPU-META-BOOT.md 2.2) */
 u32 g4p_fw_addr(u64 gpuva, bool cached)
 {

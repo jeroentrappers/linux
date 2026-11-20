@@ -58,6 +58,12 @@
 struct g4p_boot {
 	struct g4p_mmu mmu;
 	struct g4p_bo image;	/* the only buffer in the FW heap: GPU VA 0xe1c0000000 */
+	struct g4p_fwinit fi;	/* shared structures (M4) */
+	u32 roots[2];		/* FW addresses of root A, root B */
+	bool alive;
+	u32 nr_events, ev_type, ev_payload;
+	unsigned int alive_ms;
+	u32 fender_perf;
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -126,13 +132,14 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 	*arg++ = 0;
 	*arg++ = 0;
 	*arg++ = g4p_fw_addr(b->image.gpuva + G4P_ROOTS_OFFSET, false);
-	end[0] = 0;	/* root A: none yet (M4) */
-	end[1] = 0;	/* root B */
+	end[0] = b->roots[0];	/* root A */
+	end[1] = b->roots[1];	/* root B */
 	return 0;
 }
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
+	g4p_fwinit_free(dev, &b->fi);
 	g4p_bo_free(dev, &b->image);
 	g4p_mmu_fini(dev, &b->mmu);
 	kfree(b);
@@ -176,6 +183,8 @@ int g4p_boot_start(struct g4p *g)
 	if (!ret)
 		ret = g4p_fw_build_image(fw, b->image.cpu, b->image.size);
 	if (!ret)
+		ret = g4p_fwinit_build(g, &b->mmu, &b->fi, &b->image, b->roots);
+	if (!ret)
 		ret = g4p_boot_args(g, b);
 	if (ret) {
 		g4p_boot_free_mem(g->dev, b);
@@ -201,8 +210,29 @@ int g4p_boot_start(struct g4p *g)
 	/* bootFirmware: release META */
 	g4p_wr64_fenced(g, 0, RGX_CR_SOFT_RESET);
 	udelay(3);
-	msleep(100);
+	/* waitForFWAlive: iOS waits up to 10 s; event type 0 = alive (re/GPU-FW-INIT.md 7) */
+	for (b->alive_ms = 0; b->alive_ms < 2000 && !b->alive; b->alive_ms += 10) {
+		u32 type, payload;
 
+		while (g4p_fwinit_event(&b->fi, &type, &payload)) {
+			if (!b->nr_events++ || type == 0) {
+				b->ev_type = type;
+				b->ev_payload = payload;
+			}
+			if (type == 0)
+				b->alive = true;
+		}
+		if (!b->alive)
+			usleep_range(10000, 11000);
+	}
+
+	/* RGX reads only while the Fender still reports a non-zero perf state with no request pending */
+	b->fender_perf = readl(g->fender + 0x1000);
+	if (!(b->fender_perf & 0xf) || (b->fender_perf & BIT(4))) {
+		dev_warn(g->dev, "META boot: Fender perf 0x%08x after boot, not reading RGX\n", b->fender_perf);
+		b->ret = -EIO;
+		return 0;
+	}
 	b->soft_reset = readq(g->rgx + RGX_CR_SOFT_RESET);
 	b->event_status = readq(g->rgx + RGX_CR_EVENT_STATUS);
 	b->mslvctrl1 = readl(g->rgx + RGX_CR_META_SP_MSLVCTRL1);
@@ -228,6 +258,9 @@ int g4p_boot_start(struct g4p *g)
 	}
 	dev_info(g->dev, "META boot: soft_reset 0x%llx mslvctrl1 0x%08x T0 en 0x%x st 0x%x T1 en 0x%x st 0x%x (sp %d)\n",
 		 b->soft_reset, b->mslvctrl1, b->txenable[0], b->txstatus[0], b->txenable[1], b->txstatus[1], b->ret);
+	dev_info(g->dev, "META boot: %s after %u ms (%u events, first type %u payload 0x%x), roots 0x%08x 0x%08x\n",
+		 b->alive ? "firmware ALIVE" : "no alive event", b->alive_ms, b->nr_events, b->ev_type, b->ev_payload,
+		 b->roots[0], b->roots[1]);
 	dev_info(g->dev, "META boot: stack words written t0 %u t1 %u; BIF fault 0x%llx/0x%llx 0x%llx/0x%llx; event 0x%llx\n",
 		 b->stack_dirty[0], b->stack_dirty[1], b->fault[0], b->fault[1], b->fault[2], b->fault[3],
 		 b->event_status);
@@ -250,6 +283,10 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	seq_printf(s, "  stack words written: t0 %u t1 %u (of 1024)\n", b->stack_dirty[0], b->stack_dirty[1]);
 	seq_printf(s, "  BIF fault bank0 mmu 0x%016llx req 0x%016llx bank1 mmu 0x%016llx req 0x%016llx\n",
 		   b->fault[0], b->fault[1], b->fault[2], b->fault[3]);
+	seq_printf(s, "  fender perf after boot 0x%08x\n", b->fender_perf);
+	seq_printf(s, "  alive %d after %u ms, %u events (type %u payload 0x%x), roots 0x%08x 0x%08x\n", b->alive,
+		   b->alive_ms, b->nr_events, b->ev_type, b->ev_payload, b->roots[0], b->roots[1]);
+	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
 		   ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[1]);
 }

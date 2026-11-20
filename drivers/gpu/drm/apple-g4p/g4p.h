@@ -90,6 +90,20 @@ int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, siz
 int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo);
 void g4p_bo_free(struct device *dev, struct g4p_bo *bo);
 u32 g4p_fw_addr(u64 gpuva, bool cached);
+u64 g4p_fw_heap_base(void);
+
+/* g4p_fwinit.c: firmware shared structures (re/GPU-FW-INIT.md) */
+struct g4p_fwinit {
+	struct g4p_bo list_a;	/* heap 7 */
+	struct g4p_bo list_b;	/* heap 6 */
+	u64 pio_va[3];		/* heap 8: Fender, AIC timer, AIC SW-int */
+};
+
+int g4p_fwinit_build(struct g4p *g, struct g4p_mmu *mmu, struct g4p_fwinit *fi, const struct g4p_bo *image,
+		     u32 *roots);
+void g4p_fwinit_free(struct device *dev, struct g4p_fwinit *fi);
+bool g4p_fwinit_event(struct g4p_fwinit *fi, u32 *type, u32 *payload);
+void g4p_fwinit_show_log(struct seq_file *s, struct g4p_fwinit *fi);
 
 /* g4p_boot.c */
 int g4p_boot_start(struct g4p *g);
