@@ -3,6 +3,8 @@ config DRM_APPLE_G4P
 	tristate "Apple A8 GPU (G4P) power layer and core ID (bring-up)"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF && PM
+	select CRC32
+	select FW_LOADER
 	help
 	  Bring-up driver for the PowerVR Rogue based GPU of the Apple A8 (T7000, iPhone 6). It binds without
 	  touching the hardware and powers the GPU up only on request through debugfs (module parameter

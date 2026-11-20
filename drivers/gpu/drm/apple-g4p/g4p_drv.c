@@ -25,6 +25,11 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/vmalloc.h>
+
+#include "g4p_fw.h"
+
+#define G4P_FW_NAME		"apple/agx-g4p-b0.ldr"
 
 /* Fender, Apple's GPU power controller (AGX_CR_FNDR_*; re/GPU-BRINGUP.md 1, 8.11) */
 #define FNDR_CTRL		0x0000	/* 0x40000000 at wake; bit 29 is firmware state (8.11), never written */
@@ -57,6 +62,8 @@ struct g4p {
 	bool have_id;
 	u32 core_rev, core_id;
 	struct dentry *debugfs;
+	struct g4p_fw fw;			/* loaded on first read of debugfs firmware */
+	void *fw_image;				/* host copy (vmalloc), not yet given to the GPU */
 };
 
 static bool experimental;
@@ -207,8 +214,7 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 		seq_printf(s, "fender ctrl 0x%08x perf 0x%08x next 0x%08x\n", readl(g->fender + FNDR_CTRL),
 			   readl(g->fender + FNDR_PERF_CTL), readl(g->fender + FNDR_PERF_NEXT));
 	}
-	/* never read RGX here: only the values taken right after the wake (iOS accepts major 3 with minor 8
-	 * (G4P B0) or 10 (B1); clusters = CORE_ID[15:8], re/GPU-BRINGUP.md 2) */
+	/* never read RGX here, only the values taken at power-up (AGX accepts 3.8 and 3.10) */
 	if (g->have_id)
 		seq_printf(s, "core revision 0x%08x id 0x%08x (read at power-up)\n", g->core_rev, g->core_id);
 	else
@@ -217,6 +223,33 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(g4p_status);
+
+/* M3 step 1: load, parse and lay out the firmware on the host (no hardware access) */
+static int g4p_firmware_show(struct seq_file *s, void *unused)
+{
+	struct g4p *g = s->private;
+	int ret = 0;
+
+	mutex_lock(&g->lock);
+	if (!g->fw.blob) {
+		ret = g4p_fw_request(g->dev, G4P_FW_NAME, &g->fw);
+		if (ret)
+			goto out;
+		g->fw_image = vmalloc(g->fw.image_size);
+		ret = g->fw_image ? g4p_fw_build_image(&g->fw, g->fw_image, g->fw.image_size) : -ENOMEM;
+		if (ret) {
+			vfree(g->fw_image);
+			g->fw_image = NULL;
+			g4p_fw_release(&g->fw);
+			goto out;
+		}
+	}
+	g4p_fw_show(s, &g->fw, g->fw_image);
+out:
+	mutex_unlock(&g->lock);
+	return ret;
+}
+DEFINE_SHOW_ATTRIBUTE(g4p_firmware);
 
 /* ------------------------------------------------------------------------------------------------ */
 /* probe: map and parse only, no register access */
@@ -271,6 +304,7 @@ static int g4p_probe(struct platform_device *pdev)
 	g->debugfs = debugfs_create_dir("apple-g4p", NULL);
 	debugfs_create_file("power", 0600, g->debugfs, g, &g4p_power_fops);
 	debugfs_create_file("status", 0400, g->debugfs, g, &g4p_status_fops);
+	debugfs_create_file("firmware", 0400, g->debugfs, g, &g4p_firmware_fops);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }
@@ -282,6 +316,8 @@ static void g4p_remove(struct platform_device *pdev)
 	debugfs_remove_recursive(g->debugfs);
 	mutex_lock(&g->lock);
 	g4p_power_off_locked(g);
+	vfree(g->fw_image);
+	g4p_fw_release(&g->fw);
 	mutex_unlock(&g->lock);
 }
 
