@@ -87,6 +87,7 @@ struct g4p_bo {
 	dma_addr_t dma;
 	size_t size;
 	u64 gpuva;
+	bool view;	/* carved out of another buffer: not freed on its own */
 };
 
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);

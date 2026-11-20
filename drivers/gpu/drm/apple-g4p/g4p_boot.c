@@ -86,6 +86,12 @@ struct g4p_boot {
 	u32 devctl_sent, devctl_done, devctl_last_us;
 	int irqs;	/* firmware interrupts seen by the end of the alive wait */
 	/* CL channel (re/GPU-FIRST-JOB.md 2.1): state in heap 7, ring ctl + command pointers in heap 6 */
+	/*
+	 * Job memory mapped before the firmware boots (GPU-BRINGUP 8.34): pages mapped after boot were not
+	 * seen by the GPU MMU on the second post-boot mapping even with gart_inval.
+	 */
+	struct g4p_bo arena[2];		/* [0] heap 7 (private), [1] heap 6 (shared) */
+	size_t arena_used[2];
 	struct g4p_bo cl_state, cl_ring;
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
@@ -172,6 +178,8 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
+	g4p_bo_free(dev, &b->arena[0]);
+	g4p_bo_free(dev, &b->arena[1]);
 	g4p_bo_free(dev, &b->job.cmd);
 	g4p_bo_free(dev, &b->job.stream);
 	g4p_bo_free(dev, &b->job.cdm);
@@ -182,6 +190,23 @@ static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 	g4p_bo_free(dev, &b->image);
 	g4p_mmu_fini(dev, &b->mmu);
 	kfree(b);
+}
+
+#define G4P_ARENA_SIZE	SZ_64K
+
+/* a 4 KiB aligned piece of the pre-boot arena: [0] private (heap 7), [1] shared (heap 6) */
+static int g4p_carve(struct g4p_boot *b, unsigned int which, size_t size, struct g4p_bo *bo)
+{
+	size_t off = b->arena_used[which];
+
+	size = ALIGN(size, SZ_4K);
+	if (!b->arena[which].cpu || off + size > b->arena[which].size)
+		return -ENOSPC;
+	*bo = (struct g4p_bo){ .cpu = b->arena[which].cpu + off, .dma = b->arena[which].dma + off, .size = size,
+			       .gpuva = b->arena[which].gpuva + off, .view = true };
+	memset(bo->cpu, 0, size);
+	b->arena_used[which] = off + size;
+	return 0;
 }
 
 /* the IRQ handler reads RGX: on only between a boot and the power-off */
@@ -239,6 +264,10 @@ int g4p_boot_start(struct g4p *g)
 		ret = g4p_fw_build_image(fw, b->image.cpu, b->image.size);
 	if (!ret)
 		ret = g4p_fwinit_build(g, &b->mmu, &b->fi, &b->image, b->roots);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, G4P_ARENA_SIZE, &b->arena[0]);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, G4P_ARENA_SIZE, &b->arena[1]);
 	if (!ret)
 		ret = g4p_boot_args(g, b);
 	if (ret) {
@@ -389,6 +418,35 @@ static bool g4p_gpu_running(struct g4p *g)
 	return (perf & 0xf) && !(perf & BIT(4));
 }
 
+/* channel state + channel ring as AGXChannel::init / resetChannelState; no submission */
+static int g4p_cl_channel(struct g4p_boot *b)
+{
+	void *st, *ctl;
+	int ret;
+
+	if (b->cl_state.cpu)
+		return 0;
+	ret = g4p_carve(b, 0, 0x80, &b->cl_state);
+	if (!ret)
+		ret = g4p_carve(b, 1, 0x60 + 4 * G4P_CHAN_RING_SIZE, &b->cl_ring);
+	if (ret)
+		return ret;
+	st = b->cl_state.cpu;
+	ctl = b->cl_ring.cpu;
+	/* resetChannelState: ring ctl indices 0, +0x50 = size; state +0 ctl, +4 pointer array, +0x18 = ~0 */
+	*(u32 *)(ctl + 0x50) = G4P_CHAN_RING_SIZE;
+	*(u32 *)(st + 0x00) = g4p_fw_addr(b->cl_ring.gpuva, false);
+	*(u32 *)(st + 0x04) = g4p_fw_addr(b->cl_ring.gpuva + 0x60, false);
+	*(u32 *)(st + 0x18) = 0xffffffff;
+	wmb();	/* channel objects before the ring entry that names them */
+	return 0;
+}
+
+/*
+ * C1 submits the channel with no command. NOTE (GPU-BRINGUP 8.34): the firmware's scheduler then fetches the
+ * current command pointer anyway, reads 0 and T0 faults; iOS never submits an empty channel. Kept as a
+ * diagnostic only: it kills the firmware until the next power cycle.
+ */
 int g4p_boot_cl_c1(struct g4p *g)
 {
 	struct g4p_boot *b = g->boot;
@@ -403,19 +461,11 @@ int g4p_boot_cl_c1(struct g4p *g)
 		return -EBUSY;	/* one C1 per boot */
 	if (!g4p_gpu_running(g))
 		return -EIO;
-	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, 0x80, &b->cl_state);
-	if (!ret)
-		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, 0x60 + 4 * G4P_CHAN_RING_SIZE, &b->cl_ring);
+	ret = g4p_cl_channel(b);
 	if (ret)
 		return ret;
 	st = b->cl_state.cpu;
 	ctl = b->cl_ring.cpu;
-	/* resetChannelState: ring ctl indices 0, +0x50 = size; state +0 ctl, +4 pointer array, +0x18 = ~0 */
-	*(u32 *)(ctl + 0x50) = G4P_CHAN_RING_SIZE;
-	*(u32 *)(st + 0x00) = g4p_fw_addr(b->cl_ring.gpuva, false);
-	*(u32 *)(st + 0x04) = g4p_fw_addr(b->cl_ring.gpuva + 0x60, false);
-	*(u32 *)(st + 0x18) = 0xffffffff;
-	wmb();	/* channel objects before the ring entry that names them */
 	if (gart_inval)	/* new pages after boot: the BIF has a stale PT line (re/GPU-C1-DEBUG.md) */
 		g4p_fwinit_gart_inval(&b->fi);
 
@@ -486,16 +536,16 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	void *ctl;
 	unsigned int n = 0, end;
 	int wr, cwr, ret;
+	bool first;
 
 	if (which != 2 && which != 3)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
-	if (!b->cl_state.cpu) {
-		ret = g4p_boot_cl_c1(g);
-		if (ret)
-			return ret;
-	}
+	first = !b->cl_state.cpu;
+	ret = g4p_cl_channel(b);	/* set up only: the first ring 2 entry carries the command */
+	if (ret)
+		return ret;
 	if (b->job.cmd.cpu)
 		return -EBUSY;	/* one job per boot for now */
 	if (!g4p_gpu_running(g))
@@ -506,13 +556,13 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	 * the firmware invalidates the D-cache lines before reading them (fw 0x10028220); with the uncached
 	 * form the first command read faulted on META (GPU-BRINGUP 8.33).
 	 */
-	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, G4P_CDM_CMD_SIZE, &j->cmd);
+	ret = g4p_carve(b, 0, G4P_CDM_CMD_SIZE, &j->cmd);
 	if (!ret)
-		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, SZ_4K, &j->stream);
+		ret = g4p_carve(b, 0, SZ_4K, &j->stream);
 	if (!ret)
-		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->cdm);
+		ret = g4p_carve(b, 1, SZ_4K, &j->cdm);
 	if (!ret)
-		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->misc);
+		ret = g4p_carve(b, 1, SZ_4K, &j->misc);
 	if (ret)
 		return ret;
 	fcmd = g4p_fw_addr(j->cmd.gpuva, true);
@@ -569,7 +619,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 
 	entry[1] = fchan;
 	entry[2] = cwr;
-	entry[3] = 0;	/* not the channel's first submission (C1 was) */
+	entry[3] = first;	/* 1 on the channel's first submission */
 	j->irq0 = atomic_read(&g->irq_count);
 	wr = g4p_fwinit_ring_push(&b->fi, 2, entry);
 	if (wr < 0)
@@ -599,6 +649,12 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		j->fault[2] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
 		j->fault[3] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ);
 	}
+	/* host view of what the scheduler reads (GPU-BRINGUP 8.33), with the firmware addresses */
+	dev_info(g->dev, "C%u host view: state FW 0x%08x [+0]=0x%08x [+4]=0x%08x; ring ctl FW 0x%08x +0x00=%u +0x10=%u +0x20=%u +0x30=%u +0x40=%u; ptr[0] (FW 0x%08x) = 0x%08x; cmd FW 0x%08x [+0]=0x%08x\n",
+		 which, fchan, *(u32 *)b->cl_state.cpu, *(u32 *)(b->cl_state.cpu + 4),
+		 g4p_fw_addr(b->cl_ring.gpuva, false), *(u32 *)ctl, *(u32 *)(ctl + 0x10), *(u32 *)(ctl + 0x20),
+		 *(u32 *)(ctl + 0x30), *(u32 *)(ctl + 0x40), g4p_fw_addr(b->cl_ring.gpuva + 0x60, false),
+		 *(u32 *)(ctl + 0x60), fcmd, *(u32 *)j->cmd.cpu);
 	dev_info(g->dev, "C%u: %u stream words; after %u us: ring 2 read %u (write %d), channel read %u (+0x10 %u, write %d), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
 		 which, n, j->us, j->ring2_rd, wr, j->chan_rd, j->chan_10, cwr, j->stamp0, j->stamp1, j->irqs,
 		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);

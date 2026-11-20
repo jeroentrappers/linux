@@ -10,6 +10,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/sizes.h>
+#include <linux/string.h>
 
 #include "g4p.h"
 
@@ -146,6 +147,10 @@ int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, siz
 /* the buffer's pages stay mapped (the GPU MMU tables go with g4p_mmu_fini, after power-off) */
 void g4p_bo_free(struct device *dev, struct g4p_bo *bo)
 {
+	if (bo->view) {
+		memset(bo, 0, sizeof(*bo));
+		return;
+	}
 	if (bo->cpu)
 		dma_free_coherent(dev, bo->size, bo->cpu, bo->dma);
 	bo->cpu = NULL;
