@@ -104,11 +104,14 @@ int g4p_fwinit_build(struct g4p *g, struct g4p_mmu *mmu, struct g4p_fwinit *fi, 
 void g4p_fwinit_free(struct device *dev, struct g4p_fwinit *fi);
 bool g4p_fwinit_event(struct g4p_fwinit *fi, u32 *type, u32 *payload);
 void g4p_fwinit_show_log(struct seq_file *s, struct g4p_fwinit *fi);
+int g4p_fwinit_devctl_push(struct g4p_fwinit *fi, const u32 *entry);
+u32 g4p_fwinit_devctl_read_index(struct g4p_fwinit *fi);
 
 /* g4p_boot.c */
 int g4p_boot_start(struct g4p *g);
 void g4p_boot_free(struct g4p *g);
 void g4p_boot_show(struct seq_file *s, struct g4p *g);
+int g4p_boot_devctl_nop(struct g4p *g, u32 type);
 
 
 #endif

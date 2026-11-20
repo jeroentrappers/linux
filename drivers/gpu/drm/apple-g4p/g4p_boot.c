@@ -30,6 +30,8 @@
 #define RGX_CR_META_SP_MSLVCTRL0_RD	BIT(0)
 #define RGX_CR_META_SP_MSLVCTRL1	0x0a18
 #define RGX_CR_META_SP_MSLVCTRL1_IDLE	(BIT(24) | BIT(26))	/* READY | GBLPORT_IDLE */
+#define RGX_CR_MTS_SCHEDULE		0x0b00
+#define RGX_CR_MTS_SCHEDULE_DM0	0x10	/* TASK_COUNTED, DM 0: AGX's kick (0x…8501704) */
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_BIF_CAT_BASE0		0x1200
 #define RGX_CR_BIF_FAULT_BANK0_MMU	0x12b0
@@ -64,6 +66,7 @@ struct g4p_boot {
 	u32 nr_events, ev_type, ev_payload;
 	unsigned int alive_ms;
 	u32 fender_perf;
+	u32 devctl_sent, devctl_done, devctl_last_us;
 	/* results */
 	int ret;
 	u64 soft_reset;
@@ -267,6 +270,44 @@ int g4p_boot_start(struct g4p *g)
 	return 0;
 }
 
+/*
+ * M5 step 1: one device-control no-op. Types 9..11 (RDE*) are only consumed by the firmware's dispatcher
+ * (fw 0x1000328c: they branch to 0x100033d4, which advances the read index), so the response to check is
+ * the firmware read index catching up with ours.
+ */
+int g4p_boot_devctl_nop(struct g4p *g, u32 type)
+{
+	struct g4p_boot *b = g->boot;
+	u32 entry[5] = { type };
+	u32 perf;
+	int wr;
+
+	if (type < 9 || type > 11)
+		return -EINVAL;
+	if (!b || !b->alive || !g->powered)
+		return -ENODEV;
+	perf = readl(g->fender + 0x1000);
+	if (!(perf & 0xf) || (perf & BIT(4)))
+		return -EIO;	/* GPU not in a running perf state: no RGX access */
+	wr = g4p_fwinit_devctl_push(&b->fi, entry);
+	if (wr < 0)
+		return wr;
+	writel(RGX_CR_MTS_SCHEDULE_DM0, g->rgx + RGX_CR_MTS_SCHEDULE);
+	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
+	b->devctl_sent++;
+	for (b->devctl_last_us = 0; b->devctl_last_us < 100000; b->devctl_last_us += 10) {
+		if (g4p_fwinit_devctl_read_index(&b->fi) == (u32)wr) {
+			b->devctl_done++;
+			dev_info(g->dev, "devctl type %u: consumed after %u us (index %d)\n", type, b->devctl_last_us, wr);
+			return 0;
+		}
+		udelay(10);
+	}
+	dev_warn(g->dev, "devctl type %u: not consumed in 100 ms (read %u, write %d)\n", type,
+		 g4p_fwinit_devctl_read_index(&b->fi), wr);
+	return -ETIMEDOUT;
+}
+
 void g4p_boot_show(struct seq_file *s, struct g4p *g)
 {
 	struct g4p_boot *b = g->boot;
@@ -286,6 +327,8 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 	seq_printf(s, "  fender perf after boot 0x%08x\n", b->fender_perf);
 	seq_printf(s, "  alive %d after %u ms, %u events (type %u payload 0x%x), roots 0x%08x 0x%08x\n", b->alive,
 		   b->alive_ms, b->nr_events, b->ev_type, b->ev_payload, b->roots[0], b->roots[1]);
+	seq_printf(s, "  devctl: %u sent, %u consumed (last %u us), read index %u\n", b->devctl_sent, b->devctl_done,
+		   b->devctl_last_us, g4p_fwinit_devctl_read_index(&b->fi));
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
 		   ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[1]);

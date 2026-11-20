@@ -249,6 +249,21 @@ static int g4p_boot_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
+/* M5: echo 9 > devctl queues a device-control no-op (types 9..11 only) and waits for the firmware */
+static int g4p_devctl_set(void *data, u64 val)
+{
+	struct g4p *g = data;
+	int ret;
+
+	if (!experimental)
+		return -EPERM;
+	mutex_lock(&g->lock);
+	ret = g4p_boot_devctl_nop(g, val);
+	mutex_unlock(&g->lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(g4p_devctl_fops, NULL, g4p_devctl_set, "%llu\n");
+
 /* ------------------------------------------------------------------------------------------------ */
 /* probe: map and parse only, no register access */
 
@@ -309,6 +324,7 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("status", 0400, g->debugfs, g, &g4p_status_fops);
 	debugfs_create_file("firmware", 0400, g->debugfs, g, &g4p_firmware_fops);
 	debugfs_create_file("boot", 0200, g->debugfs, g, &g4p_boot_fops);
+	debugfs_create_file("devctl", 0200, g->debugfs, g, &g4p_devctl_fops);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }
