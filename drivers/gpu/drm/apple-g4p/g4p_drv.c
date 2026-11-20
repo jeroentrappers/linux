@@ -18,6 +18,7 @@
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -27,44 +28,9 @@
 #include <linux/pm_runtime.h>
 #include <linux/vmalloc.h>
 
-#include "g4p_fw.h"
+#include "g4p.h"
 
 #define G4P_FW_NAME		"apple/agx-g4p-b0.ldr"
-
-/* Fender, Apple's GPU power controller (AGX_CR_FNDR_*; re/GPU-BRINGUP.md 1, 8.11) */
-#define FNDR_CTRL		0x0000	/* 0x40000000 at wake; bit 29 is firmware state (8.11), never written */
-#define FNDR_PERF_CTL		0x1000	/* [3:0] perf state, bit 4 = request pending */
-#define FNDR_PERF_CTL_BUSY	BIT(4)
-#define FNDR_PERF_NEXT		0x1004	/* read only (iOS dumps it) */
-#define FNDR_SLEEP_TIMER	0x10000
-#define FNDR_TIMEOUT_US		100000
-
-/* Rogue core (upstream ROGUE_CR_*) */
-#define RGX_CR_CORE_ID		0x0018
-#define RGX_CR_CORE_REVISION	0x0020
-
-#define G4P_BRIDGE11_WORDS	32
-
-/* PMGR MiscACG (XNU _regGroups[kRegGroupMiscACG]); bit 0 = auto clock gating enable */
-#define PMGR_MISC_ACG_EN	BIT(0)
-
-struct g4p {
-	struct device *dev;
-	void __iomem *rgx;
-	void __iomem *fender;
-	void __iomem *bridge10;
-	void __iomem *bridge11;
-	void __iomem *misc_acg;			/* NULL: not described, RGX access refused */
-	u32 bridge10_cfg[2];			/* offset, value */
-	u32 bridge11_cfg[G4P_BRIDGE11_WORDS];	/* words from offset 0 */
-	struct mutex lock;
-	bool powered;
-	bool have_id;
-	u32 core_rev, core_id;
-	struct dentry *debugfs;
-	struct g4p_fw fw;			/* loaded on first read of debugfs firmware */
-	void *fw_image;				/* host copy (vmalloc), not yet given to the GPU */
-};
 
 static bool experimental;
 module_param(experimental, bool, 0444);
@@ -142,6 +108,7 @@ static void g4p_power_off_locked(struct g4p *g)
 	/* TODO (8.12): turn GFX DVFM off as gpuprobe "off" does; a stuck transition left on crashes the SoC */
 	pm_runtime_put_sync(g->dev);
 	g->powered = false;
+	g4p_boot_free(g);	/* the GPU is off: its memory can go */
 	dev_info(g->dev, "powered down\n");
 }
 
@@ -219,37 +186,68 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 		seq_printf(s, "core revision 0x%08x id 0x%08x (read at power-up)\n", g->core_rev, g->core_id);
 	else
 		seq_puts(s, "core id: not read yet\n");
+	g4p_boot_show(s, g);
 	mutex_unlock(&g->lock);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(g4p_status);
 
-/* M3 step 1: load, parse and lay out the firmware on the host (no hardware access) */
+/* load, parse and lay out the firmware on the host (no hardware access) */
+static int g4p_fw_load_locked(struct g4p *g)
+{
+	int ret;
+
+	if (g->fw.blob)
+		return 0;
+	ret = g4p_fw_request(g->dev, G4P_FW_NAME, &g->fw);
+	if (ret)
+		return ret;
+	g->fw_image = vmalloc(g->fw.image_size);
+	ret = g->fw_image ? g4p_fw_build_image(&g->fw, g->fw_image, g->fw.image_size) : -ENOMEM;
+	if (ret) {
+		vfree(g->fw_image);
+		g->fw_image = NULL;
+		g4p_fw_release(&g->fw);
+	}
+	return ret;
+}
+
 static int g4p_firmware_show(struct seq_file *s, void *unused)
 {
 	struct g4p *g = s->private;
-	int ret = 0;
+	int ret;
 
 	mutex_lock(&g->lock);
-	if (!g->fw.blob) {
-		ret = g4p_fw_request(g->dev, G4P_FW_NAME, &g->fw);
-		if (ret)
-			goto out;
-		g->fw_image = vmalloc(g->fw.image_size);
-		ret = g->fw_image ? g4p_fw_build_image(&g->fw, g->fw_image, g->fw.image_size) : -ENOMEM;
-		if (ret) {
-			vfree(g->fw_image);
-			g->fw_image = NULL;
-			g4p_fw_release(&g->fw);
-			goto out;
-		}
-	}
-	g4p_fw_show(s, &g->fw, g->fw_image);
-out:
+	ret = g4p_fw_load_locked(g);
+	if (!ret)
+		g4p_fw_show(s, &g->fw, g->fw_image);
 	mutex_unlock(&g->lock);
 	return ret;
 }
 DEFINE_SHOW_ATTRIBUTE(g4p_firmware);
+
+/* M3: power up (if needed) and boot META with the firmware image only (g4p_boot.c) */
+static int g4p_boot_set(void *data, u64 val)
+{
+	struct g4p *g = data;
+	int ret;
+
+	if (!experimental)
+		return -EPERM;
+	if (val != 1)
+		return -EINVAL;
+	mutex_lock(&g->lock);
+	ret = g4p_fw_load_locked(g);
+	if (!ret)
+		ret = g4p_power_on_locked(g);
+	if (!ret && !g->have_id)
+		ret = -ENODEV;	/* never boot without the core ID read (MiscACG and the wake checked) */
+	if (!ret)
+		ret = g4p_boot_start(g);
+	mutex_unlock(&g->lock);
+	return ret;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
 /* ------------------------------------------------------------------------------------------------ */
 /* probe: map and parse only, no register access */
@@ -296,6 +294,11 @@ static int g4p_probe(struct platform_device *pdev)
 		platform_get_resource_byname(pdev, IORESOURCE_MEM, "bridge10")))
 		return dev_err_probe(dev, -EINVAL, "bad bridge10 offset\n");
 
+	/* no IOMMU in front of the GPU (re/GPU-META-BOOT.md 5): its MMU walks 40-bit physical addresses */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
+	if (ret)
+		return ret;
+
 	platform_set_drvdata(pdev, g);
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
@@ -305,6 +308,7 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("power", 0600, g->debugfs, g, &g4p_power_fops);
 	debugfs_create_file("status", 0400, g->debugfs, g, &g4p_status_fops);
 	debugfs_create_file("firmware", 0400, g->debugfs, g, &g4p_firmware_fops);
+	debugfs_create_file("boot", 0200, g->debugfs, g, &g4p_boot_fops);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }
