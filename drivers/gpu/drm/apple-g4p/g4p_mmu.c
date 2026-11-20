@@ -30,6 +30,25 @@ static const struct {
 	[G4P_HEAP_PIO]     = { 0xe1c4200000ULL, SZ_4M,  G4P_PTE_PM_META_PROTECT | G4P_PTE_SLC_BYPASS },
 };
 
+/*
+ * iOS maps the shared heaps cache-coherent (CC) and turns snooping on (Fender +0 bit 29). Linux does not
+ * snoop yet, so with CC the GPU's SLC kept a stale copy of host-written memory (a channel pointer read
+ * back as 0 after the host had written it, GPU-BRINGUP 8.33). Bring-up default: bypass the SLC instead.
+ */
+static bool slc_bypass = true;
+module_param(slc_bypass, bool, 0444);
+MODULE_PARM_DESC(slc_bypass, "map the shared/private firmware heaps SLC-bypass instead of cache-coherent");
+
+static u64 g4p_heap_flags(enum g4p_heap heap)
+{
+	u64 f = g4p_heap_cfg[heap].flags;
+
+	if (slc_bypass && (heap == G4P_HEAP_SHARED || heap == G4P_HEAP_PRIVATE))
+		f = (f & ~G4P_PTE_CC) | G4P_PTE_SLC_BYPASS;
+	return f;
+}
+
+
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 {
 	u64 base = g4p_heap_cfg[G4P_HEAP_FW].base;
@@ -97,7 +116,7 @@ int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, si
 		return -ENOMEM;
 	bo->size = size;
 	bo->gpuva = va;
-	ret = g4p_mmu_map(dev, mmu, va, bo->dma, size, g4p_heap_cfg[heap].flags);
+	ret = g4p_mmu_map(dev, mmu, va, bo->dma, size, g4p_heap_flags(heap));
 	if (ret) {
 		dma_free_coherent(dev, size, bo->cpu, bo->dma);
 		bo->cpu = NULL;

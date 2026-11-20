@@ -501,16 +501,21 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	if (!g4p_gpu_running(g))
 		return -EIO;
 	j = &b->job;
-	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, G4P_CDM_CMD_SIZE, &j->cmd);
+	/*
+	 * iOS keeps commands and command streams in the private heap (7) and passes the cached firmware form:
+	 * the firmware invalidates the D-cache lines before reading them (fw 0x10028220); with the uncached
+	 * form the first command read faulted on META (GPU-BRINGUP 8.33).
+	 */
+	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, G4P_CDM_CMD_SIZE, &j->cmd);
 	if (!ret)
-		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->stream);
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, SZ_4K, &j->stream);
 	if (!ret)
 		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->cdm);
 	if (!ret)
 		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->misc);
 	if (ret)
 		return ret;
-	fcmd = g4p_fw_addr(j->cmd.gpuva, false);
+	fcmd = g4p_fw_addr(j->cmd.gpuva, true);
 	fchan = g4p_fw_addr(b->cl_state.gpuva, false);
 	fa3 = g4p_fw_addr(g4p_fwinit_list_a_va(&b->fi) + 0x2400, true);	/* list A #3: CDM DM state */
 
@@ -521,7 +526,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	w32a(j->cmd.cpu, 0x008, 0);			/* context 0 = the boot page catalogue */
 	w32a(j->cmd.cpu, 0x00c, g4p_fw_addr(j->misc.gpuva + 0x100, false));
 	*(u64 *)(j->cmd.cpu + 0x068) = j->cdm.gpuva;	/* CDM control stream base -> RGX 0x498 */
-	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, false));
+	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, true));
 	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
 	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
 	w32a(j->cmd.cpu, 0x268, G4P_STAMP_VALUE);
