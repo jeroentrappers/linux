@@ -116,6 +116,7 @@ void g4p_fwinit_ack_trace_stats(struct g4p_fwinit *fi);
 u32 g4p_fwinit_ring_ctl(struct g4p_fwinit *fi, unsigned int which, unsigned int off);
 int g4p_fwinit_ring_push(struct g4p_fwinit *fi, unsigned int ring, const u32 *entry);
 u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring);
+u64 g4p_fwinit_list_a_va(struct g4p_fwinit *fi);
 
 /* g4p_boot.c */
 int g4p_boot_start(struct g4p *g);
@@ -123,6 +124,7 @@ void g4p_boot_free(struct g4p *g);
 void g4p_boot_show(struct seq_file *s, struct g4p *g);
 int g4p_boot_devctl_nop(struct g4p *g, u32 type);
 int g4p_boot_cl_c1(struct g4p *g);
+int g4p_boot_cl_job(struct g4p *g, unsigned int which);
 void g4p_boot_irq_off(struct g4p *g);
 void g4p_boot_irq_rings(struct g4p *g);
 

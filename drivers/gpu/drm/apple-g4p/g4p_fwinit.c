@@ -262,6 +262,7 @@ int g4p_fwinit_build(struct g4p *g, struct g4p_mmu *mmu, struct g4p_fwinit *fi, 
 	 */
 	w32(b, LB_ROOT_B + 0x028, 0);
 	w32(b, LB_ROOT_B + 0x034, 0x78);	/* gpu_temperature_limit */
+	w32(b, LB_ROOT_B + 0x018, 1);		/* agf_disable_all_context_switch: no context store (no PDS yet) */
 	w32(b, LB_ROOT_B + 0x04a, 1);
 	w32(b, LB_ROOT_B + 0xc66, 2746);	/* PowerTarget */
 	w32(b, LB_ROOT_B + 0xc6a, 300);		/* CLTMPerfMax */
@@ -277,6 +278,11 @@ int g4p_fwinit_build(struct g4p *g, struct g4p_mmu *mmu, struct g4p_fwinit *fi, 
 #undef FA
 #undef FB
 	return 0;
+}
+
+u64 g4p_fwinit_list_a_va(struct g4p_fwinit *fi)
+{
+	return fi->list_a.gpuva;
 }
 
 void g4p_fwinit_free(struct device *dev, struct g4p_fwinit *fi)

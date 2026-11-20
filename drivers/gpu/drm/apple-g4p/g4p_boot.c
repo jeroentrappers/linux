@@ -87,6 +87,13 @@ struct g4p_boot {
 	int irqs;	/* firmware interrupts seen by the end of the alive wait */
 	/* CL channel (re/GPU-FIRST-JOB.md 2.1): state in heap 7, ring ctl + command pointers in heap 6 */
 	struct g4p_bo cl_state, cl_ring;
+	struct g4p_cljob {
+		struct g4p_bo cmd, stream, cdm, misc;
+		unsigned int which, stream_words, us;
+		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
+		int irq0, irqs;
+		u64 fault[4];
+	} job;
 	int cl_ret;
 	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd, cl_state_24;
 	u64 cl_fault[4], cl_event_status;
@@ -165,6 +172,10 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
+	g4p_bo_free(dev, &b->job.cmd);
+	g4p_bo_free(dev, &b->job.stream);
+	g4p_bo_free(dev, &b->job.cdm);
+	g4p_bo_free(dev, &b->job.misc);
 	g4p_bo_free(dev, &b->cl_state);
 	g4p_bo_free(dev, &b->cl_ring);
 	g4p_fwinit_free(dev, &b->fi);
@@ -371,6 +382,13 @@ int g4p_boot_devctl_nop(struct g4p *g, u32 type)
  * and its scheduler finds no command (ctl +0x00 == +0x40). Everything the firmware writes back is passed
  * in the uncached address form so the host sees it (META's data cache is on).
  */
+static bool g4p_gpu_running(struct g4p *g)
+{
+	u32 perf = readl(g->fender + 0x1000);
+
+	return (perf & 0xf) && !(perf & BIT(4));
+}
+
 int g4p_boot_cl_c1(struct g4p *g)
 {
 	struct g4p_boot *b = g->boot;
@@ -383,8 +401,7 @@ int g4p_boot_cl_c1(struct g4p *g)
 		return -ENODEV;
 	if (b->cl_state.cpu)
 		return -EBUSY;	/* one C1 per boot */
-	perf = readl(g->fender + 0x1000);
-	if (!(perf & 0xf) || (perf & BIT(4)))
+	if (!g4p_gpu_running(g))
 		return -EIO;
 	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, 0x80, &b->cl_state);
 	if (!ret)
@@ -443,6 +460,146 @@ int g4p_boot_cl_c1(struct g4p *g)
 	return b->cl_ret;
 }
 
+/*
+ * M5 checkpoints C2/C3 (re/GPU-FIRST-JOB.md 3, 4, 7): one CDM command on the C1 channel.
+ *   C2: command stream = the end record only.
+ *   C3: the six records iOS emits for a CDM command (2 kick, 3, 4 WFI, 6, 7 finish, 8 end); CDM control
+ *       stream = one STREAM_TERMINATE; terminate/context program fields 0 (iOS uses real ones, GPU-BRINGUP
+ *       8.31: this tests whether the CDM needs them for an empty stream).
+ * Command, streams, stamps and the +0x0c buffer live in the uncached shared heap; the stamp record is
+ * {FW(stamp0), FW(stamp1), value, index}. Results: channel ring read index, stamp, events, live BIF faults.
+ */
+#define G4P_CDM_CMD_SIZE	0x2c0	/* iOS CDM pool slot size (capture 1) */
+#define G4P_STAMP_VALUE		0x5a5a0001
+
+static void w32a(void *p, u32 off, u32 v)
+{
+	*(u32 *)(p + off) = v;
+}
+
+int g4p_boot_cl_job(struct g4p *g, unsigned int which)
+{
+	struct g4p_boot *b = g->boot;
+	struct g4p_cljob *j;
+	u32 entry[5] = { 2 };
+	u32 fcmd, fchan, fa3, *w;
+	void *ctl;
+	unsigned int n = 0, end;
+	int wr, cwr, ret;
+
+	if (which != 2 && which != 3)
+		return -EINVAL;
+	if (!b || !b->alive || !g->powered)
+		return -ENODEV;
+	if (!b->cl_state.cpu) {
+		ret = g4p_boot_cl_c1(g);
+		if (ret)
+			return ret;
+	}
+	if (b->job.cmd.cpu)
+		return -EBUSY;	/* one job per boot for now */
+	if (!g4p_gpu_running(g))
+		return -EIO;
+	j = &b->job;
+	ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, G4P_CDM_CMD_SIZE, &j->cmd);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->stream);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->cdm);
+	if (!ret)
+		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, SZ_4K, &j->misc);
+	if (ret)
+		return ret;
+	fcmd = g4p_fw_addr(j->cmd.gpuva, false);
+	fchan = g4p_fw_addr(b->cl_state.gpuva, false);
+	fa3 = g4p_fw_addr(g4p_fwinit_list_a_va(&b->fi) + 0x2400, true);	/* list A #3: CDM DM state */
+
+	/* CDM control stream: STREAM_TERMINATE (block_type 2, Mesa cdm.xml) */
+	w32a(j->cdm.cpu, 0, 0x80000000);
+	/* the command (§3.1); stamps at misc +0 / +4, the +0x0c buffer at misc +0x100 */
+	w32a(j->cmd.cpu, 0x000, 3);			/* CDM */
+	w32a(j->cmd.cpu, 0x008, 0);			/* context 0 = the boot page catalogue */
+	w32a(j->cmd.cpu, 0x00c, g4p_fw_addr(j->misc.gpuva + 0x100, false));
+	*(u64 *)(j->cmd.cpu + 0x068) = j->cdm.gpuva;	/* CDM control stream base -> RGX 0x498 */
+	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, false));
+	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
+	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
+	w32a(j->cmd.cpu, 0x268, G4P_STAMP_VALUE);
+	w32a(j->cmd.cpu, 0x26c, 0);			/* stamp index: event 1 bit 0 */
+
+	/* the command stream (§4) */
+	w = j->stream.cpu;
+	if (which == 3) {
+		static const u32 hdr2 = 0x32, hdr3 = 0x80000018, hdr6 = 0x18, hdr7 = 0x33;
+
+		/* 2: CDM kick */
+		w[n++] = hdr2; w[n++] = fcmd + 0x18; w[n++] = fcmd + 0x68; w[n++] = fa3 + 0x720; w[n++] = fchan;
+		w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0; w[n++] = 0;
+		w[n++] = 0;
+		/* 3: timestamps */
+		w[n++] = hdr3; w[n++] = fcmd + 0x280; w[n++] = fcmd + 0x288; w[n++] = fcmd + 0x288; w[n++] = 0;
+		/* 4: compute wait-for-idle (encodeComputeWFI: 0x101, literal 0x…7134908, 1) */
+		w[n++] = 0x101; w[n++] = 0x004a000a; w[n++] = 1; w[n++] = 1;
+		/* 6: timestamps */
+		w[n++] = hdr6; w[n++] = fcmd + 0x280; w[n++] = fcmd + 0x288; w[n++] = fcmd + 0x28c; w[n++] = 0;
+		/* 7: finish (stamp); last word = stream offset of the end record */
+		end = (n + 11) * 4;
+		w[n++] = hdr7; w[n++] = fa3 + 0x720; w[n++] = fchan; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0;
+		w[n++] = 0; w[n++] = 0; w[n++] = g4p_fw_addr(j->misc.gpuva + 4, false); w[n++] = G4P_STAMP_VALUE; w[n++] = end;
+	}
+	w[n++] = 0x40000017;			/* 8: end */
+	w32a(j->cmd.cpu, 0x1ec, ALIGN(n * 4, 64));
+	j->stream_words = n;
+	wmb();	/* command and streams before the channel ring names them */
+
+	/* channel ring: ptr[wr] = FW(cmd), host write index ctl +0x40 */
+	ctl = b->cl_ring.cpu;
+	cwr = *(u32 *)(ctl + 0x40);
+	*(u32 *)(ctl + 0x60 + 4 * cwr) = fcmd;
+	wmb();	/* the pointer before the write index */
+	cwr = (cwr + 1) % G4P_CHAN_RING_SIZE;
+	*(u32 *)(ctl + 0x40) = cwr;
+	if (gart_inval)
+		g4p_fwinit_gart_inval(&b->fi);
+
+	entry[1] = fchan;
+	entry[2] = cwr;
+	entry[3] = 0;	/* not the channel's first submission (C1 was) */
+	j->irq0 = atomic_read(&g->irq_count);
+	wr = g4p_fwinit_ring_push(&b->fi, 2, entry);
+	if (wr < 0)
+		return wr;
+	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
+	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
+
+	for (j->us = 0; j->us < 200000; j->us += 20) {
+		if (READ_ONCE(*(u32 *)j->misc.cpu) == G4P_STAMP_VALUE)
+			break;
+		if (which == 2 && READ_ONCE(*(u32 *)ctl) == (u32)cwr)
+			break;
+		udelay(20);
+	}
+	udelay(200);
+	rmb();	/* the firmware writes before reading them */
+	j->which = which;
+	j->ring2_rd = g4p_fwinit_ring_read_index(&b->fi, 2);
+	j->chan_rd = READ_ONCE(*(u32 *)ctl);
+	j->chan_10 = READ_ONCE(*(u32 *)(ctl + 0x10));
+	j->stamp0 = READ_ONCE(*(u32 *)j->misc.cpu);
+	j->stamp1 = READ_ONCE(*(u32 *)(j->misc.cpu + 4));
+	j->irqs = atomic_read(&g->irq_count) - j->irq0;
+	if (g4p_gpu_running(g)) {
+		j->fault[0] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
+		j->fault[1] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ);
+		j->fault[2] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
+		j->fault[3] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ);
+	}
+	dev_info(g->dev, "C%u: %u stream words; after %u us: ring 2 read %u (write %d), channel read %u (+0x10 %u, write %d), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
+		 which, n, j->us, j->ring2_rd, wr, j->chan_rd, j->chan_10, cwr, j->stamp0, j->stamp1, j->irqs,
+		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);
+	return j->stamp0 == G4P_STAMP_VALUE || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
+}
+
 void g4p_boot_show(struct seq_file *s, struct g4p *g)
 {
 	struct g4p_boot *b = g->boot;
@@ -475,6 +632,11 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 		seq_printf(s, "  C1 live: BIF fault 0x%llx/0x%llx 0x%llx/0x%llx event_status 0x%llx state +0x24 %u\n",
 			   b->cl_fault[0], b->cl_fault[1], b->cl_fault[2], b->cl_fault[3], b->cl_event_status,
 			   b->cl_state_24);
+	if (b->job.cmd.cpu)
+		seq_printf(s, "  C%u: %u us, ring 2 read %u, channel read %u (+0x10 %u), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
+			   b->job.which, b->job.us, b->job.ring2_rd, b->job.chan_rd, b->job.chan_10, b->job.stamp0,
+			   b->job.stamp1, b->job.irqs, b->job.fault[0], b->job.fault[1], b->job.fault[2],
+			   b->job.fault[3]);
 	g4p_fwinit_show_events(s, &b->fi);
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],
