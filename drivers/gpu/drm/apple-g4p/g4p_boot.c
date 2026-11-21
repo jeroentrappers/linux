@@ -590,6 +590,44 @@ static void w32a(void *p, u32 off, u32 v)
 	*(u32 *)(p + off) = v;
 }
 
+/*
+ * C5 (GPU-BRINGUP 8.39): a 1x1x1 compute kernel with no USC work. Its PDS program stores a word itself
+ * (Mesa pvr_rogue_pds_encode.h: limm temp0, #value; st const64[0]; wdf; halt); the data segment holds the ST
+ * descriptor (destination dword address << 2, count 1, source temp 0, write-through). CDM block: KERNEL0..5, 8
+ * (Mesa cdm.xml, pvr_compute_generate_control_stream), then STREAM_TERMINATE.
+ */
+#define G4P_C5_OUT		0x800		/* in the PDS page: PDS ST addresses are 38 bits (8.39), below the FW heaps */
+#define G4P_C5_VALUE		0x1234
+#define G4P_PDS_C5_CODE		0x400
+#define G4P_PDS_C5_DATA		0x500
+
+static void g4p_c5_stream(struct g4p_boot *b, struct g4p_cljob *j)
+{
+	u32 po = b->pds.gpuva - G4P_PDS_VA;
+	u64 dst = b->pds.gpuva + G4P_C5_OUT;
+	u64 st = ((dst >> 2) & GENMASK_ULL(35, 0)) << 2 | 1ULL << 40;	/* count 1, src temp 0, write-through */
+	u32 *code = b->pds.cpu + G4P_PDS_C5_CODE, *data = b->pds.cpu + G4P_PDS_C5_DATA;
+	u32 *w = j->misc.cpu + 0x800;	/* the buffer at cmd+0x78 -> RGX 0x480: the stream the CDM runs (8.39) */
+
+	code[0] = 0xd1800000 | ((u32)G4P_C5_VALUE << 2);	/* limm temp0, #value */
+	code[1] = 0xd0800000;	/* st const64[0] */
+	code[2] = 0xd1000000;	/* wdf */
+	code[3] = 0xd3000000;	/* halt */
+	data[0] = lower_32_bits(st);
+	data[1] = upper_32_bits(st);
+	data[2] = 0;
+	data[3] = 0;
+	w[0] = 1 << 8 | 1 << 2 | 1 << 1;	/* KERNEL0: compute kernel, pds temps 1, pds data 1 (x16 B), usc target any */
+	w[1] = po + G4P_PDS_C5_DATA;		/* KERNEL1: data address, sd_type none */
+	w[2] = po + G4P_PDS_C5_CODE;		/* KERNEL2: code address */
+	w[3] = 0;				/* KERNEL3..5: 1 x 1 x 1 workgroups (count - 1) */
+	w[4] = 0;
+	w[5] = 0;
+	w[6] = 0;				/* KERNEL8: max instances 32, workgroup size 1 x 1 x 1 */
+	w[7] = 0x80000000;			/* STREAM_TERMINATE */
+	wmb();
+}
+
 int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 {
 	struct g4p_boot *b = g->boot;
@@ -601,7 +639,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	int wr, cwr, ret;
 	bool first;
 
-	if (which < 2 || which > 4)
+	if (which < 2 || which > 5)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
@@ -645,13 +683,15 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	 */
 	if (which >= 3 && c3_var == 1)
 		*(u64 *)(j->cmd.cpu + 0x068) = 0xe1c2f00000ULL;	/* heap 6, never mapped */
-	if ((which == 3 && c3_var == 2) || which == 4)
+	if ((which == 3 && c3_var == 2) || which >= 4)
 		*(u64 *)(j->cmd.cpu + 0x078) = j->misc.gpuva + 0x800;	/* -> RGX 0x480 */
 	if (which == 4 && c4_pattern == 1)
 		for (unsigned int i = 0; i < 0x800 / 4; i++)	/* PDS offsets on unmapped pages of the PDS window */
 			w32a(j->misc.cpu, 0x800 + 4 * i, 0x10000 + 0x10 * i);
 	if (which == 4 && c4_pattern == 3)
 		w32a(j->misc.cpu, 0x800, 0x80000000);	/* CDM STREAM_TERMINATE: an empty resume stream */
+	if (which == 5)
+		g4p_c5_stream(b, j);
 	if (which == 4 && c4_pattern == 2) {
 		u32 po = b->pds.gpuva - G4P_PDS_VA;
 
@@ -660,7 +700,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		w32a(j->misc.cpu, 0x804, 0x20100003);
 		w32a(j->misc.cpu, 0x808, po + G4P_PDS_TERM_CODE);
 	}
-	if (which == 4) {
+	if (which >= 4) {
 		/* CDM_TERMINATE_PDS (code bits 4..31, data bits 36..63, both << 4) and PDS1 exactly as iOS (8.31) */
 		u64 o = b->pds.gpuva - G4P_PDS_VA;	/* PDS offset of the page */
 
@@ -724,7 +764,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
-	for (j->us = 0; j->us < (which == 4 ? 1000000 : 200000); j->us += 20) {
+	for (j->us = 0; j->us < (which >= 4 ? 1000000 : 200000); j->us += 20) {
 		if (READ_ONCE(*(u32 *)j->misc.cpu) == G4P_STAMP_VALUE)
 			break;
 		if (which == 2 && READ_ONCE(*(u32 *)ctl) == (u32)cwr)
@@ -739,6 +779,9 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	j->chan_10 = READ_ONCE(*(u32 *)(ctl + 0x10));
 	j->stamp0 = READ_ONCE(*(u32 *)j->misc.cpu);
 	j->stamp1 = READ_ONCE(*(u32 *)(j->misc.cpu + 4));
+	if (which == 5)
+		dev_info(g->dev, "C5: word at GPU VA 0x%llx = 0x%08x (kernel stores 0x%x)\n",
+			 (u64)b->pds.gpuva + G4P_C5_OUT, READ_ONCE(*(u32 *)(b->pds.cpu + G4P_C5_OUT)), G4P_C5_VALUE);
 	j->irqs = atomic_read(&g->irq_count) - j->irq0;
 	if (g4p_gpu_running(g)) {
 		j->fault[0] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
