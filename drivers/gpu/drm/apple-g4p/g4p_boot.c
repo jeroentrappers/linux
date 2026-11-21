@@ -205,6 +205,9 @@ static const u32 g4p_pds_doutc_halt[] = { 0xf0000005, 0xd3000000 };
 
 static unsigned int c4_prog;
 static bool c4_ctx;
+static unsigned int c4_pattern = 3;	/* 8.38: an empty resume stream completes the job */
+module_param(c4_pattern, uint, 0644);
+MODULE_PARM_DESC(c4_pattern, "C4: fill the CDM context-state buffer with word i = 0x10000 + 0x10 * i (it does: word 0, 8.37); 2 = words 0..2 = the fence-terminate program (data, task word, code), 3 = STREAM_TERMINATE (the buffer is the CDM resume control stream, Mesa lls.xml)");
 module_param(c4_ctx, bool, 0644);
 MODULE_PARM_DESC(c4_ctx, "C4: point the context PDS fields (cmd+0x224/+0x22c -> RGX 0x4a8/0x4b0) at a halt program in the page");
 module_param(c4_prog, uint, 0644);
@@ -644,6 +647,19 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		*(u64 *)(j->cmd.cpu + 0x068) = 0xe1c2f00000ULL;	/* heap 6, never mapped */
 	if ((which == 3 && c3_var == 2) || which == 4)
 		*(u64 *)(j->cmd.cpu + 0x078) = j->misc.gpuva + 0x800;	/* -> RGX 0x480 */
+	if (which == 4 && c4_pattern == 1)
+		for (unsigned int i = 0; i < 0x800 / 4; i++)	/* PDS offsets on unmapped pages of the PDS window */
+			w32a(j->misc.cpu, 0x800 + 4 * i, 0x10000 + 0x10 * i);
+	if (which == 4 && c4_pattern == 3)
+		w32a(j->misc.cpu, 0x800, 0x80000000);	/* CDM STREAM_TERMINATE: an empty resume stream */
+	if (which == 4 && c4_pattern == 2) {
+		u32 po = b->pds.gpuva - G4P_PDS_VA;
+
+		/* 8.37: word 0 = PDS data address (PDSRW read), word 2 = code address (PDS fetch); word 1 = task word [G] */
+		w32a(j->misc.cpu, 0x800, po + G4P_PDS_TERM_DATA);
+		w32a(j->misc.cpu, 0x804, 0x20100003);
+		w32a(j->misc.cpu, 0x808, po + G4P_PDS_TERM_CODE);
+	}
 	if (which == 4) {
 		/* CDM_TERMINATE_PDS (code bits 4..31, data bits 36..63, both << 4) and PDS1 exactly as iOS (8.31) */
 		u64 o = b->pds.gpuva - G4P_PDS_VA;	/* PDS offset of the page */
