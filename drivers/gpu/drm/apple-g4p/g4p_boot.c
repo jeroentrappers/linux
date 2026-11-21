@@ -51,7 +51,7 @@ MODULE_PARM_DESC(ack_rings, "consume the trace/statistics rings so the firmware 
 
 static unsigned int c3_var;
 module_param(c3_var, uint, 0644);
-MODULE_PARM_DESC(c3_var, "C3 variant (GPU-BRINGUP 8.35): 1 = stream base at an unmapped VA, 2 = CDM context state base set");
+MODULE_PARM_DESC(c3_var, "C3/C4 variant (GPU-BRINGUP 8.35): 1 = stream base at an unmapped VA, 2 = CDM context state base set (C3)");
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
@@ -97,6 +97,7 @@ struct g4p_boot {
 	struct g4p_bo arena[2];		/* [0] heap 7 (private), [1] heap 6 (shared) */
 	size_t arena_used[2];
 	struct g4p_bo cl_state, cl_ring;
+	struct g4p_bo pds;		/* one page at G4P_PDS_VA: C4's CDM terminate program */
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
 		unsigned int which, stream_words, us;
@@ -180,10 +181,61 @@ static int g4p_boot_args(struct g4p *g, struct g4p_boot *b)
 	return 0;
 }
 
+/*
+ * C4 (GPU-BRINGUP 8.35): with a context-state buffer the CDM reads PDS memory at 0x300000000 = PDS offset 0,
+ * so the PDS execution base is 0x300000000 here; iOS's CDM terminate program sits at offset 0xde0. One page,
+ * mapped before boot like the job arena, holds Mesa's fence-terminate program (pvr_pds.c
+ * pvr_pds_generate_fence_terminate_program, encoded with pvr_rogue_pds_encode.h): code at +0x100, its
+ * 16-byte data segment (two zero 64-bit DOUTC sources) at +0x200.
+ */
+#define G4P_PDS_VA		0x300000000ULL
+#define G4P_PDS_TERM_CODE	0x100
+#define G4P_PDS_TERM_DATA	0x200
+
+static const u32 g4p_pds_fence_terminate[] = {
+	0xc1100001,	/* bra if0, setc if1, +1: is this the coefficient-sync task? */
+	0xdb000000,	/* halt (if1) */
+	0xc1080001,	/* bra if0, setc if0, +1: default predicate back to if0 */
+	0xf0000005,	/* doutc */
+	0xd3000000,	/* halt */
+};
+
+/* doutc; halt only (pvr_pds_generate_doutc, without the barrier-conditional prefix): iOS's code fits 16 bytes */
+static const u32 g4p_pds_doutc_halt[] = { 0xf0000005, 0xd3000000 };
+
+static unsigned int c4_prog;
+static bool c4_ctx;
+module_param(c4_ctx, bool, 0644);
+MODULE_PARM_DESC(c4_ctx, "C4: point the context PDS fields (cmd+0x224/+0x22c -> RGX 0x4a8/0x4b0) at a halt program in the page");
+module_param(c4_prog, uint, 0644);
+MODULE_PARM_DESC(c4_prog, "C4 terminate program: 0 = Mesa fence terminate (5 instructions), 1 = doutc; halt, 2 = code address on an unmapped PDS page (does the CDM fetch it?), 3 = also a halt at PDS offset 0, 4 = page moved to +0x1000 (offset 0 unmapped)");
+
+static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b);
+
+static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
+{
+	struct g4p_bo *p = &b->pds;
+
+	p->cpu = dma_alloc_coherent(g->dev, SZ_4K, &p->dma, GFP_KERNEL);
+	if (!p->cpu)
+		return -ENOMEM;
+	p->size = SZ_4K;
+	p->gpuva = G4P_PDS_VA + (c4_prog == 4 ? SZ_4K : 0);
+	if (c4_prog == 3)
+		*(u32 *)p->cpu = 0xd3000000;	/* halt: for a program that the CDM runs from a zero register */
+	*(u32 *)(p->cpu + 0x300) = 0xd3000000;	/* halt: c4_ctx's context program; data at +0x400 (zero) */
+	if (c4_prog == 1)
+		memcpy(p->cpu + G4P_PDS_TERM_CODE, g4p_pds_doutc_halt, sizeof(g4p_pds_doutc_halt));
+	else
+		memcpy(p->cpu + G4P_PDS_TERM_CODE, g4p_pds_fence_terminate, sizeof(g4p_pds_fence_terminate));
+	return g4p_mmu_map_page(g->dev, &b->mmu, p->gpuva, p->dma, G4P_PTE_SLC_BYPASS);
+}
+
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
 	g4p_bo_free(dev, &b->arena[0]);
 	g4p_bo_free(dev, &b->arena[1]);
+	g4p_bo_free(dev, &b->pds);
 	g4p_bo_free(dev, &b->job.cmd);
 	g4p_bo_free(dev, &b->job.stream);
 	g4p_bo_free(dev, &b->job.cdm);
@@ -272,6 +324,8 @@ int g4p_boot_start(struct g4p *g)
 		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_PRIVATE, G4P_ARENA_SIZE, &b->arena[0]);
 	if (!ret)
 		ret = g4p_bo_alloc(g->dev, &b->mmu, G4P_HEAP_SHARED, G4P_ARENA_SIZE, &b->arena[1]);
+	if (!ret)
+		ret = g4p_boot_pds_page(g, b);
 	if (!ret)
 		ret = g4p_boot_args(g, b);
 	if (ret) {
@@ -520,6 +574,8 @@ int g4p_boot_cl_c1(struct g4p *g)
  *   C3: the six records iOS emits for a CDM command (2 kick, 3, 4 WFI, 6, 7 finish, 8 end); CDM control
  *       stream = one STREAM_TERMINATE; terminate/context program fields 0 (iOS uses real ones, GPU-BRINGUP
  *       8.31: this tests whether the CDM needs them for an empty stream).
+ *   C4: C3 plus a CDM context-state buffer (cmd+0x78) and the fence-terminate PDS program (cmd+0x70/+0x18),
+ *       GPU-BRINGUP 8.35.
  * Command, streams, stamps and the +0x0c buffer live in the uncached shared heap; the stamp record is
  * {FW(stamp0), FW(stamp1), value, index}. Results: channel ring read index, stamp, events, live BIF faults.
  */
@@ -542,7 +598,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	int wr, cwr, ret;
 	bool first;
 
-	if (which != 2 && which != 3)
+	if (which < 2 || which > 4)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
@@ -584,10 +640,23 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	 * 8.35 variants: 1 tells whether the CDM fetches from 0x498 at all (the fault address then moves to
 	 * the unmapped VA), 2 gives the CDM a zeroed context state buffer (iOS: cmd+0x78 non-zero, 8.31).
 	 */
-	if (which == 3 && c3_var == 1)
+	if (which >= 3 && c3_var == 1)
 		*(u64 *)(j->cmd.cpu + 0x068) = 0xe1c2f00000ULL;	/* heap 6, never mapped */
-	if (which == 3 && c3_var == 2)
+	if ((which == 3 && c3_var == 2) || which == 4)
 		*(u64 *)(j->cmd.cpu + 0x078) = j->misc.gpuva + 0x800;	/* -> RGX 0x480 */
+	if (which == 4) {
+		/* CDM_TERMINATE_PDS (code bits 4..31, data bits 36..63, both << 4) and PDS1 exactly as iOS (8.31) */
+		u64 o = b->pds.gpuva - G4P_PDS_VA;	/* PDS offset of the page */
+
+		*(u64 *)(j->cmd.cpu + 0x070) = ((u64)(o + G4P_PDS_TERM_DATA) << 32) |
+					       (o + G4P_PDS_TERM_CODE + (c4_prog == 2 ? SZ_4K : 0));
+		w32a(j->cmd.cpu, 0x018, 0x20100003);	/* pds_seq_dep, common_shared, data size 1, fence */
+		if (c4_ctx) {
+			/* iOS: +0x224 = {code 0xdc0, data 0x14000}, +0x22c = 0x28800005 (8.36) */
+			*(u64 *)(j->cmd.cpu + 0x224) = ((o + 0x400) << 32) | (o + 0x300);
+			w32a(j->cmd.cpu, 0x22c, 0x28000003);	/* pds_seq_dep, target, data size 1, fence */
+		}
+	}
 	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, true));
 	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
 	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
@@ -596,7 +665,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 
 	/* the command stream (§4) */
 	w = j->stream.cpu;
-	if (which == 3) {
+	if (which >= 3) {
 		static const u32 hdr2 = 0x32, hdr3 = 0x80000018, hdr6 = 0x18, hdr7 = 0x33;
 
 		/* 2: CDM kick */
@@ -639,7 +708,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
-	for (j->us = 0; j->us < 200000; j->us += 20) {
+	for (j->us = 0; j->us < (which == 4 ? 1000000 : 200000); j->us += 20) {
 		if (READ_ONCE(*(u32 *)j->misc.cpu) == G4P_STAMP_VALUE)
 			break;
 		if (which == 2 && READ_ONCE(*(u32 *)ctl) == (u32)cwr)
@@ -669,6 +738,11 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 			 readl(g->rgx + 0x490), readq(g->rgx + 0x498), readl(g->rgx + 0x4a0), readq(g->rgx + 0x4a8),
 			 readl(g->rgx + 0x4b0), readq(g->rgx + 0x4b8), readl(g->rgx + 0x4c0), readl(g->rgx + 0x4c8),
 			 *(u64 *)(j->cmd.cpu + 0x068), c3_var);
+		/* the registers the DDK's debug dump shows for a stuck job (rgxdebug.c, non-S7 infrastructure) */
+		dev_info(g->dev, "C%u state: EVENT_STATUS 0x130 %08x MTS_GPU_INT_STATUS 0xbb0 %08x SIDEKICK_IDLE 0x3c8 %08x SLC_IDLE 0x3898 %08x SLC_STATUS0 0x3820 %08x MCU_FENCE 0x1740 %016llx PERF_COMPUTE_PHASE 0x6018 %08x PERF_COMPUTE_CYCLE 0x6030 %08x\n",
+			 which, readl(g->rgx + 0x130), readl(g->rgx + 0xbb0), readl(g->rgx + 0x3c8),
+			 readl(g->rgx + 0x3898), readl(g->rgx + 0x3820), readq(g->rgx + 0x1740),
+			 readl(g->rgx + 0x6018), readl(g->rgx + 0x6030));
 	}
 	/* host view of what the scheduler reads (GPU-BRINGUP 8.33), with the firmware addresses */
 	dev_info(g->dev, "C%u host view: state FW 0x%08x [+0]=0x%08x [+4]=0x%08x; ring ctl FW 0x%08x +0x00=%u +0x10=%u +0x20=%u +0x30=%u +0x40=%u; ptr[0] (FW 0x%08x) = 0x%08x; cmd FW 0x%08x [+0]=0x%08x\n",

@@ -305,7 +305,7 @@ static int g4p_devctl_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_devctl_fops, NULL, g4p_devctl_set, "%llu\n");
 
-/* M5 checkpoints (re/GPU-FIRST-JOB.md 7): echo 1|2|3 > cl runs C1 (empty channel), C2, C3 (empty job) */
+/* M5 checkpoints (re/GPU-FIRST-JOB.md 7): echo 1..4 > cl runs C1 (empty channel), C2, C3 (empty job), C4 (C3 + context state + PDS) */
 static int g4p_cl_set(void *data, u64 val)
 {
 	struct g4p *g = data;
@@ -313,7 +313,7 @@ static int g4p_cl_set(void *data, u64 val)
 
 	if (!experimental)
 		return -EPERM;
-	if (val < 1 || val > 3)
+	if (val < 1 || val > 4)
 		return -EINVAL;
 	mutex_lock(&g->lock);
 	ret = val == 1 ? g4p_boot_cl_c1(g) : g4p_boot_cl_job(g, val);

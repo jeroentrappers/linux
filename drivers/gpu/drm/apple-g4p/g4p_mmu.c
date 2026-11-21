@@ -70,6 +70,10 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu)
 {
+	if (mmu->xpt)
+		dma_free_coherent(dev, SZ_4K, mmu->xpt, mmu->xpt_dma);
+	if (mmu->xpd)
+		dma_free_coherent(dev, SZ_4K, mmu->xpd, mmu->xpd_dma);
 	for (unsigned int i = 0; i < ARRAY_SIZE(mmu->pt); i++)
 		if (mmu->pt[i])
 			dma_free_coherent(dev, SZ_4K, mmu->pt[i], mmu->pt_dma[i]);
@@ -100,6 +104,34 @@ int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa,
 			return -EEXIST;
 		mmu->pt[d][MMU_PT_INDEX(a)] = ((pa + off) & MMU_PA_MASK) | flags | G4P_PTE_VALID;
 	}
+	return 0;
+}
+
+/*
+ * One 4 KiB page at @va outside the firmware heaps' PC entry: all such pages share one 2 MiB window (own PD
+ * and PT), set by the first call. For bring-up programs at fixed GPU VAs (the PDS heap, GPU-BRINGUP 8.35).
+ */
+int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags)
+{
+	unsigned int pc = MMU_PC_INDEX(va);
+
+	if (!IS_ALIGNED(va | pa, SZ_4K) || pc == mmu->pc_index || va & ~GENMASK_ULL(39, 0) ||
+	    pa & ~GENMASK_ULL(39, 0))
+		return -EINVAL;
+	if (!mmu->xpd) {
+		mmu->xpd = dma_alloc_coherent(dev, SZ_4K, &mmu->xpd_dma, GFP_KERNEL);
+		mmu->xpt = dma_alloc_coherent(dev, SZ_4K, &mmu->xpt_dma, GFP_KERNEL);
+		if (!mmu->xpd || !mmu->xpt)
+			return -ENOMEM;
+		mmu->xva = va & ~(u64)(SZ_2M - 1);
+		mmu->xpd[MMU_PD_INDEX(va)] = (mmu->xpt_dma & MMU_PA_MASK) | MMU_PD_VALID;
+		mmu->pc[pc] = ((mmu->xpd_dma >> 12) << 4) | MMU_PC_VALID;
+	}
+	if ((va & ~(u64)(SZ_2M - 1)) != mmu->xva)
+		return -EINVAL;
+	if (mmu->xpt[MMU_PT_INDEX(va)])
+		return -EEXIST;
+	mmu->xpt[MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
 	return 0;
 }
 

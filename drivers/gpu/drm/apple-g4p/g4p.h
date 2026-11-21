@@ -80,6 +80,10 @@ struct g4p_mmu {
 	u64 *pt[512];
 	dma_addr_t pt_dma[512];
 	u64 heap_next[G4P_NR_HEAPS];
+	/* one extra 2 MiB window outside the firmware heaps (the PDS heap at 0x300000000, GPU-BRINGUP 8.35) */
+	u64 *xpd, *xpt;
+	dma_addr_t xpd_dma, xpt_dma;
+	u64 xva;		/* 2 MiB aligned base of the window, 0 = none */
 };
 
 struct g4p_bo {
@@ -93,6 +97,7 @@ struct g4p_bo {
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu);
 int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, size_t size, u64 flags);
+int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags);
 int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, size_t size, u64 *gpuva);
 int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo);
 void g4p_bo_free(struct device *dev, struct g4p_bo *bo);
