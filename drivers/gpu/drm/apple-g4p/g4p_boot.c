@@ -14,6 +14,7 @@
 
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -701,6 +702,69 @@ static void g4p_c6_stream(struct g4p_boot *b, struct g4p_cljob *j)
 	wmb();
 }
 
+/*
+ * C7 (GPU-BRINGUP 8.41): the iOS dispatch structure (8.41) with a USC program compiled by Apple's compiler for
+ * `out[0] = 0x1234` (buffer(0) from the shared registers). That blob is Apple-generated, so it is not in this
+ * source: it comes from /lib/firmware/agx-g4p-c7-usc.bin (user's own capture, like the firmware).
+ *   K0: PDS-only, usc_common_shared: 8 doutw fill the 16 shared registers with the pair {0x800, 3} (GPU VA
+ *       0x300000800 in whichever aligned pair the shader reads).
+ *   K1: doutw temp0 (local id) -> vi0, doutu (exe 0x600, temps 2): as iOS's kick program.
+ */
+#define G4P_PDS_C7_K0_CODE	0x300
+#define G4P_PDS_C7_K0_DATA	0x380
+#define G4P_PDS_C7_K1_CODE	0x400
+#define G4P_PDS_C7_K1_DATA	0x500
+
+static int g4p_c7_stream(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
+{
+	u32 po = b->pds.gpuva - G4P_PDS_VA;
+	u32 *k0c = b->pds.cpu + G4P_PDS_C7_K0_CODE, *k0d = b->pds.cpu + G4P_PDS_C7_K0_DATA;
+	u32 *k1c = b->pds.cpu + G4P_PDS_C7_K1_CODE, *k1d = b->pds.cpu + G4P_PDS_C7_K1_DATA;
+	u32 *w = j->misc.cpu + 0x800;
+	const struct firmware *fw;
+	int ret;
+
+	ret = request_firmware(&fw, "agx-g4p-c7-usc.bin", g->dev);
+	if (ret)
+		return ret;
+	if (fw->size > 0x100) {
+		release_firmware(fw);
+		return -EINVAL;
+	}
+	memcpy(b->pds.cpu + G4P_USC_C6_CODE, fw->data, fw->size);
+	release_firmware(fw);
+
+	for (unsigned int i = 0; i < 8; i++) {
+		k0c[i] = 0xf0100001 + i * 0x10101;	/* doutw const[2i].64, const[16+i].32 */
+		k0d[2 * i] = 0x800;
+		k0d[2 * i + 1] = 0x3;
+		/* common store, address offset 2i (dwords), 64 bits; last on the final one */
+		k0d[16 + i] = 0x10000000 | (2 * i) << 13 | 2 | (i == 7 ? 0x80000000 : 0);
+	}
+	k0c[8] = 0xd3000000;	/* halt */
+	k1c[0] = 0xf0024001;	/* doutw temp[0].64 -> vi0, const[2].32 */
+	k1c[1] = 0xf4000002;	/* doutu const[0].64, end */
+	k1c[2] = 0xd3000000;
+	k1d[0] = po + G4P_USC_C6_CODE;	/* doutu: exe offset */
+	k1d[1] = 0x10;			/* temps 2 (x4) at bit 35, as iOS */
+	k1d[2] = 0x80000000;		/* doutw: last, unified store, offset 0, lower 32 bits */
+	k1d[3] = 0;
+
+	w[0] = 1 << 18 | 6 << 2;		/* K0 KERNEL0: usc common 1 (x64 B), pds data 6 (x16 B), target all */
+	w[1] = (po + G4P_PDS_C7_K0_DATA) | 1 << 1;	/* KERNEL1: usc_common_shared */
+	w[2] = po + G4P_PDS_C7_K0_CODE;
+	w[3] = w[4] = w[5] = 0;
+	w[6] = 1 << 27;				/* KERNEL8: 1 instance */
+	w[7] = 1 << 12 | 1 << 8 | 1 << 2 | 1 << 1;	/* K1 KERNEL0: unified 1, pds temps 1, data 1, target any */
+	w[8] = (po + G4P_PDS_C7_K1_DATA) | 2 << 2;	/* KERNEL1: sd_type USC */
+	w[9] = po + G4P_PDS_C7_K1_CODE;
+	w[10] = w[11] = w[12] = 0;
+	w[13] = 1 << 27;
+	w[14] = 0x80000000;			/* STREAM_TERMINATE */
+	wmb();
+	return 0;
+}
+
 int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 {
 	struct g4p_boot *b = g->boot;
@@ -712,7 +776,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	int wr, cwr, ret;
 	bool first;
 
-	if (which < 2 || which > 6)
+	if (which < 2 || which > 7)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
@@ -767,6 +831,11 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		g4p_c5_stream(b, j);
 	if (which == 6)
 		g4p_c6_stream(b, j);
+	if (which == 7) {
+		ret = g4p_c7_stream(g, b, j);
+		if (ret)
+			return ret;
+	}
 	if (which == 4 && c4_pattern == 2) {
 		u32 po = b->pds.gpuva - G4P_PDS_VA;
 
@@ -855,7 +924,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	j->stamp0 = READ_ONCE(*(u32 *)j->misc.cpu);
 	j->stamp1 = READ_ONCE(*(u32 *)(j->misc.cpu + 4));
 	if (which >= 5)
-		for (unsigned int o = 0; o < SZ_4K; o += 4)	/* where did the value land? */
+		for (unsigned int o = 0x700; o < SZ_4K; o += 4)	/* where did the value land? */
 			if (READ_ONCE(*(u32 *)(b->pds.cpu + o)) == G4P_C5_VALUE)
 				dev_info(g->dev, "C%u: 0x%x found at PDS page +0x%x\n", which, G4P_C5_VALUE, o);
 	if (which >= 5)

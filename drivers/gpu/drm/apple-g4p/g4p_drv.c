@@ -313,7 +313,7 @@ static int g4p_cl_set(void *data, u64 val)
 
 	if (!experimental)
 		return -EPERM;
-	if (val < 1 || val > 6)
+	if (val < 1 || val > 7)
 		return -EINVAL;
 	mutex_lock(&g->lock);
 	ret = val == 1 ? g4p_boot_cl_c1(g) : g4p_boot_cl_job(g, val);
