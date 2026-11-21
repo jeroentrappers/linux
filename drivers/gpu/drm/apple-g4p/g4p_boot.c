@@ -48,6 +48,10 @@ MODULE_PARM_DESC(gart_inval, "ask the firmware to invalidate the GPU MMU caches 
 static bool ack_rings = true;
 module_param(ack_rings, bool, 0644);
 MODULE_PARM_DESC(ack_rings, "consume the trace/statistics rings so the firmware does not block on them");
+
+static unsigned int c3_var;
+module_param(c3_var, uint, 0644);
+MODULE_PARM_DESC(c3_var, "C3 variant (GPU-BRINGUP 8.35): 1 = stream base at an unmapped VA, 2 = CDM context state base set");
 #define RGX_CR_META_BOOT		0x0bf8
 #define RGX_CR_META_SP_MSLVIRQSTATUS	0x0ac8	/* TRIGVECT2 (bit 2): firmware -> host; write 0 = ack (AGX) */
 #define RGX_CR_BIF_CAT_BASE0		0x1200
@@ -576,6 +580,14 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	w32a(j->cmd.cpu, 0x008, 0);			/* context 0 = the boot page catalogue */
 	w32a(j->cmd.cpu, 0x00c, g4p_fw_addr(j->misc.gpuva + 0x100, false));
 	*(u64 *)(j->cmd.cpu + 0x068) = j->cdm.gpuva;	/* CDM control stream base -> RGX 0x498 */
+	/*
+	 * 8.35 variants: 1 tells whether the CDM fetches from 0x498 at all (the fault address then moves to
+	 * the unmapped VA), 2 gives the CDM a zeroed context state buffer (iOS: cmd+0x78 non-zero, 8.31).
+	 */
+	if (which == 3 && c3_var == 1)
+		*(u64 *)(j->cmd.cpu + 0x068) = 0xe1c2f00000ULL;	/* heap 6, never mapped */
+	if (which == 3 && c3_var == 2)
+		*(u64 *)(j->cmd.cpu + 0x078) = j->misc.gpuva + 0x800;	/* -> RGX 0x480 */
 	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, true));
 	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
 	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
@@ -648,6 +660,15 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		j->fault[1] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ);
 		j->fault[2] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
 		j->fault[3] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ);
+		/*
+		 * CDM registers as the hardware holds them after the job (read only; GPU-BRINGUP 8.35): the C3
+		 * fault is a CDM control stream read at VA 0 (DDK rgxdebug.c tag 8 / sub-tag 0).
+		 */
+		dev_info(g->dev, "C%u CDM: 0x478 %08x 0x480 %016llx 0x488 %08x 0x490 %08x 0x498 %016llx 0x4a0 %08x 0x4a8 %016llx 0x4b0 %08x 0x4b8 %016llx 0x4c0 %08x 0x4c8 %08x; stream base sent %016llx (var %u)\n",
+			 which, readl(g->rgx + 0x478), readq(g->rgx + 0x480), readl(g->rgx + 0x488),
+			 readl(g->rgx + 0x490), readq(g->rgx + 0x498), readl(g->rgx + 0x4a0), readq(g->rgx + 0x4a8),
+			 readl(g->rgx + 0x4b0), readq(g->rgx + 0x4b8), readl(g->rgx + 0x4c0), readl(g->rgx + 0x4c8),
+			 *(u64 *)(j->cmd.cpu + 0x068), c3_var);
 	}
 	/* host view of what the scheduler reads (GPU-BRINGUP 8.33), with the firmware addresses */
 	dev_info(g->dev, "C%u host view: state FW 0x%08x [+0]=0x%08x [+4]=0x%08x; ring ctl FW 0x%08x +0x00=%u +0x10=%u +0x20=%u +0x30=%u +0x40=%u; ptr[0] (FW 0x%08x) = 0x%08x; cmd FW 0x%08x [+0]=0x%08x\n",
