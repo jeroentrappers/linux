@@ -225,6 +225,10 @@ static unsigned int heap_pages = 1;
 module_param(heap_pages, uint, 0644);
 MODULE_PARM_DESC(heap_pages, "pages of the code-heap window at GPU VA 0x300000000 (1..32, read at boot; C8)");
 
+static unsigned long long heap_pte = G4P_PTE_SLC_BYPASS;
+module_param(heap_pte, ullong, 0644);
+MODULE_PARM_DESC(heap_pte, "PTE flags of the code-heap window (read at boot): 8 = SLC bypass (default), 4 = cache-coherent, 0 = SLC cached");
+
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b);
 
 static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
@@ -246,7 +250,8 @@ static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
 	else
 		memcpy(p->cpu + G4P_PDS_TERM_CODE, g4p_pds_fence_terminate, sizeof(g4p_pds_fence_terminate));
 	for (size_t off = 0; off < size && !ret; off += SZ_4K)
-		ret = g4p_mmu_map_page(g->dev, &b->mmu, p->gpuva + off, p->dma + off, G4P_PTE_SLC_BYPASS);
+		ret = g4p_mmu_map_page(g->dev, &b->mmu, p->gpuva + off, p->dma + off,
+				       heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS | G4P_PTE_READ_ONLY));
 	return ret;
 }
 
@@ -930,9 +935,15 @@ out:
 
 /*
  * debugfs apple-g4p/c8mem: 0x0000 command (4 KiB), 0x1000 misc page (stamps; stream at +0x800), 0x2000 command
- * stream, 0x3000 CDM page, 0x10000 code-heap window. Host memory only: no register access.
+ * stream, 0x3000 CDM page, 0x10000 code-heap window (up to 128 KiB), then the firmware image at 0x40000 (its data
+ * segment holds the firmware's globals, 8.46), list A at 0x80000 and list B at 0xc0000 (256 KiB each at most).
+ * Host memory only: no register access.
  */
 #define G4P_C8MEM_HEAP		0x10000
+#define G4P_C8MEM_IMAGE		0x40000
+#define G4P_C8MEM_LIST_A	0x80000
+#define G4P_C8MEM_LIST_B	0xc0000
+#define G4P_C8MEM_SIZE		0x100000
 
 ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
 {
@@ -944,7 +955,7 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
 	if (!b || !b->pds.cpu)
 		return -ENODEV;
 	j = &b->job;
-	size = G4P_C8MEM_HEAP + b->pds.size;
+	size = G4P_C8MEM_SIZE;
 	buf = vzalloc(size);
 	if (!buf)
 		return -ENOMEM;
@@ -958,6 +969,12 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
 	if (j->cdm.cpu)
 		memcpy(buf + 0x3000, j->cdm.cpu, SZ_4K);
 	memcpy(buf + G4P_C8MEM_HEAP, b->pds.cpu, b->pds.size);
+	if (b->image.cpu)
+		memcpy(buf + G4P_C8MEM_IMAGE, b->image.cpu, min_t(size_t, b->image.size, SZ_256K));
+	if (b->fi.list_a.cpu)
+		memcpy(buf + G4P_C8MEM_LIST_A, b->fi.list_a.cpu, min_t(size_t, b->fi.list_a.size, SZ_256K));
+	if (b->fi.list_b.cpu)
+		memcpy(buf + G4P_C8MEM_LIST_B, b->fi.list_b.cpu, min_t(size_t, b->fi.list_b.size, SZ_256K));
 	*bufp = buf;
 	return size;
 }

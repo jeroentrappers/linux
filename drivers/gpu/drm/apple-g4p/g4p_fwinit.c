@@ -11,6 +11,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/string.h>
@@ -145,6 +146,16 @@ static void g4p_power_data(void *p)
 	w64(p, 0x1008, g4p_timebase());
 }
 
+/*
+ * GPU-BRINGUP 8.46: list A #6 +0x8 (= config +0x4a8 on iOS, accel[0x1b50]) is the MCU fence buffer: at every kick
+ * the firmware (fw 0x10021924) programs RGX_CR_MCU_FENCE = (this & ~31) | DM bits, and with 0 it writes 0, so a
+ * CDM fence kernel never gets its USC fence acknowledgement. iOS uses a small zeroed heap-4 buffer; any GPU VA
+ * mapped before the boot works for bring-up (e.g. a page of the code-heap window, apple-g4p heap_pages).
+ */
+static unsigned long long mcu_fence_va;
+module_param(mcu_fence_va, ullong, 0644);
+MODULE_PARM_DESC(mcu_fence_va, "GPU VA of the MCU fence buffer given to the firmware (list A #6 +8, config +0x4a8); 0 = none (read at boot)");
+
 /* list A #7, firmware config (§4) */
 static void g4p_config(struct g4p *g, void *c, const u64 *pio_va)
 {
@@ -193,6 +204,8 @@ static void g4p_config(struct g4p *g, void *c, const u64 *pio_va)
 		w32(c, 0x4a0, t1->pc);
 		w32(c, 0x4a4, t1->sp);
 	}
+	if (mcu_fence_va)
+		w64(c, 0x4a8, mcu_fence_va);
 	w64(c, 0x4b0, g4p_fw_heap_base());
 	w32(c, 0x4bc, 7);		/* BIF-DM */
 	w32(c, 0x4c8, 0xffff);		/* agf_gtp_ks */
@@ -243,6 +256,7 @@ int g4p_fwinit_build(struct g4p *g, struct g4p_mmu *mmu, struct g4p_fwinit *fi, 
 	w32(a, LA_ROOT_A + 0x98, FA(LA_5));
 	w32(a, LA_ROOT_A + 0x470, FA(LA_8));
 	w32(a, LA_ROOT_A + 0x474, FA(LA_6));
+	w64(a, LA_6 + 0x8, mcu_fence_va);
 	w32(a, LA_ROOT_A + 0x478, FA(LA_CONFIG));
 	w32(a, LA_ROOT_A + 0x47c, FA(LA_9));
 	w32(a, LA_ROOT_A + 0x480, FB(LB_LOG_MSG));
