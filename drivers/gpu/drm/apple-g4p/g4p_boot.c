@@ -711,6 +711,19 @@ static void g4p_c6_stream(struct g4p_boot *b, struct g4p_cljob *j)
  *   K1: doutw temp0 (local id) -> vi0, doutu (exe 0x600, temps 2): as iOS's kick program.
  */
 #define G4P_PDS_C7_K0_CODE	0x300
+
+static unsigned int c7_lo = 0x800, c7_mode = 2;
+static bool c7_tab_probe, c7_mcu_fence, c7_fence;
+module_param(c7_fence, bool, 0644);
+MODULE_PARM_DESC(c7_fence, "C7: append Mesa's compute fence kernel (hangs on this core so far, 8.42)");
+module_param(c7_mcu_fence, bool, 0644);
+MODULE_PARM_DESC(c7_mcu_fence, "C7: program RGX_CR_MCU_FENCE before the kick");
+module_param(c7_tab_probe, bool, 0644);
+MODULE_PARM_DESC(c7_tab_probe, "C7: argument table entries point at distinct unmapped addresses");
+module_param(c7_lo, uint, 0644);
+MODULE_PARM_DESC(c7_lo, "C7: low word of the address put in the shared registers (high word 3)");
+module_param(c7_mode, uint, 0644);
+MODULE_PARM_DESC(c7_mode, "C7 shared-register fill: 0 = {lo, 3} pairs, 1 = distinct values per register, 2 = argument table (default)");
 #define G4P_PDS_C7_K0_DATA	0x380
 #define G4P_PDS_C7_K1_CODE	0x400
 #define G4P_PDS_C7_K1_DATA	0x500
@@ -736,12 +749,31 @@ static int g4p_c7_stream(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 
 	for (unsigned int i = 0; i < 8; i++) {
 		k0c[i] = 0xf0100001 + i * 0x10101;	/* doutw const[2i].64, const[16+i].32 */
-		k0d[2 * i] = 0x800;
-		k0d[2 * i + 1] = 0x3;
+		k0d[2 * i] = c7_mode == 1 ? c7_lo + 0x200 * i : c7_lo;
+		k0d[2 * i + 1] = c7_mode == 1 ? c7_lo + 0x200 * i + 0x100 : 0x3;
 		/* common store, address offset 2i (dwords), 64 bits; last on the final one */
 		k0d[16 + i] = 0x10000000 | (2 * i) << 13 | 2 | (i == 7 ? 0x80000000 : 0);
 	}
 	k0c[8] = 0xd3000000;	/* halt */
+	if (c7_mode == 2) {
+		/*
+		 * 8.42: the shader loads its buffer addresses from an argument table whose GPU address is in shared
+		 * registers 14/15 (read fault at the sh14/sh15 value); entry 0 = buffer(0). Table at PDS page +0x900.
+		 */
+		u32 *tab = b->pds.cpu + 0x900;
+
+		tab[0] = po + G4P_C5_OUT;	/* buffer(0) = 0x300000800 */
+		tab[1] = 0x3;
+		if (c7_tab_probe)	/* entry k = 0x300020000 + 0x100 k (unmapped): the fault names the entry used */
+			for (unsigned int k = 0; k < 32; k++) {
+				tab[2 * k] = 0x20000 + 0x100 * k;
+				tab[2 * k + 1] = 0x3;
+			}
+		for (unsigned int i = 0; i < 8; i++) {
+			k0d[2 * i] = po + 0x900;
+			k0d[2 * i + 1] = 0x3;
+		}
+	}
 	k1c[0] = 0xf0024001;	/* doutw temp[0].64 -> vi0, const[2].32 */
 	k1c[1] = 0xf4000002;	/* doutu const[0].64, end */
 	k1c[2] = 0xd3000000;
@@ -760,7 +792,21 @@ static int g4p_c7_stream(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 	w[9] = po + G4P_PDS_C7_K1_CODE;
 	w[10] = w[11] = w[12] = 0;
 	w[13] = 1 << 27;
-	w[14] = 0x80000000;			/* STREAM_TERMINATE */
+	/*
+	 * K2: Mesa's compute fence kernel (pvr_arch_compute_generate_fence): PDS-only, fence = wait for the USC
+	 * fence acknowledgement, sd_type PDS, frees the shared registers; program = the fence terminate at +0x100.
+	 */
+	if (!c7_fence) {
+		w[14] = 0x80000000;		/* STREAM_TERMINATE */
+		wmb();
+		return 0;
+	}
+	w[14] = 1 << 2 | 1 << 1 | 1;		/* KERNEL0: pds data 1, target any, fence */
+	w[15] = (po + G4P_PDS_TERM_DATA) | 1 << 2 | 1 << 1;	/* KERNEL1: sd_type PDS, usc_common_shared */
+	w[16] = po + G4P_PDS_TERM_CODE;
+	w[17] = w[18] = w[19] = 0;
+	w[20] = 1 << 27;
+	w[21] = 0x80000000;			/* STREAM_TERMINATE */
 	wmb();
 	return 0;
 }
@@ -835,6 +881,12 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		ret = g4p_c7_stream(g, b, j);
 		if (ret)
 			return ret;
+		/*
+		 * RGX_CR_MCU_FENCE (0x1740, DDK): where the MCU writes a USC fence acknowledgement; it reads 0 here,
+		 * so the fence kernel waits forever (8.42). Point it at a scratch line in the shared heap, DM compute.
+		 */
+		if (c7_mcu_fence)
+			writeq(2ULL << 40 | ((j->misc.gpuva + 0xf00) & GENMASK_ULL(39, 5)), g->rgx + 0x1740);
 	}
 	if (which == 4 && c4_pattern == 2) {
 		u32 po = b->pds.gpuva - G4P_PDS_VA;
