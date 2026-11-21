@@ -628,6 +628,79 @@ static void g4p_c5_stream(struct g4p_boot *b, struct g4p_cljob *j)
 	wmb();
 }
 
+/*
+ * C6 (GPU-BRINGUP 8.40): the same 1x1x1 dispatch, but the PDS program only sets the instance index (doutw
+ * vi0 = 0) and kicks a USC task (doutu); the USC shader does the store. Shader: GLSL
+ *   layout(local_size_x = 1) in; buffer_reference P { uint v; };
+ *   void main() { P p = P(uvec2(0x800, 0x3)); p.v = 0x1234u; }
+ * compiled by Mesa's pco for Series 6XT (BVNC 4.40.2.51, drm-shim). It stores 0x1234 to GPU VA 0x300000800
+ * (r1/r2 = address, r3 = value; st.writeback; wdf) behind the guard vi0 < 1. USC temps 5.
+ * The USC code sits in the PDS page; USC execution offsets are assumed relative to 0x300000000 (iOS has one
+ * "CodeHeap" for both) [G].
+ */
+#define G4P_USC_C6_CODE		0x600
+
+static unsigned int c6_probe;
+module_param(c6_probe, uint, 0644);
+MODULE_PARM_DESC(c6_probe, "C6 probes: 1 = USC code offset on an unmapped page, 2 = shader store address 0x300001800 (unmapped)");
+
+static const u32 g4p_usc_store[] = {
+	0xd300d299, 0x9cc1f03c, 0x8087871e, 0x011190cf, 0x82444020, 0x00002067,
+	0xc098ff44, 0xf13cd300, 0x871e9ca0, 0x1180cfc0, 0x82442000, 0x00443867,
+	0x8004ff44, 0x00360460, 0x92860000, 0x08001340, 0x00000000, 0x9286ff41,
+	0x12341340, 0x00000000, 0x8234ff43, 0x00038700, 0xa0654200, 0x0865f200,
+	0xff004143, 0xff6a8002, 0x24678244, 0xff440044, 0x00ee8004, 0xfffffff2,
+};
+
+/* the same shader without pco's instance check (vi0 < workgroup size): just the store (temps 6) */
+static const u32 g4p_usc_store_ng[] = {
+	0x13409286, 0x00000800, 0xff430000, 0x13409286, 0x00001234, 0xff450000,
+	0x87008234, 0x44000003, 0xf200a065, 0x43450865, 0x8003ff00, 0xfff1ff6a,
+	0x00ee8004, 0xfffffff2,
+};
+
+static unsigned int c6_shader = 1;
+module_param(c6_shader, uint, 0644);
+MODULE_PARM_DESC(c6_shader, "C6 shader: 0 = with pco's instance check, 1 = without (default)");
+
+static void g4p_c6_stream(struct g4p_boot *b, struct g4p_cljob *j)
+{
+	u32 po = b->pds.gpuva - G4P_PDS_VA;
+	u64 doutu = (po + G4P_USC_C6_CODE + (c6_probe == 1 ? SZ_4K : 0)) | (u64)DIV_ROUND_UP(6, 4) << 35;
+	u32 *code = b->pds.cpu + G4P_PDS_C5_CODE, *data = b->pds.cpu + G4P_PDS_C5_DATA;
+	u32 *w = j->misc.cpu + 0x800;
+
+	u32 *usc = b->pds.cpu + G4P_USC_C6_CODE;
+
+	if (c6_shader == 1) {
+		memcpy(usc, g4p_usc_store_ng, sizeof(g4p_usc_store_ng));
+		if (c6_probe == 2)
+			usc[1] = 0x00001800;	/* the address immediate: 0x300001800 (unmapped) */
+		if (c6_probe == 3)
+			usc[1] = 0x00010000;	/* 0x300010000 (unmapped) */
+	} else {
+		memcpy(usc, g4p_usc_store, sizeof(g4p_usc_store));
+		if (c6_probe == 2)	/* the address immediate (0x800) is bytes 0x3e..0x41: make it 0x1800 */
+			usc[15] = 0x18001340;
+	}
+	code[0] = 0xf0040101;	/* doutw const[2].64 (vi0, vi1 = 0), const[4].32 (control) */
+	code[1] = 0xf4000002;	/* doutu const[0].64, end */
+	code[2] = 0xd3000000;	/* halt */
+	data[0] = lower_32_bits(doutu);
+	data[1] = upper_32_bits(doutu);
+	data[2] = 0;
+	data[3] = 0;
+	data[4] = 0x80000002;	/* doutw: last, unified store, offset 0, 64 bits */
+	data[5] = data[6] = data[7] = 0;
+	w[0] = 1 << 12 | 2 << 2 | 1 << 1;	/* KERNEL0: usc unified 1 (x16 B), pds data 2 (x16 B), usc target any */
+	w[1] = po + G4P_PDS_C5_DATA;		/* KERNEL1 */
+	w[2] = po + G4P_PDS_C5_CODE;		/* KERNEL2 */
+	w[3] = w[4] = w[5] = 0;			/* 1 x 1 x 1 workgroups */
+	w[6] = 1 << 27;				/* KERNEL8: max instances 1, workgroup size 1 x 1 x 1 */
+	w[7] = 0x80000000;			/* STREAM_TERMINATE */
+	wmb();
+}
+
 int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 {
 	struct g4p_boot *b = g->boot;
@@ -639,7 +712,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	int wr, cwr, ret;
 	bool first;
 
-	if (which < 2 || which > 5)
+	if (which < 2 || which > 6)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
@@ -692,6 +765,8 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		w32a(j->misc.cpu, 0x800, 0x80000000);	/* CDM STREAM_TERMINATE: an empty resume stream */
 	if (which == 5)
 		g4p_c5_stream(b, j);
+	if (which == 6)
+		g4p_c6_stream(b, j);
 	if (which == 4 && c4_pattern == 2) {
 		u32 po = b->pds.gpuva - G4P_PDS_VA;
 
@@ -779,8 +854,12 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	j->chan_10 = READ_ONCE(*(u32 *)(ctl + 0x10));
 	j->stamp0 = READ_ONCE(*(u32 *)j->misc.cpu);
 	j->stamp1 = READ_ONCE(*(u32 *)(j->misc.cpu + 4));
-	if (which == 5)
-		dev_info(g->dev, "C5: word at GPU VA 0x%llx = 0x%08x (kernel stores 0x%x)\n",
+	if (which >= 5)
+		for (unsigned int o = 0; o < SZ_4K; o += 4)	/* where did the value land? */
+			if (READ_ONCE(*(u32 *)(b->pds.cpu + o)) == G4P_C5_VALUE)
+				dev_info(g->dev, "C%u: 0x%x found at PDS page +0x%x\n", which, G4P_C5_VALUE, o);
+	if (which >= 5)
+		dev_info(g->dev, "C%u: word at GPU VA 0x%llx = 0x%08x (kernel stores 0x%x)\n", which,
 			 (u64)b->pds.gpuva + G4P_C5_OUT, READ_ONCE(*(u32 *)(b->pds.cpu + G4P_C5_OUT)), G4P_C5_VALUE);
 	j->irqs = atomic_read(&g->irq_count) - j->irq0;
 	if (g4p_gpu_running(g)) {
