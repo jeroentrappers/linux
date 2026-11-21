@@ -305,7 +305,7 @@ static int g4p_devctl_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_devctl_fops, NULL, g4p_devctl_set, "%llu\n");
 
-/* M5 checkpoints (re/GPU-FIRST-JOB.md 7): echo 1..5 > cl: C1 (empty channel), C2, C3 (empty job), C4 (+ resume stream, PDS), C5 (PDS-only kernel) */
+/* M5 checkpoints (re/GPU-FIRST-JOB.md 7): echo 1..5 > cl: C1 (empty channel), C2, C3 (empty job), C4 (+ resume stream, PDS), C5 (PDS-only kernel), C6/C7 (USC), C8 (job image) */
 static int g4p_cl_set(void *data, u64 val)
 {
 	struct g4p *g = data;
@@ -313,7 +313,7 @@ static int g4p_cl_set(void *data, u64 val)
 
 	if (!experimental)
 		return -EPERM;
-	if (val < 1 || val > 7)
+	if (val < 1 || val > 8)
 		return -EINVAL;
 	mutex_lock(&g->lock);
 	ret = val == 1 ? g4p_boot_cl_c1(g) : g4p_boot_cl_job(g, val);
@@ -321,6 +321,30 @@ static int g4p_cl_set(void *data, u64 val)
 	return ret;
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_cl_fops, NULL, g4p_cl_set, "%llu\n");
+
+/* C8 readback (g4p_boot.c): command, misc, streams and the code-heap window, as host memory */
+static ssize_t g4p_c8mem_read(struct file *f, char __user *ubuf, size_t len, loff_t *pos)
+{
+	struct g4p *g = f->private_data;
+	void *buf = NULL;
+	ssize_t size, ret;
+
+	mutex_lock(&g->lock);
+	size = g4p_boot_c8mem(g, &buf);
+	mutex_unlock(&g->lock);
+	if (size < 0)
+		return size;
+	ret = simple_read_from_buffer(ubuf, len, pos, buf, size);
+	vfree(buf);
+	return ret;
+}
+
+static const struct file_operations g4p_c8mem_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = g4p_c8mem_read,
+	.llseek = default_llseek,
+};
 
 /* ------------------------------------------------------------------------------------------------ */
 /* probe: map and parse only, no register access */
@@ -396,6 +420,7 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("boot", 0200, g->debugfs, g, &g4p_boot_fops);
 	debugfs_create_file("devctl", 0200, g->debugfs, g, &g4p_devctl_fops);
 	debugfs_create_file("cl", 0200, g->debugfs, g, &g4p_cl_fops);
+	debugfs_create_file("c8mem", 0400, g->debugfs, g, &g4p_c8mem_fops);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }

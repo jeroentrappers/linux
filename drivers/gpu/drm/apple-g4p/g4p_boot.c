@@ -21,6 +21,7 @@
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 
 #include "g4p.h"
 
@@ -101,7 +102,7 @@ struct g4p_boot {
 	struct g4p_bo pds;		/* one page at G4P_PDS_VA: C4's CDM terminate program */
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
-		unsigned int which, stream_words, us;
+		unsigned int which, stream_words, us, timeout_ms;
 		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
 		int irq0, irqs;
 		u64 fault[4];
@@ -214,16 +215,28 @@ MODULE_PARM_DESC(c4_ctx, "C4: point the context PDS fields (cmd+0x224/+0x22c -> 
 module_param(c4_prog, uint, 0644);
 MODULE_PARM_DESC(c4_prog, "C4 terminate program: 0 = Mesa fence terminate (5 instructions), 1 = doutc; halt, 2 = code address on an unmapped PDS page (does the CDM fetch it?), 3 = also a halt at PDS offset 0, 4 = page moved to +0x1000 (offset 0 unmapped)");
 
+/*
+ * C8 (re/GPU-SESSIONS.md): the PDS page can grow into a code-heap window of heap_pages pages from
+ * G4P_PDS_VA, so code heaps captured on iOS (PDS offsets up to 0x14000+) can be replayed at their own offsets.
+ * Mapped before the boot like the rest; the default of one page keeps the C4..C7 unmapped-page probes valid.
+ */
+#define G4P_HEAP_PAGES_MAX	32
+static unsigned int heap_pages = 1;
+module_param(heap_pages, uint, 0644);
+MODULE_PARM_DESC(heap_pages, "pages of the code-heap window at GPU VA 0x300000000 (1..32, read at boot; C8)");
+
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b);
 
 static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
 {
 	struct g4p_bo *p = &b->pds;
+	size_t size = clamp(heap_pages, 1U, (unsigned int)G4P_HEAP_PAGES_MAX) * SZ_4K;
+	int ret = 0;
 
-	p->cpu = dma_alloc_coherent(g->dev, SZ_4K, &p->dma, GFP_KERNEL);
+	p->cpu = dma_alloc_coherent(g->dev, size, &p->dma, GFP_KERNEL);
 	if (!p->cpu)
 		return -ENOMEM;
-	p->size = SZ_4K;
+	p->size = size;
 	p->gpuva = G4P_PDS_VA + (c4_prog == 4 ? SZ_4K : 0);
 	if (c4_prog == 3)
 		*(u32 *)p->cpu = 0xd3000000;	/* halt: for a program that the CDM runs from a zero register */
@@ -232,7 +245,9 @@ static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
 		memcpy(p->cpu + G4P_PDS_TERM_CODE, g4p_pds_doutc_halt, sizeof(g4p_pds_doutc_halt));
 	else
 		memcpy(p->cpu + G4P_PDS_TERM_CODE, g4p_pds_fence_terminate, sizeof(g4p_pds_fence_terminate));
-	return g4p_mmu_map_page(g->dev, &b->mmu, p->gpuva, p->dma, G4P_PTE_SLC_BYPASS);
+	for (size_t off = 0; off < size && !ret; off += SZ_4K)
+		ret = g4p_mmu_map_page(g->dev, &b->mmu, p->gpuva + off, p->dma + off, G4P_PTE_SLC_BYPASS);
+	return ret;
 }
 
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
@@ -811,6 +826,142 @@ static int g4p_c7_stream(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 	return 0;
 }
 
+/*
+ * C8 (re/GPU-SESSIONS.md): a data-driven job. /lib/firmware/agx-g4p-job.bin (built by tools/gpulinux/g4pjob.py)
+ * is a header {magic "G4PJ", version 1, flags, timeout_ms} and records {type, off, len, data[len] padded to 4}:
+ *   1 HEAP    bytes into the code-heap window at PDS offset off (GPU VA 0x300000000 + off)
+ *   2 STREAM  bytes into the CDM control stream (cmd+0x78 -> misc +0x800) at off; at most 0x700 bytes
+ *   3 CMD     bytes into the command at off, after the C4..C7 defaults; the harness's own fields (stream
+ *             pointer/size +0x1e8..+0x1ef, stamps +0x260..+0x26f) are refused
+ *   4 REG     a 64-bit RGX register write before the kick (off = register, data = value), allow-listed
+ * Everything else is as C7: terminate program, PDS1 word, stamps, the same kick and finish records. The heap
+ * window, the command and the misc page are read back through debugfs apple-g4p/c8mem before the power-off.
+ */
+#define G4P_JOB_MAGIC		0x4a503447	/* "G4PJ" */
+#define G4P_JOB_HEAP		1
+#define G4P_JOB_STREAM		2
+#define G4P_JOB_CMD		3
+#define G4P_JOB_REG		4
+#define G4P_JOB_STREAM_MAX	0x700
+
+static const u32 g4p_job_regs[] = {
+	0x1740,	/* RGX_CR_MCU_FENCE */
+};
+
+static int g4p_c8_job(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
+{
+	const struct firmware *fw;
+	const u8 *d, *end;
+	u32 hdr[4];
+	unsigned int nrec = 0;
+	int ret;
+
+	ret = request_firmware(&fw, "agx-g4p-job.bin", g->dev);
+	if (ret)
+		return ret;
+	ret = -EINVAL;
+	if (fw->size < sizeof(hdr) || fw->size > SZ_1M)
+		goto out;
+	memcpy(hdr, fw->data, sizeof(hdr));
+	if (hdr[0] != G4P_JOB_MAGIC || hdr[1] != 1)
+		goto out;
+	j->timeout_ms = hdr[3] ? min(hdr[3], 10000U) : 1000;
+	/* default stream: STREAM_TERMINATE only */
+	w32a(j->misc.cpu, 0x800, 0x80000000);
+	d = fw->data + sizeof(hdr);
+	end = fw->data + fw->size;
+	while (d < end) {
+		u32 r[3];
+		size_t padded;
+		u64 v;
+
+		if (end - d < sizeof(r))
+			goto out;
+		memcpy(r, d, sizeof(r));
+		d += sizeof(r);
+		padded = ALIGN((size_t)r[2], 4);
+		if (padded < r[2] || end - d < padded)
+			goto out;
+		switch (r[0]) {
+		case G4P_JOB_HEAP:
+			if ((u64)r[1] + r[2] > b->pds.size)
+				goto out;
+			memcpy(b->pds.cpu + r[1], d, r[2]);
+			break;
+		case G4P_JOB_STREAM:
+			if ((u64)r[1] + r[2] > G4P_JOB_STREAM_MAX)
+				goto out;
+			memcpy(j->misc.cpu + 0x800 + r[1], d, r[2]);
+			break;
+		case G4P_JOB_CMD:
+			if ((u64)r[1] + r[2] > G4P_CDM_CMD_SIZE)
+				goto out;
+			if ((r[1] < 0x1f0 && r[1] + r[2] > 0x1e8) || (r[1] < 0x270 && r[1] + r[2] > 0x260))
+				goto out;
+			memcpy(j->cmd.cpu + r[1], d, r[2]);
+			break;
+		case G4P_JOB_REG:
+			if (r[2] != 8)
+				goto out;
+			for (unsigned int i = 0; i < ARRAY_SIZE(g4p_job_regs); i++)
+				if (g4p_job_regs[i] == r[1])
+					goto reg_ok;
+			goto out;
+reg_ok:
+			memcpy(&v, d, 8);
+			writeq(v, g->rgx + r[1]);
+			break;
+		default:
+			goto out;
+		}
+		d += padded;
+		nrec++;
+	}
+	wmb();
+	dev_info(g->dev, "C8: %u records from agx-g4p-job.bin (%zu bytes), flags 0x%x, timeout %u ms\n", nrec,
+		 fw->size, hdr[2], j->timeout_ms);
+	ret = 0;
+out:
+	if (ret)
+		dev_err(g->dev, "C8: bad job image at record %u\n", nrec);
+	release_firmware(fw);
+	return ret;
+}
+
+/*
+ * debugfs apple-g4p/c8mem: 0x0000 command (4 KiB), 0x1000 misc page (stamps; stream at +0x800), 0x2000 command
+ * stream, 0x3000 CDM page, 0x10000 code-heap window. Host memory only: no register access.
+ */
+#define G4P_C8MEM_HEAP		0x10000
+
+ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
+{
+	struct g4p_boot *b = g->boot;
+	struct g4p_cljob *j;
+	size_t size;
+	void *buf;
+
+	if (!b || !b->pds.cpu)
+		return -ENODEV;
+	j = &b->job;
+	size = G4P_C8MEM_HEAP + b->pds.size;
+	buf = vzalloc(size);
+	if (!buf)
+		return -ENOMEM;
+	rmb();
+	if (j->cmd.cpu)
+		memcpy(buf, j->cmd.cpu, min_t(size_t, j->cmd.size, SZ_4K));
+	if (j->misc.cpu)
+		memcpy(buf + 0x1000, j->misc.cpu, SZ_4K);
+	if (j->stream.cpu)
+		memcpy(buf + 0x2000, j->stream.cpu, SZ_4K);
+	if (j->cdm.cpu)
+		memcpy(buf + 0x3000, j->cdm.cpu, SZ_4K);
+	memcpy(buf + G4P_C8MEM_HEAP, b->pds.cpu, b->pds.size);
+	*bufp = buf;
+	return size;
+}
+
 int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 {
 	struct g4p_boot *b = g->boot;
@@ -822,7 +973,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	int wr, cwr, ret;
 	bool first;
 
-	if (which < 2 || which > 7)
+	if (which < 2 || which > 8)
 		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
@@ -909,6 +1060,11 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 			w32a(j->cmd.cpu, 0x22c, 0x28000003);	/* pds_seq_dep, target, data size 1, fence */
 		}
 	}
+	if (which == 8) {
+		ret = g4p_c8_job(g, b, j);	/* after the defaults, so CMD records override them */
+		if (ret)
+			return ret;
+	}
 	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, true));
 	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
 	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
@@ -960,7 +1116,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
-	for (j->us = 0; j->us < (which >= 4 ? 1000000 : 200000); j->us += 20) {
+	for (j->us = 0; j->us < (which == 8 ? j->timeout_ms * 1000 : which >= 4 ? 1000000 : 200000); j->us += 20) {
 		if (READ_ONCE(*(u32 *)j->misc.cpu) == G4P_STAMP_VALUE)
 			break;
 		if (which == 2 && READ_ONCE(*(u32 *)ctl) == (u32)cwr)

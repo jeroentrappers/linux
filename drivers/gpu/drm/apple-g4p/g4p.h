@@ -131,6 +131,7 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g);
 int g4p_boot_devctl_nop(struct g4p *g, u32 type);
 int g4p_boot_cl_c1(struct g4p *g);
 int g4p_boot_cl_job(struct g4p *g, unsigned int which);
+ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);
 void g4p_boot_irq_off(struct g4p *g);
 void g4p_boot_irq_rings(struct g4p *g);
 
