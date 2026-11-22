@@ -57,6 +57,8 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_prime.h>
+#include <linux/dma-buf.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_managed.h>
@@ -339,8 +341,58 @@ static const struct vm_operations_struct adpt_vm_ops = {
 	.close = drm_gem_vm_close,
 };
 
+/*
+ * PRIME export of a carveout buffer (for the GPU to render into it, linux-on-iphone6 re/GPU-BRINGUP.md 9.15): the
+ * carveout has no struct pages for the generic helpers, so the attachment gets one DMA range = the physical
+ * address (importers without an IOMMU between them and memory, the A8 GPU's own MMU maps it).
+ */
+static struct sg_table *adpt_map_dma_buf(struct dma_buf_attachment *attach, enum dma_data_direction dir)
+{
+	struct adpt_bo *bo = to_bo((struct drm_gem_object *)attach->dmabuf->priv);
+	struct sg_table *sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+	if (sg_alloc_table(sgt, 1, GFP_KERNEL)) {
+		kfree(sgt);
+		return ERR_PTR(-ENOMEM);
+	}
+	sg_dma_address(sgt->sgl) = bo->phys;
+	sg_dma_len(sgt->sgl) = bo->base.size;
+	return sgt;
+}
+
+static void adpt_unmap_dma_buf(struct dma_buf_attachment *attach, struct sg_table *sgt, enum dma_data_direction dir)
+{
+	sg_free_table(sgt);
+	kfree(sgt);
+}
+
+static const struct dma_buf_ops adpt_dmabuf_ops = {
+	.map_dma_buf = adpt_map_dma_buf,
+	.unmap_dma_buf = adpt_unmap_dma_buf,
+	.release = drm_gem_dmabuf_release,
+	.mmap = drm_gem_dmabuf_mmap,
+};
+
+static struct dma_buf *adpt_bo_export(struct drm_gem_object *obj, int flags)
+{
+	struct dma_buf_export_info exp = {
+		.exp_name = KBUILD_MODNAME,
+		.owner = obj->dev->driver->fops->owner,
+		.ops = &adpt_dmabuf_ops,
+		.size = obj->size,
+		.flags = flags,
+		.priv = obj,
+		.resv = obj->resv,
+	};
+
+	return drm_gem_dmabuf_export(obj->dev, &exp);
+}
+
 static const struct drm_gem_object_funcs adpt_bo_funcs = {
 	.free = adpt_bo_free,
+	.export = adpt_bo_export,
 	.mmap = adpt_bo_mmap,
 	.vm_ops = &adpt_vm_ops,
 };
