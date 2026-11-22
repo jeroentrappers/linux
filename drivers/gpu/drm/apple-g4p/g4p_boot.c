@@ -102,7 +102,7 @@ struct g4p_boot {
 	struct g4p_bo pds;		/* one page at G4P_PDS_VA: C4's CDM terminate program */
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
-		unsigned int which, stream_words, us, timeout_ms;
+		unsigned int which, stream_words, us, timeout_ms, seq;	/* seq: jobs run in this boot */
 		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
 		int irq0, irqs;
 		u64 fault[4];
@@ -988,6 +988,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	void *ctl;
 	unsigned int n = 0, end;
 	int wr, cwr, ret;
+	u32 stamp;
 	bool first;
 
 	if (which < 2 || which > 8)
@@ -998,25 +999,40 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	ret = g4p_cl_channel(b);	/* set up only: the first ring 2 entry carries the command */
 	if (ret)
 		return ret;
-	if (b->job.cmd.cpu)
-		return -EBUSY;	/* one job per boot for now */
-	if (!g4p_gpu_running(g))
-		return -EIO;
 	j = &b->job;
 	/*
-	 * iOS keeps commands and command streams in the private heap (7) and passes the cached firmware form:
-	 * the firmware invalidates the D-cache lines before reading them (fw 0x10028220); with the uncached
-	 * form the first command read faulted on META (GPU-BRINGUP 8.33).
+	 * GPU-BRINGUP 8.63: C8 jobs can follow each other in one firmware boot on the same channel (the previous
+	 * one has completed: its stamp was seen, or it timed out and the caller powers off). The command, streams
+	 * and misc page are reused and cleared; each job gets its own stamp value. C2..C7 stay one per boot.
 	 */
-	ret = g4p_carve(b, 0, G4P_CDM_CMD_SIZE, &j->cmd);
-	if (!ret)
-		ret = g4p_carve(b, 0, SZ_4K, &j->stream);
-	if (!ret)
-		ret = g4p_carve(b, 1, SZ_4K, &j->cdm);
-	if (!ret)
-		ret = g4p_carve(b, 1, SZ_4K, &j->misc);
-	if (ret)
-		return ret;
+	if (j->cmd.cpu && which != 8)
+		return -EBUSY;
+	if (!g4p_gpu_running(g))
+		return -EIO;
+	if (j->cmd.cpu) {
+		if (j->stamp0 != (G4P_STAMP_VALUE + j->seq - 1))
+			return -EBUSY;	/* the previous job never completed: power-cycle first */
+		memset(j->cmd.cpu, 0, j->cmd.size);
+		memset(j->stream.cpu, 0, j->stream.size);
+		memset(j->cdm.cpu, 0, j->cdm.size);
+		memset(j->misc.cpu, 0, j->misc.size);
+	} else {
+		/*
+		 * iOS keeps commands and command streams in the private heap (7) and passes the cached firmware
+		 * form: the firmware invalidates the D-cache lines before reading them (fw 0x10028220); with the
+		 * uncached form the first command read faulted on META (GPU-BRINGUP 8.33).
+		 */
+		ret = g4p_carve(b, 0, G4P_CDM_CMD_SIZE, &j->cmd);
+		if (!ret)
+			ret = g4p_carve(b, 0, SZ_4K, &j->stream);
+		if (!ret)
+			ret = g4p_carve(b, 1, SZ_4K, &j->cdm);
+		if (!ret)
+			ret = g4p_carve(b, 1, SZ_4K, &j->misc);
+		if (ret)
+			return ret;
+	}
+	stamp = G4P_STAMP_VALUE + j->seq;
 	fcmd = g4p_fw_addr(j->cmd.gpuva, true);
 	fchan = g4p_fw_addr(b->cl_state.gpuva, false);
 	fa3 = g4p_fw_addr(g4p_fwinit_list_a_va(&b->fi) + 0x2400, true);	/* list A #3: CDM DM state */
@@ -1085,7 +1101,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	w32a(j->cmd.cpu, 0x1e8, g4p_fw_addr(j->stream.gpuva, true));
 	w32a(j->cmd.cpu, 0x260, g4p_fw_addr(j->misc.gpuva, false));
 	w32a(j->cmd.cpu, 0x264, g4p_fw_addr(j->misc.gpuva + 4, false));
-	w32a(j->cmd.cpu, 0x268, G4P_STAMP_VALUE);
+	w32a(j->cmd.cpu, 0x268, stamp);
 	w32a(j->cmd.cpu, 0x26c, 0);			/* stamp index: event 1 bit 0 */
 
 	/* the command stream (§4) */
@@ -1106,7 +1122,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		/* 7: finish (stamp); last word = stream offset of the end record */
 		end = (n + 11) * 4;
 		w[n++] = hdr7; w[n++] = fa3 + 0x720; w[n++] = fchan; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0;
-		w[n++] = 0; w[n++] = 0; w[n++] = g4p_fw_addr(j->misc.gpuva + 4, false); w[n++] = G4P_STAMP_VALUE; w[n++] = end;
+		w[n++] = 0; w[n++] = 0; w[n++] = g4p_fw_addr(j->misc.gpuva + 4, false); w[n++] = stamp; w[n++] = end;
 	}
 	w[n++] = 0x40000017;			/* 8: end */
 	w32a(j->cmd.cpu, 0x1ec, ALIGN(n * 4, 64));
@@ -1134,7 +1150,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
 	for (j->us = 0; j->us < (which == 8 ? j->timeout_ms * 1000 : which >= 4 ? 1000000 : 200000); j->us += 20) {
-		if (READ_ONCE(*(u32 *)j->misc.cpu) == G4P_STAMP_VALUE)
+		if (READ_ONCE(*(u32 *)j->misc.cpu) == stamp)
 			break;
 		if (which == 2 && READ_ONCE(*(u32 *)ctl) == (u32)cwr)
 			break;
@@ -1185,7 +1201,8 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	dev_info(g->dev, "C%u: %u stream words; after %u us: ring 2 read %u (write %d), channel read %u (+0x10 %u, write %d), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
 		 which, n, j->us, j->ring2_rd, wr, j->chan_rd, j->chan_10, cwr, j->stamp0, j->stamp1, j->irqs,
 		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);
-	return j->stamp0 == G4P_STAMP_VALUE || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
+	j->seq++;
+	return j->stamp0 == stamp || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
 }
 
 void g4p_boot_show(struct seq_file *s, struct g4p *g)
