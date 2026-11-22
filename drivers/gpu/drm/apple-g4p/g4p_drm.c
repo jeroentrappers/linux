@@ -300,6 +300,8 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		if (ret == 0 || ret == -ETIMEDOUT) {
 			g4p_boot_job_result(g, &a->stamp, &a->elapsed_us, a->fault);
 			a->status = ret ? 1 : 0;
+			if (ret)
+				g4p_recover_locked(g);	/* the next submit boots the firmware again */
 			ret = 0;
 		}
 	}

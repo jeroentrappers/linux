@@ -162,6 +162,7 @@ void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);
+void g4p_recover_locked(struct g4p *g);
 
 /* g4p_drm.c */
 struct g4p *g4p_drm_alloc(struct device *dev);

@@ -290,6 +290,13 @@ static int g4p_boot_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
+/* 8.65: after a job that did not complete (fault, hang): power off; the next submit boots again */
+void g4p_recover_locked(struct g4p *g)
+{
+	dev_warn(g->dev, "job did not complete: powering the GPU off for recovery\n");
+	g4p_power_off_locked(g);
+}
+
 /*
  * 8.64: for the DRM path. Power up and boot the firmware with the DRM pool mapped, unless a boot that maps it
  * is already running. A boot started through debugfs without the pool is refused (power it off first).
