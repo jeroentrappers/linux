@@ -79,7 +79,9 @@ struct g4p {
 	unsigned int pool_pages;
 	struct list_head sep_bos;		/* separate BOs (8.65), mapped into every boot */
 	struct list_head zombies;		/* their memory, freed while the GPU was on */
-	u64 sep_next;				/* next free GPU VA for them */
+	u64 sep_next;				/* next free GPU VA for them (context 0) */
+	unsigned long ctx_used;			/* R5: memory contexts owned by DRM files (bit n = context n) */
+	unsigned int job_ctx;			/* set during a DRM submit: the job's memory context */
 	struct delayed_work idle_work;		/* 8.67: power off after idle_ms without a submit */
 	/* 8.68: the one asynchronous job in flight */
 	bool job_async;				/* set during a submit: g4p_boot_cl_job returns after the kick */
@@ -109,6 +111,8 @@ enum g4p_heap {
 #define G4P_PTE_SLC_BYPASS	BIT_ULL(3)
 #define G4P_PTE_PM_META_PROTECT	BIT_ULL(62)
 
+#define G4P_NR_CTX	8	/* firmware memory contexts (CAT_BASE0..7); 0 = kernel */
+
 struct g4p_mmu {
 	u32 *pc;
 	u64 *pd;
@@ -124,6 +128,17 @@ struct g4p_mmu {
 	u64 *xpd, *xpt[512];
 	dma_addr_t xpd_dma, xpt_dma[512];
 	u64 xva;		/* 1 GiB aligned base of the entry, 0 = none */
+	/*
+	 * R5 (8.77): per-client memory contexts 1..7. Each has its own PC (a copy of the kernel's, context 0) with
+	 * its own PD for the extra entry: the low half (the pool, shared) points at the kernel's page tables, the
+	 * high half (the user VA range 0x320000000..) at the context's own. The firmware loads CAT_BASE[n] from
+	 * its context table; the CDM kick names the context (stream record 2, payload word 4).
+	 */
+	struct g4p_mmu_ctx {
+		u32 *pc;
+		u64 *pd, *pt[256];
+		dma_addr_t pc_dma, pd_dma, pt_dma[256];
+	} ctx[G4P_NR_CTX];
 };
 
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
@@ -131,6 +146,11 @@ void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu);
 int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, size_t size, u64 flags);
 int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags);
 void g4p_mmu_unmap_page(struct g4p_mmu *mmu, u64 va);
+int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx);
+void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx);
+int g4p_mmu_ctx_map_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, phys_addr_t pa,
+			 u64 flags);
+void g4p_mmu_ctx_unmap_page(struct g4p_mmu *mmu, unsigned int ctx, u64 va);
 int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, size_t size, u64 *gpuva);
 int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo);
 void g4p_bo_free(struct device *dev, struct g4p_bo *bo);
@@ -150,7 +170,8 @@ void g4p_fwinit_free(struct device *dev, struct g4p_fwinit *fi);
 bool g4p_fwinit_event(struct g4p_fwinit *fi, u32 *type, u32 *payload);
 void g4p_fwinit_show_log(struct seq_file *s, struct g4p_fwinit *fi);
 void g4p_fwinit_show_events(struct seq_file *s, struct g4p_fwinit *fi);
-void g4p_fwinit_gart_inval(struct g4p_fwinit *fi);
+void g4p_fwinit_gart_inval(struct g4p_fwinit *fi, unsigned int ctx);
+void g4p_fwinit_set_ctx(struct g4p_fwinit *fi, unsigned int ctx, u64 pc_dma);
 void g4p_fwinit_ack_trace_stats(struct g4p_fwinit *fi);
 u32 g4p_fwinit_ring_ctl(struct g4p_fwinit *fi, unsigned int which, unsigned int off);
 int g4p_fwinit_ring_push(struct g4p_fwinit *fi, unsigned int ring, const u32 *entry);
@@ -168,12 +189,17 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);
 void g4p_boot_irq_off(struct g4p *g);
 void g4p_boot_irq_rings(struct g4p *g);
 bool g4p_boot_uses_pool(struct g4p *g);
-int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size);
-void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size);
+int g4p_boot_map_range(struct g4p *g, unsigned int ctx, u64 va, dma_addr_t dma, size_t size);
+void g4p_boot_unmap_range(struct g4p *g, unsigned int ctx, u64 va, size_t size);
+int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx);
+void g4p_boot_ctx_detach(struct g4p *g, unsigned int ctx);
 int g4p_drm_map_separate(struct g4p *g);	/* g4p_drm.c: map all separate BOs into a new boot */
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
 bool g4p_boot_job_done(struct g4p *g, u32 n);
 u32 g4p_boot_next_job(struct g4p *g);
+void g4p_boot_job_dbg(struct g4p *g, u32 n);
+void g4p_boot_job_retire(struct g4p *g, u32 n);
+void g4p_boot_stall_dbg(struct g4p *g);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);

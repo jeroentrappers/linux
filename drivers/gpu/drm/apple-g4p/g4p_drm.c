@@ -7,7 +7,9 @@
  * (post-boot mappings are not reliable yet, 8.34). Buffers are page ranges of the pool; page 0 holds the
  * driver's own PDS programs. SUBMIT runs a job image in the C8 record format (g4p_boot.c g4p_c8_job) on the
  * firmware's compute channel and waits for its completion stamp; jobs follow each other in one firmware boot
- * (8.63). Not yet: VM_BIND, sync objects, a scheduler, runtime PM.
+ * (8.63). Since then: separate BOs and VM_BIND (8.65, 8.71), async submits with sync objects (8.68, 8.69),
+ * idle power-off (8.67) and (R5, 8.77) one GPU memory context per open file: separate BOs live in the file's
+ * own page tables, the pool (code) stays shared by all.
  */
 
 #include <linux/bitmap.h>
@@ -45,6 +47,13 @@ struct g4p_gem {
 	struct g4p_bo mem;		/* own allocation, mapped at mem.gpuva */
 	struct list_head node;		/* g->sep_bos, while mapped */
 	bool mapped;
+	unsigned int ctx;		/* R5: the memory context of the file that created it */
+};
+
+/* R5 (8.77): per DRM file: its own GPU memory context (1..7) and VA allocator for separate BOs */
+struct g4p_file {
+	unsigned int ctx;
+	u64 sep_next;
 };
 
 #define G4P_SEP_VA	0x320000000ULL
@@ -98,6 +107,11 @@ static struct dma_fence *g4p_wait_target(struct g4p *g, bool all);
  * 8.70: the GPU MMU invalidate that the firmware runs at a kick (gart_inval) only takes effect for the job after
  * that one: a job right after an unmap can still use the old translation, any later job faults. So after an
  * unmap one empty job (STREAM_TERMINATE only) makes the unmap effective, and the memory can be freed.
+ *
+ * 8.78: the same empty job is what completes a job: some of a compute job's stores are still in a GPU cache
+ * when its stamp is written, and reach memory only at the next kick, translated in *that* kick's memory
+ * context (seen: another client's buffer at the same VA received them). So every DRM job is followed by an
+ * empty job in its own context (g->job_ctx), and its fence waits for that one.
  */
 static int g4p_flush_unmap_locked(struct g4p *g)
 {
@@ -127,7 +141,7 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 		dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
 	} else if (bo->separate) {
 		list_del(&bo->node);
-		g4p_boot_unmap_range(g, bo->mem.gpuva, bo->mem.size);
+		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 		if (g->powered && g->boot && g4p_flush_unmap_locked(g)) {
 			/* the flush job failed: park the memory until the GPU is off (and recover) */
 			struct g4p_zombie *z = kmalloc(sizeof(*z), GFP_KERNEL);
@@ -196,6 +210,9 @@ static int g4p_ioctl_get_param(struct drm_device *drm, void *data, struct drm_fi
 	case DRM_APPLE_G4P_PARAM_CORE_REVISION:
 		a->value = g->have_id ? g->core_rev : 0;
 		return 0;
+	case DRM_APPLE_G4P_PARAM_MEMORY_CONTEXT:
+		a->value = ((struct g4p_file *)file->driver_priv)->ctx;
+		return 0;
 	}
 	return -EINVAL;
 }
@@ -208,17 +225,19 @@ int g4p_drm_map_separate(struct g4p *g)
 
 	list_for_each_entry(bo, &g->sep_bos, node)
 		if (!ret)
-			ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
+			ret = g4p_boot_map_range(g, bo->ctx, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
 	return ret;
 }
 
 static int g4p_bo_create_separate(struct g4p *g, struct drm_file *file, struct g4p_gem *bo, unsigned int n,
 				  struct drm_apple_g4p_bo_create *a)
 {
+	struct g4p_file *gf = file->driver_priv;
 	size_t size = (size_t)n * SZ_4K;
 	int ret;
 
 	bo->separate = true;
+	bo->ctx = gf->ctx;
 	bo->npages = n;	/* mmap size check */
 	bo->mem.cpu = dma_alloc_coherent(g->dev, size, &bo->mem.dma, GFP_KERNEL);
 	if (!bo->mem.cpu) {
@@ -230,16 +249,21 @@ static int g4p_bo_create_separate(struct g4p *g, struct drm_file *file, struct g
 	ret = 0;
 	if (!(a->flags & APPLE_G4P_BO_NOMAP)) {
 		/* driver-chosen VA from the top half of the user range (VM_BIND users get the bottom half) */
-		if (!g->sep_next)
-			g->sep_next = G4P_SEP_VA;
-		bo->mem.gpuva = g->sep_next;
-		g->sep_next += ALIGN(size, SZ_64K);	/* a gap between buffers: overruns fault */
-		ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, size);	/* post-boot if running */
+		if (!gf->sep_next)
+			gf->sep_next = G4P_SEP_VA;
+		if (gf->sep_next + size > APPLE_G4P_USER_VA_END) {
+			ret = -ENOSPC;
+			goto unlock;
+		}
+		bo->mem.gpuva = gf->sep_next;
+		gf->sep_next += ALIGN(size, SZ_64K);	/* a gap between buffers: overruns fault */
+		ret = g4p_boot_map_range(g, bo->ctx, bo->mem.gpuva, bo->mem.dma, size);	/* post-boot if running */
 		if (!ret) {
 			list_add_tail(&bo->node, &g->sep_bos);
 			bo->mapped = true;
 		}
 	}
+unlock:
 	mutex_unlock(&g->lock);
 	if (ret) {
 		dma_free_coherent(g->dev, size, bo->mem.cpu, bo->mem.dma);
@@ -261,13 +285,13 @@ static int g4p_bo_create_separate(struct g4p *g, struct drm_file *file, struct g
 	return 0;
 }
 
-/* 8.71: does [va, va + size) overlap a mapped separate BO? */
-static bool g4p_va_busy(struct g4p *g, u64 va, u64 size)
+/* 8.71: does [va, va + size) overlap a mapped separate BO of memory context ctx? */
+static bool g4p_va_busy(struct g4p *g, unsigned int ctx, u64 va, u64 size)
 {
 	struct g4p_gem *o;
 
 	list_for_each_entry(o, &g->sep_bos, node)
-		if (va < o->mem.gpuva + o->mem.size && o->mem.gpuva < va + size)
+		if (o->ctx == ctx && va < o->mem.gpuva + o->mem.size && o->mem.gpuva < va + size)
 			return true;
 	return false;
 }
@@ -285,7 +309,7 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 	if (!obj)
 		return -ENOENT;
 	bo = to_g4p_gem(obj);
-	if (!bo->separate) {
+	if (!bo->separate || bo->ctx != ((struct g4p_file *)file->driver_priv)->ctx) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -301,11 +325,11 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 		if (bo->mapped || !IS_ALIGNED(a->gpu_va, SZ_4K) || a->gpu_va < APPLE_G4P_USER_VA_START ||
 		    a->gpu_va + bo->mem.size > APPLE_G4P_USER_VA_END) {
 			ret = -EINVAL;
-		} else if (g4p_va_busy(g, a->gpu_va, bo->mem.size)) {
+		} else if (g4p_va_busy(g, bo->ctx, a->gpu_va, bo->mem.size)) {
 			ret = -EBUSY;
 		} else {
 			bo->mem.gpuva = a->gpu_va;
-			ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
+			ret = g4p_boot_map_range(g, bo->ctx, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
 			if (!ret) {
 				list_add_tail(&bo->node, &g->sep_bos);
 				bo->mapped = true;
@@ -319,7 +343,7 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 		}
 		list_del(&bo->node);
 		bo->mapped = false;
-		g4p_boot_unmap_range(g, bo->mem.gpuva, bo->mem.size);
+		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 		if (g->powered && g->boot && g4p_flush_unmap_locked(g))
 			g4p_recover_locked(g);	/* the flush job failed: power off, the next boot maps without it */
 		break;
@@ -391,7 +415,8 @@ static const struct dma_fence_ops g4p_fence_ops = {
 	.get_timeline_name = g4p_fence_timeline,
 };
 
-#define G4P_FQ	8	/* = G4P_JOB_SLOTS (g4p_boot.c) */
+#define G4P_FQ		8	/* = G4P_JOB_SLOTS (g4p_boot.c) */
+#define G4P_INFLIGHT	(G4P_FQ / 2)	/* submits in flight: two job slots each (8.78) */
 
 /* complete jobs in flight, oldest first, while their stamps are in memory (IRQ or process context) */
 void g4p_drm_irq(struct g4p *g)
@@ -401,7 +426,12 @@ void g4p_drm_irq(struct g4p *g)
 	unsigned long flags;
 
 	spin_lock_irqsave(&g->fence_lock, flags);
-	while (g->fq_tail != g->fq_head && g4p_boot_job_done(g, g->fq_job[g->fq_tail % G4P_FQ])) {
+	/*
+	 * each entry: the job and its write-back job right after it (8.78). The firmware skips the first one's
+	 * stamp (the second is already queued), so the second's stamp completes both.
+	 */
+	while (g->fq_tail != g->fq_head && g4p_boot_job_done(g, g->fq_job[g->fq_tail % G4P_FQ] + 1)) {
+		g4p_boot_job_retire(g, g->fq_job[g->fq_tail % G4P_FQ]);
 		done[n++] = g->fq[g->fq_tail % G4P_FQ];
 		g->fq[g->fq_tail % G4P_FQ] = NULL;
 		g->fq_tail++;
@@ -445,6 +475,11 @@ static void g4p_timeout_work(struct work_struct *w)
 	mutex_lock(&g->lock);
 	g4p_drm_irq(g);	/* a missed interrupt: check the stamps once more */
 	if (g->fq_tail != g->fq_head) {
+		g4p_boot_stall_dbg(g);
+		for (u32 i = g->fq_tail; i != g->fq_head; i++) {
+			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ]);
+			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ] + 1);
+		}
 		g4p_fail_inflight(g, -ETIMEDOUT);
 		g4p_recover_locked(g);
 	}
@@ -457,7 +492,7 @@ static struct dma_fence *g4p_wait_target(struct g4p *g, bool all)
 	struct dma_fence *f = NULL;
 
 	spin_lock_irq(&g->fence_lock);
-	if (g->fq_head - g->fq_tail >= (all ? 1 : G4P_FQ))
+	if (g->fq_head - g->fq_tail >= (all ? 1 : G4P_INFLIGHT))
 		f = dma_fence_get(g->fq[(all ? g->fq_head - 1 : g->fq_tail) % G4P_FQ]);
 	spin_unlock_irq(&g->fence_lock);
 	return f;
@@ -512,6 +547,9 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	ret = g4p_pool_get_locked(g);
 	if (!ret)
 		ret = g4p_ensure_booted_locked(g);
+	if (!ret)	/* R5: the file's memory context in this boot (CAT_BASE[ctx] loaded before the kick) */
+		ret = g4p_boot_ctx_attach(g, ((struct g4p_file *)file->driver_priv)->ctx);
+	g->job_ctx = ((struct g4p_file *)file->driver_priv)->ctx;
 	if (!ret && async) {
 		struct dma_fence *f = kzalloc(sizeof(*f), GFP_KERNEL);
 
@@ -523,7 +561,7 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 			g->job_img_size = a->job_size;
 			g->job_async = true;
 			spin_lock_irq(&g->fence_lock);
-			if (g->fq_head - g->fq_tail >= G4P_FQ) {
+			if (g->fq_head - g->fq_tail >= G4P_INFLIGHT) {
 				ret = -EBUSY;	/* raced with another submitter: user space retries */
 			} else {
 				g->fq_job[g->fq_head % G4P_FQ] = g4p_boot_next_job(g);
@@ -533,6 +571,8 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 			spin_unlock_irq(&g->fence_lock);
 			if (!ret)
 				ret = g4p_boot_cl_job(g, 8);
+			if (!ret)	/* its write-back job, same context (8.78) */
+				ret = g4p_flush_unmap_locked(g);
 			g->job_async = false;
 			g->job_img = NULL;
 			if (ret == -EBUSY && g->fq[(g->fq_head - 1) % G4P_FQ] != f) {
@@ -556,12 +596,15 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		g->job_img = NULL;
 		if (ret == 0 || ret == -ETIMEDOUT) {
 			g4p_boot_job_result(g, &a->stamp, &a->elapsed_us, a->fault);
+			if (!ret)	/* its write-back job, same context (8.78) */
+				ret = g4p_flush_unmap_locked(g);
 			a->status = ret ? 1 : 0;
 			if (ret)
 				g4p_recover_locked(g);	/* the next submit boots the firmware again */
 			ret = 0;
 		}
 	}
+	g->job_ctx = 0;
 	if (idle_ms && g->boot)
 		mod_delayed_work(system_wq, &g->idle_work, msecs_to_jiffies(idle_ms));
 	mutex_unlock(&g->lock);
@@ -580,10 +623,68 @@ static const struct drm_ioctl_desc g4p_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_VM_BIND, g4p_ioctl_vm_bind, DRM_RENDER_ALLOW),
 };
 
+/* R5 (8.77): each open file gets one of the firmware's memory contexts 1..7 (0 is the kernel's) */
+static int g4p_drm_open(struct drm_device *drm, struct drm_file *file)
+{
+	struct g4p *g = to_g4p(drm);
+	struct g4p_file *gf = kzalloc(sizeof(*gf), GFP_KERNEL);
+	unsigned int c;
+
+	if (!gf)
+		return -ENOMEM;
+	mutex_lock(&g->lock);
+	c = find_next_zero_bit(&g->ctx_used, G4P_NR_CTX, 1);
+	if (c < G4P_NR_CTX)
+		set_bit(c, &g->ctx_used);
+	mutex_unlock(&g->lock);
+	if (c >= G4P_NR_CTX) {
+		kfree(gf);
+		return -EBUSY;	/* all seven in use */
+	}
+	gf->ctx = c;
+	file->driver_priv = gf;
+	return 0;
+}
+
+/*
+ * after the file's handles are gone (drm_gem_release runs first). Buffers can outlive them (CPU mappings):
+ * unmap whatever is still mapped in this context now, so that a later owner of the number cannot reach them.
+ */
+static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
+{
+	struct g4p *g = to_g4p(drm);
+	struct g4p_file *gf = file->driver_priv;
+	struct g4p_gem *bo, *t;
+	struct dma_fence *f;
+	bool any = false;
+
+	while ((f = g4p_wait_target(g, true))) {
+		dma_fence_wait(f, false);
+		dma_fence_put(f);
+	}
+	mutex_lock(&g->lock);
+	list_for_each_entry_safe(bo, t, &g->sep_bos, node) {
+		if (bo->ctx != gf->ctx)
+			continue;
+		list_del(&bo->node);
+		bo->mapped = false;
+		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
+		any = true;
+	}
+	if (any && g->powered && g->boot && g4p_flush_unmap_locked(g))
+		g4p_recover_locked(g);
+	g4p_boot_ctx_detach(g, gf->ctx);
+	clear_bit(gf->ctx, &g->ctx_used);
+	mutex_unlock(&g->lock);
+	kfree(gf);
+}
+
 DEFINE_DRM_GEM_FOPS(g4p_drm_fops);
 
 static const struct drm_driver g4p_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_SYNCOBJ,
+	.open = g4p_drm_open,
+	.postclose = g4p_drm_postclose,
 	.ioctls = g4p_ioctls,
 	.num_ioctls = ARRAY_SIZE(g4p_ioctls),
 	.fops = &g4p_drm_fops,

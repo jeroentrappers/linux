@@ -110,6 +110,7 @@ struct g4p_boot {
 		int irq0, irqs;
 		u64 fault[4];
 	} jobs[G4P_JOB_SLOTS];	/* 8.69: job slots, used round robin */
+	u32 events_seen;	/* firmware events drained after the boot (8.78) */
 	u32 job_n;		/* jobs kicked in this boot; job k uses slot k % G4P_JOB_SLOTS, stamp base + k */
 	int cl_ret;
 	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd, cl_state_24;
@@ -321,8 +322,17 @@ void g4p_boot_irq_off(struct g4p *g)
 /* from the IRQ handler: keep the host-bound trace/statistics rings drained */
 void g4p_boot_irq_rings(struct g4p *g)
 {
-	if (ack_rings && g->boot->fi.list_b.cpu)
-		g4p_fwinit_ack_trace_stats(&g->boot->fi);
+	u32 type, payload;
+
+	if (!ack_rings || !g->boot->fi.list_b.cpu)
+		return;
+	g4p_fwinit_ack_trace_stats(&g->boot->fi);
+	/*
+	 * 8.78: the event ring too (256 entries, one completion event per job): unread, it filled after 256 jobs
+	 * of one boot and the firmware stopped taking commands. Completion itself comes from the stamps.
+	 */
+	while (g->boot->alive && g4p_fwinit_event(&g->boot->fi, &type, &payload))	/* the alive wait reads its own */
+		g->boot->events_seen++;
 }
 
 /* only once the GPU is powered off: until then it may still access these pages */
@@ -478,15 +488,13 @@ int g4p_boot_start(struct g4p *g)
  * (fw 0x1000328c: they branch to 0x100033d4, which advances the read index), so the response to check is
  * the firmware read index catching up with ours.
  */
-int g4p_boot_devctl_nop(struct g4p *g, u32 type)
+static int g4p_boot_devctl(struct g4p *g, u32 type, u32 arg)
 {
 	struct g4p_boot *b = g->boot;
-	u32 entry[5] = { type };
+	u32 entry[5] = { type, arg };
 	u32 perf;
 	int wr;
 
-	if (type < 9 || type > 11)
-		return -EINVAL;
 	if (!b || !b->alive || !g->powered)
 		return -ENODEV;
 	perf = readl(g->fender + 0x1000);
@@ -509,6 +517,48 @@ int g4p_boot_devctl_nop(struct g4p *g, u32 type)
 	dev_warn(g->dev, "devctl type %u: not consumed in 100 ms (read %u, write %d)\n", type,
 		 g4p_fwinit_ring_read_index(&b->fi, 3), wr);
 	return -ETIMEDOUT;
+}
+
+int g4p_boot_devctl_nop(struct g4p *g, u32 type)
+{
+	if (type < 9 || type > 11)
+		return -EINVAL;
+	return g4p_boot_devctl(g, type, 0);
+}
+
+/*
+ * R5 (8.77): make memory context @ctx (1..7) usable in the running boot: its page catalogue, the firmware's
+ * context table entry and, once the firmware runs, a device-control type 3 that loads CAT_BASE[ctx] (before
+ * that, the firmware's init loads it from the table). Idempotent; refreshes the shared pool half of its PD.
+ */
+int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx)
+{
+	struct g4p_boot *b = g->boot;
+	bool fresh;
+	int ret;
+
+	if (!b || !ctx)
+		return 0;
+	fresh = !b->mmu.ctx[ctx].pc;
+	ret = g4p_mmu_ctx_init(g->dev, &b->mmu, ctx);
+	if (ret)
+		return ret;
+	g4p_fwinit_set_ctx(&b->fi, ctx, b->mmu.ctx[ctx].pc_dma);
+	if (fresh && b->alive)
+		return g4p_boot_devctl(g, 3, ctx);
+	return 0;
+}
+
+/*
+ * the context's owner went away: drop its table entry. Its tables stay until the boot ends (CAT_BASE[ctx]
+ * still points at them); a later owner of the same number reuses them, by then empty in the user half.
+ */
+void g4p_boot_ctx_detach(struct g4p *g, unsigned int ctx)
+{
+	struct g4p_boot *b = g->boot;
+
+	if (b && ctx && b->mmu.ctx[ctx].pc)
+		g4p_fwinit_set_ctx(&b->fi, ctx, 0);
 }
 
 /*
@@ -574,7 +624,7 @@ int g4p_boot_cl_c1(struct g4p *g)
 	st = b->cl_state.cpu;
 	ctl = b->cl_ring.cpu;
 	if (gart_inval)	/* new pages after boot: the BIF has a stale PT line (re/GPU-C1-DEBUG.md) */
-		g4p_fwinit_gart_inval(&b->fi);
+		g4p_fwinit_gart_inval(&b->fi, 0);
 
 	entry[1] = g4p_fw_addr(b->cl_state.gpuva, false);
 	entry[2] = 0;	/* channel ring write index: no commands */
@@ -1145,7 +1195,8 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 
 		/* 2: CDM kick */
 		w[n++] = hdr2; w[n++] = fcmd + 0x18; w[n++] = fcmd + 0x68; w[n++] = fa3 + 0x720; w[n++] = fchan;
-		w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0; w[n++] = 0;
+		w[n++] = g->job_ctx;	/* +16: memory context (fw 0x10021648: CDM CAT_BASE index, 8.77) */
+		w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0; w[n++] = 0;
 		w[n++] = 0;
 		/* 3: timestamps */
 		w[n++] = hdr3; w[n++] = fcmd + 0x280; w[n++] = fcmd + 0x288; w[n++] = fcmd + 0x288; w[n++] = 0;
@@ -1171,7 +1222,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	cwr = (cwr + 1) % G4P_CHAN_RING_SIZE;
 	*(u32 *)(ctl + 0x40) = cwr;
 	if (gart_inval)
-		g4p_fwinit_gart_inval(&b->fi);
+		g4p_fwinit_gart_inval(&b->fi, g->job_ctx);
 
 	entry[1] = fchan;
 	entry[2] = cwr;
@@ -1246,25 +1297,31 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 }
 
 /* 8.65: map / unmap a DRM separate BO in the running boot's GPU MMU (window PTE flags) */
-int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size)
+int g4p_boot_map_range(struct g4p *g, unsigned int ctx, u64 va, dma_addr_t dma, size_t size)
 {
+	u64 f = heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS | G4P_PTE_READ_ONLY);
 	int ret = 0;
 
 	if (!g->boot)
 		return 0;
+	if (ctx)
+		ret = g4p_boot_ctx_attach(g, ctx);
 	for (size_t off = 0; off < size && !ret; off += SZ_4K)
-		ret = g4p_mmu_map_page(g->dev, &g->boot->mmu, va + off, dma + off,
-				       heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS | G4P_PTE_READ_ONLY));
+		ret = ctx ? g4p_mmu_ctx_map_page(g->dev, &g->boot->mmu, ctx, va + off, dma + off, f) :
+			    g4p_mmu_map_page(g->dev, &g->boot->mmu, va + off, dma + off, f);
 	wmb();	/* page tables before the next kick (the firmware invalidates the GPU MMU caches then) */
 	return ret;
 }
 
-void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size)
+void g4p_boot_unmap_range(struct g4p *g, unsigned int ctx, u64 va, size_t size)
 {
 	if (!g->boot)
 		return;
 	for (size_t off = 0; off < size; off += SZ_4K)
-		g4p_mmu_unmap_page(&g->boot->mmu, va + off);
+		if (ctx)
+			g4p_mmu_ctx_unmap_page(&g->boot->mmu, ctx, va + off);
+		else
+			g4p_mmu_unmap_page(&g->boot->mmu, va + off);
 	wmb();
 }
 
@@ -1281,6 +1338,43 @@ bool g4p_boot_job_done(struct g4p *g, u32 n)
 		return false;
 	j->stamp0 = j->expect;	/* the slot can be reused */
 	return true;
+}
+
+/*
+ * 8.78: job n is known complete (a later job of the same channel wrote its stamp; jobs run in order): free its
+ * slot. Needed because the firmware does not write a job's stamp when the next command is already queued.
+ */
+void g4p_boot_job_retire(struct g4p *g, u32 n)
+{
+	if (g->boot)
+		g->boot->jobs[n % G4P_JOB_SLOTS].stamp0 = g->boot->jobs[n % G4P_JOB_SLOTS].expect;
+}
+
+/* diagnostics for a stall: BIF faults and where the firmware is (GPU on and in a running perf state only) */
+void g4p_boot_stall_dbg(struct g4p *g)
+{
+	struct g4p_boot *b = g->boot;
+
+	if (!b || !g->powered || !g4p_gpu_running(g))
+		return;
+	dev_warn(g->dev, "stall: %u events drained; BIF fault 0x%llx/0x%llx 0x%llx/0x%llx; ring 2 read %u; channel ctl +0x00 %u +0x10 %u +0x40 %u\n",
+		 b->events_seen,
+		 readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU), readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ),
+		 readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU), readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ),
+		 g4p_fwinit_ring_read_index(&b->fi, 2), READ_ONCE(*(u32 *)b->cl_ring.cpu),
+		 READ_ONCE(*(u32 *)(b->cl_ring.cpu + 0x10)), READ_ONCE(*(u32 *)(b->cl_ring.cpu + 0x40)));
+}
+
+/* diagnostics for a stuck fence entry: slot state of job n */
+void g4p_boot_job_dbg(struct g4p *g, u32 n)
+{
+	struct g4p_cljob *j;
+
+	if (!g->boot)
+		return;
+	j = &g->boot->jobs[n % G4P_JOB_SLOTS];
+	dev_warn(g->dev, "job %u (of %u): expect 0x%08x stamp0 0x%08x memory 0x%08x\n", n, g->boot->job_n, j->expect,
+		 j->stamp0, j->misc.cpu ? READ_ONCE(*(u32 *)j->misc.cpu) : 0);
 }
 
 /* number the next kicked job will get (8.69) */

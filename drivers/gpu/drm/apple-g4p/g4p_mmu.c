@@ -20,6 +20,7 @@
 #define MMU_PC_INDEX(va)	(((va) >> 30) & 0x3ff)
 #define MMU_PD_INDEX(va)	(((va) >> 21) & 0x1ff)
 #define MMU_PT_INDEX(va)	(((va) >> 12) & 0x1ff)
+#define APPLE_G4P_POOL_VA_K	0x300000000ULL	/* = APPLE_G4P_POOL_VA (uapi) */
 
 /* AGXGart heap table (iOS 10 k10:0x1320 = iOS 12 0x…7135ed0): base, size, PTE flags */
 static const struct {
@@ -70,6 +71,8 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu)
 {
+	for (unsigned int c = 1; c < G4P_NR_CTX; c++)
+		g4p_mmu_ctx_fini(dev, mmu, c);
 	for (unsigned int i = 0; i < ARRAY_SIZE(mmu->xpt); i++)
 		if (mmu->xpt[i])
 			dma_free_coherent(dev, SZ_4K, mmu->xpt[i], mmu->xpt_dma[i]);
@@ -108,6 +111,19 @@ int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa,
 	return 0;
 }
 
+/* 8.77: the extra entry's PD, created on first use for the 1 GiB at @va */
+static int g4p_mmu_xpd_get(struct device *dev, struct g4p_mmu *mmu, u64 va)
+{
+	if (!mmu->xpd) {
+		mmu->xpd = dma_alloc_coherent(dev, SZ_4K, &mmu->xpd_dma, GFP_KERNEL);
+		if (!mmu->xpd)
+			return -ENOMEM;
+		mmu->xva = va & ~(u64)(SZ_1G - 1);
+		mmu->pc[MMU_PC_INDEX(va)] = ((mmu->xpd_dma >> 12) << 4) | MMU_PC_VALID;
+	}
+	return (va & ~(u64)(SZ_1G - 1)) == mmu->xva ? 0 : -EINVAL;
+}
+
 /*
  * One 4 KiB page at @va outside the firmware heaps' PC entry: all such pages share one 1 GiB PC entry (own PD,
  * page tables per 2 MiB on demand), set by the first call. For the code heap / user pool at 0x300000000.
@@ -119,15 +135,10 @@ int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_
 	if (!IS_ALIGNED(va | pa, SZ_4K) || pc == mmu->pc_index || va & ~GENMASK_ULL(39, 0) ||
 	    pa & ~GENMASK_ULL(39, 0))
 		return -EINVAL;
-	if (!mmu->xpd) {
-		mmu->xpd = dma_alloc_coherent(dev, SZ_4K, &mmu->xpd_dma, GFP_KERNEL);
-		if (!mmu->xpd)
-			return -ENOMEM;
-		mmu->xva = va & ~(u64)(SZ_1G - 1);
-		mmu->pc[pc] = ((mmu->xpd_dma >> 12) << 4) | MMU_PC_VALID;
-	}
-	if ((va & ~(u64)(SZ_1G - 1)) != mmu->xva)
-		return -EINVAL;
+	int ret = g4p_mmu_xpd_get(dev, mmu, va);
+
+	if (ret)
+		return ret;
 	if (!mmu->xpt[d]) {
 		mmu->xpt[d] = dma_alloc_coherent(dev, SZ_4K, &mmu->xpt_dma[d], GFP_KERNEL);
 		if (!mmu->xpt[d])
@@ -138,6 +149,81 @@ int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_
 		return -EEXIST;
 	mmu->xpt[d][MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
 	return 0;
+}
+
+/*
+ * R5 (8.77): memory context @ctx (1..7). Its PC is the kernel's with the extra entry replaced by the context's
+ * PD. That PD's low half (the pool, PD entries 0..255) points at the kernel's page tables and is refreshed
+ * here; call it again after the kernel mapped new pool page tables. Idempotent.
+ */
+int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
+{
+	struct g4p_mmu_ctx *c;
+	int ret;
+
+	if (!ctx || ctx >= G4P_NR_CTX)
+		return -EINVAL;
+	ret = g4p_mmu_xpd_get(dev, mmu, APPLE_G4P_POOL_VA_K);
+	if (ret)
+		return ret;
+	c = &mmu->ctx[ctx];
+	if (!c->pc) {
+		c->pc = dma_alloc_coherent(dev, SZ_4K, &c->pc_dma, GFP_KERNEL);
+		c->pd = dma_alloc_coherent(dev, SZ_4K, &c->pd_dma, GFP_KERNEL);
+		if (!c->pc || !c->pd) {
+			g4p_mmu_ctx_fini(dev, mmu, ctx);
+			return -ENOMEM;
+		}
+	}
+	memcpy(c->pc, mmu->pc, SZ_4K);
+	c->pc[MMU_PC_INDEX(mmu->xva)] = ((c->pd_dma >> 12) << 4) | MMU_PC_VALID;
+	memcpy(c->pd, mmu->xpd, 256 * sizeof(u64));
+	return 0;
+}
+
+void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
+{
+	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(c->pt); i++)
+		if (c->pt[i])
+			dma_free_coherent(dev, SZ_4K, c->pt[i], c->pt_dma[i]);
+	if (c->pd)
+		dma_free_coherent(dev, SZ_4K, c->pd, c->pd_dma);
+	if (c->pc)
+		dma_free_coherent(dev, SZ_4K, c->pc, c->pc_dma);
+	memset(c, 0, sizeof(*c));
+}
+
+/* one page in context @ctx's own half of the extra entry (VA 0x320000000..0x33fffffff) */
+int g4p_mmu_ctx_map_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, phys_addr_t pa,
+			 u64 flags)
+{
+	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+	unsigned int d = MMU_PD_INDEX(va);
+
+	if (!ctx || ctx >= G4P_NR_CTX || !c->pc || (va & ~(u64)(SZ_1G - 1)) != mmu->xva || d < 256 ||
+	    !IS_ALIGNED(va | pa, SZ_4K) || pa & ~GENMASK_ULL(39, 0))
+		return -EINVAL;
+	if (!c->pt[d - 256]) {
+		c->pt[d - 256] = dma_alloc_coherent(dev, SZ_4K, &c->pt_dma[d - 256], GFP_KERNEL);
+		if (!c->pt[d - 256])
+			return -ENOMEM;
+		c->pd[d] = (c->pt_dma[d - 256] & MMU_PA_MASK) | MMU_PD_VALID;
+	}
+	if (c->pt[d - 256][MMU_PT_INDEX(va)])
+		return -EEXIST;
+	c->pt[d - 256][MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
+	return 0;
+}
+
+void g4p_mmu_ctx_unmap_page(struct g4p_mmu *mmu, unsigned int ctx, u64 va)
+{
+	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+	unsigned int d = MMU_PD_INDEX(va);
+
+	if (ctx && ctx < G4P_NR_CTX && c->pc && (va & ~(u64)(SZ_1G - 1)) == mmu->xva && d >= 256 && c->pt[d - 256])
+		c->pt[d - 256][MMU_PT_INDEX(va)] = 0;
 }
 
 /* clear one page of the extra entry (the next job's MMU invalidate makes it visible) */

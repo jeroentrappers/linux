@@ -2,7 +2,7 @@
 /*
  * Apple A8 GPU (G4P) DRM interface, bring-up version (linux-on-iphone6 re/GPU-BRINGUP.md 8.64).
  *
- * Experimental and not stable: compute only, one GPU-visible pool, synchronous submission. Buffers are carved
+ * Experimental and not stable: compute only, one shared GPU-visible pool plus per-file separate buffers. Buffers are carved
  * from a pool that is mapped at GPU VA APPLE_G4P_POOL_VA before the firmware boots; a buffer's GPU VA minus
  * that base is also its PDS/USC code offset. A submission is a job image in the record format of the C8 debugfs
  * harness (tools/gpulinux/g4pjob.py): a header and records that write the pool, the CDM control stream and
@@ -29,6 +29,7 @@ enum drm_apple_g4p_param {
 	DRM_APPLE_G4P_PARAM_POOL_SIZE = 2,	/* bytes */
 	DRM_APPLE_G4P_PARAM_CORE_ID = 3,	/* RGX CORE_ID, valid once the GPU has been powered */
 	DRM_APPLE_G4P_PARAM_CORE_REVISION = 4,
+	DRM_APPLE_G4P_PARAM_MEMORY_CONTEXT = 5,	/* this file's GPU memory context (1..7), 8.77 */
 };
 
 struct drm_apple_g4p_get_param {
@@ -57,8 +58,9 @@ struct drm_apple_g4p_bo_create {
 /*
  * SUBMIT flags. APPLE_G4P_SUBMIT_ASYNC (8.68): return right after the kick; the job's fence is installed in
  * the syncobj out_sync (DRM_IOCTL_SYNCOBJ_* to wait), signalled from the firmware's completion interrupt, or with
- * an error after timeout_ms (the GPU is then powered off for recovery). One job is in flight at a time: a submit
- * first waits for the previous job. status/stamp/elapsed_us/fault are only filled in for synchronous submits.
+ * an error after timeout_ms (the GPU is then powered off for recovery). Up to four submits are in flight; a
+ * further async submit waits for the oldest, a synchronous one for all. A job's fence signals only once all of
+ * its stores are in memory (8.78). status/stamp/elapsed_us/fault are only filled in for synchronous submits.
  */
 #define APPLE_G4P_SUBMIT_ASYNC		(1 << 0)
 
@@ -76,10 +78,12 @@ struct drm_apple_g4p_submit {
 };
 
 /*
- * VM_BIND (8.71): map a NOMAP buffer at a GPU VA chosen by user space, or unmap it. One GPU address space for the
- * device for now (all clients share it: bring-up only); the user range is [APPLE_G4P_USER_VA_START,
- * APPLE_G4P_USER_VA_END), 4 KiB aligned; one binding per buffer, whole buffer, no overlaps. Unmapping (and
- * freeing a bound buffer) waits for the jobs in flight and makes the unmap effective before it returns.
+ * VM_BIND (8.71): map a NOMAP buffer at a GPU VA chosen by user space, or unmap it. Since 8.77 every open file
+ * has its own GPU address space for the user range [APPLE_G4P_USER_VA_START, APPLE_G4P_USER_VA_END): separate
+ * buffers are only visible to the jobs of the file that created them (the pool below it is still shared by all
+ * files). At most seven files can be open at once (open fails with EBUSY). Bindings are 4 KiB aligned, one per
+ * buffer, whole buffer, no overlaps. Unmapping (and freeing a bound buffer) waits for the jobs in flight and
+ * makes the unmap effective before it returns.
  */
 #define APPLE_G4P_USER_VA_START		0x320000000ULL
 #define APPLE_G4P_USER_VA_END		0x340000000ULL

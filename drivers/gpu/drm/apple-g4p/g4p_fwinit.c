@@ -356,13 +356,28 @@ u32 g4p_fwinit_ring_read_index(struct g4p_fwinit *fi, unsigned int ring)
  * per-context word B#18[0] with its own copy and, on a change in the low field, invalidates the BIF PT
  * cache and TLB (BIF_CTRL_INVAL 0x9), as iOS's AGXFirmware::requestGartInval arranges.
  */
-void g4p_fwinit_gart_inval(struct g4p_fwinit *fi)
+void g4p_fwinit_gart_inval(struct g4p_fwinit *fi, unsigned int ctx)
 {
-	void *p = fi->list_b.cpu + LB_CTX_U32;
-	u32 v = get_unaligned_le32(p);
+	/* 8.77: the kick (fw 0x1001eac4) compares all eight words, one per memory context */
+	for (unsigned int c = 0; c <= ctx && c < G4P_NR_CTX; c += ctx ? ctx : 1) {
+		void *p = fi->list_b.cpu + LB_CTX_U32 + 4 * c;
+		u32 v = get_unaligned_le32(p);
 
-	w32(p, 0, (v & ~0xfffu) | ((v + 1) & 0xfff));
+		w32(p, 0, (v & ~0xfffu) | ((v + 1) & 0xfff));
+	}
 	wmb();	/* before the kick that makes the firmware compare it */
+}
+
+/*
+ * R5 (8.77): memory context @ctx's page catalogue in the firmware's context table (root B +0xd12). The
+ * firmware loads every entry into CAT_BASE[n] at init (fw 0x100072cc) and one entry on a device-control
+ * type 3 {3, n} (fw 0x10003940, also copies context word n and invalidates). 0 = none.
+ */
+void g4p_fwinit_set_ctx(struct g4p_fwinit *fi, unsigned int ctx, u64 pc_dma)
+{
+	if (ctx < G4P_NR_CTX)
+		w64(fi->list_b.cpu, LB_CTX_PC + 8 * ctx, pc_dma);
+	wmb();
 }
 
 /* host-bound rings the firmware blocks on when full (trace B#3, statistics B#4): mark everything read */
