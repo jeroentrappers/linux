@@ -51,15 +51,25 @@ struct drm_apple_g4p_bo_create {
 	__u64 mmap_offset;	/* out: offset for mmap() on the DRM fd */
 };
 
+/*
+ * SUBMIT flags. APPLE_G4P_SUBMIT_ASYNC (8.68): return right after the kick; the job's fence is installed in
+ * the syncobj out_sync (DRM_IOCTL_SYNCOBJ_* to wait), signalled from the firmware's completion interrupt, or with
+ * an error after timeout_ms (the GPU is then powered off for recovery). One job is in flight at a time: a submit
+ * first waits for the previous job. status/stamp/elapsed_us/fault are only filled in for synchronous submits.
+ */
+#define APPLE_G4P_SUBMIT_ASYNC		(1 << 0)
+
 struct drm_apple_g4p_submit {
 	__u64 job;		/* in: user pointer to a job image */
 	__u32 job_size;		/* in: bytes, at most 1 MiB */
-	__u32 flags;		/* in: 0 */
+	__u32 flags;		/* in: APPLE_G4P_SUBMIT_* */
 	__u32 status;		/* out: 0 = done, 1 = timed out */
 	__u32 stamp;		/* out: the completion stamp read back */
 	__u32 elapsed_us;	/* out */
 	__u32 pad;
 	__u64 fault[2];		/* out: BIF fault bank 0 MMU / REQ status after the job */
+	__u32 out_sync;		/* in: syncobj handle for the job's fence (ASYNC), 0 = none */
+	__u32 pad2;
 };
 
 #define DRM_IOCTL_APPLE_G4P_GET_PARAM	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_GET_PARAM, struct drm_apple_g4p_get_param)

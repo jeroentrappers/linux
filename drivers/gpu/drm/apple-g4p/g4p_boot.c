@@ -103,6 +103,7 @@ struct g4p_boot {
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
 		unsigned int which, stream_words, us, timeout_ms, seq;	/* seq: jobs run in this boot */
+		u32 expect;	/* stamp of the job in flight (async, 8.68) */
 		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
 		int irq0, irqs;
 		u64 fault[4];
@@ -1175,6 +1176,13 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
+	if (which == 8 && g->job_async) {	/* 8.68: completion from the IRQ (g4p_boot_job_complete) */
+		j->which = which;
+		j->expect = stamp;
+		j->stream_words = n;
+		j->seq++;
+		return 0;
+	}
 	for (j->us = 0; j->us < (which == 8 ? j->timeout_ms * 1000 : which >= 4 ? 1000000 : 200000); j->us += 20) {
 		if (READ_ONCE(*(u32 *)j->misc.cpu) == stamp)
 			break;
@@ -1255,6 +1263,20 @@ void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size)
 }
 
 /* 8.64: did the running boot map the DRM pool? */
+/* 8.68: has the async job in flight written its stamp? (IRQ context; memory only) */
+bool g4p_boot_job_complete(struct g4p *g)
+{
+	struct g4p_cljob *j;
+
+	if (!g->boot || !g->boot->job.misc.cpu)
+		return false;
+	j = &g->boot->job;
+	if (READ_ONCE(*(u32 *)j->misc.cpu) != j->expect)
+		return false;
+	j->stamp0 = j->expect;	/* lets the next job reuse the buffers */
+	return true;
+}
+
 bool g4p_boot_uses_pool(struct g4p *g)
 {
 	return g->boot && g->pool.cpu && g->boot->pds.view && g->boot->pds.cpu == g->pool.cpu;

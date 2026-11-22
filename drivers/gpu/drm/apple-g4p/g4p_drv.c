@@ -178,6 +178,7 @@ static irqreturn_t g4p_irq(int irq, void *data)
 	atomic_inc(&g->irq_count);
 	if (g->boot)	/* memory only: the firmware blocks once the trace/statistics rings are full */
 		g4p_boot_irq_rings(g);
+	g4p_drm_irq(g);	/* 8.68: signal the async job's fence if its stamp is there */
 	wake_up(&g->irq_wq);
 	return IRQ_HANDLED;
 }
@@ -293,7 +294,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 /* 8.67: the DRM path's idle power-off (only a boot the DRM path started; debugfs boots stay up) */
 void g4p_idle_off_locked(struct g4p *g)
 {
-	if (g->boot && g->drm_booted)
+	if (g->boot && g->drm_booted && !READ_ONCE(g->inflight))
 		g4p_power_off_locked(g);
 }
 

@@ -23,6 +23,8 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_print.h>
+#include <drm/drm_syncobj.h>
+#include <linux/dma-fence.h>
 #include <uapi/drm/apple_g4p_drm.h>
 
 #include "g4p.h"
@@ -280,6 +282,64 @@ static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	return 0;
 }
 
+/* 8.68: one fence per async job; signalled from the firmware IRQ or, on timeout, with an error */
+static const char *g4p_fence_driver(struct dma_fence *f) { return "apple-g4p"; }
+static const char *g4p_fence_timeline(struct dma_fence *f) { return "compute"; }
+
+static const struct dma_fence_ops g4p_fence_ops = {
+	.get_driver_name = g4p_fence_driver,
+	.get_timeline_name = g4p_fence_timeline,
+};
+
+/* take the in-flight fence (NULL if none); caller signals and puts it */
+static struct dma_fence *g4p_take_inflight(struct g4p *g)
+{
+	struct dma_fence *f;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g->fence_lock, flags);
+	f = g->inflight;
+	g->inflight = NULL;
+	spin_unlock_irqrestore(&g->fence_lock, flags);
+	return f;
+}
+
+/* from the firmware IRQ: the job in flight has written its stamp */
+void g4p_drm_irq(struct g4p *g)
+{
+	struct dma_fence *f;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g->fence_lock, flags);
+	f = g->inflight;
+	if (f && g4p_boot_job_complete(g))
+		g->inflight = NULL;
+	else
+		f = NULL;
+	spin_unlock_irqrestore(&g->fence_lock, flags);
+	if (f) {
+		dma_fence_signal(f);
+		dma_fence_put(f);
+	}
+}
+
+static void g4p_timeout_work(struct work_struct *w)
+{
+	struct g4p *g = container_of(to_delayed_work(w), struct g4p, timeout_work);
+	struct dma_fence *f;
+
+	mutex_lock(&g->lock);
+	g4p_drm_irq(g);	/* a missed interrupt: check the stamp once more */
+	f = g4p_take_inflight(g);
+	if (f) {
+		dma_fence_set_error(f, -ETIMEDOUT);
+		dma_fence_signal(f);
+		dma_fence_put(f);
+		g4p_recover_locked(g);
+	}
+	mutex_unlock(&g->lock);
+}
+
 static void g4p_idle_work(struct work_struct *w)
 {
 	struct g4p *g = container_of(to_delayed_work(w), struct g4p, idle_work);
@@ -296,16 +356,71 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	void *img;
 	int ret;
 
-	if (a->flags || !a->job_size || a->job_size > SZ_1M)
+	bool async = a->flags & APPLE_G4P_SUBMIT_ASYNC;
+	struct drm_syncobj *sync = NULL;
+	struct dma_fence *prev;
+
+	if ((a->flags & ~APPLE_G4P_SUBMIT_ASYNC) || !a->job_size || a->job_size > SZ_1M)
 		return -EINVAL;
+	if (a->out_sync) {
+		sync = drm_syncobj_find(file, a->out_sync);
+		if (!sync)
+			return -ENOENT;
+	}
 	img = vmemdup_user(u64_to_user_ptr(a->job), a->job_size);
-	if (IS_ERR(img))
-		return PTR_ERR(img);
+	if (IS_ERR(img)) {
+		ret = PTR_ERR(img);
+		goto out_sync;
+	}
+	/* one job in flight: wait for the previous one (signalled by the IRQ or the timeout work) */
+	for (;;) {
+		spin_lock_irq(&g->fence_lock);
+		prev = g->inflight ? dma_fence_get(g->inflight) : NULL;
+		spin_unlock_irq(&g->fence_lock);
+		if (!prev)
+			break;
+		ret = dma_fence_wait(prev, true);
+		dma_fence_put(prev);
+		if (ret)
+			goto out_img;
+	}
 	mutex_lock(&g->lock);
 	ret = g4p_pool_get_locked(g);
 	if (!ret)
 		ret = g4p_ensure_booted_locked(g);
-	if (!ret) {
+	if (!ret && async) {
+		struct dma_fence *f = kzalloc(sizeof(*f), GFP_KERNEL);
+
+		if (!f) {
+			ret = -ENOMEM;
+		} else {
+			dma_fence_init(f, &g4p_fence_ops, &g->fence_lock, g->fence_ctx, ++g->fence_seq);
+			g->job_img = img;
+			g->job_img_size = a->job_size;
+			g->job_async = true;
+			spin_lock_irq(&g->fence_lock);
+			g->inflight = dma_fence_get(f);	/* before the kick: the IRQ may come at once */
+			spin_unlock_irq(&g->fence_lock);
+			ret = g4p_boot_cl_job(g, 8);
+			g->job_async = false;
+			g->job_img = NULL;
+			if (ret) {	/* never kicked: drop the in-flight reference again */
+				struct dma_fence *t = g4p_take_inflight(g);
+
+				if (t) {
+					dma_fence_set_error(t, ret);
+					dma_fence_signal(t);
+					dma_fence_put(t);
+				}
+			} else {
+				g4p_drm_irq(g);	/* very short jobs: already done */
+				mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
+			}
+			if (sync)
+				drm_syncobj_replace_fence(sync, f);
+			dma_fence_put(f);
+		}
+	} else if (!ret) {
 		g->job_img = img;
 		g->job_img_size = a->job_size;
 		ret = g4p_boot_cl_job(g, 8);
@@ -321,7 +436,11 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	if (idle_ms && g->boot)
 		mod_delayed_work(system_wq, &g->idle_work, msecs_to_jiffies(idle_ms));
 	mutex_unlock(&g->lock);
+out_img:
 	kvfree(img);
+out_sync:
+	if (sync)
+		drm_syncobj_put(sync);
 	return ret;
 }
 
@@ -334,7 +453,7 @@ static const struct drm_ioctl_desc g4p_ioctls[] = {
 DEFINE_DRM_GEM_FOPS(g4p_drm_fops);
 
 static const struct drm_driver g4p_drm_driver = {
-	.driver_features = DRIVER_GEM | DRIVER_RENDER,
+	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_SYNCOBJ,
 	.ioctls = g4p_ioctls,
 	.num_ioctls = ARRAY_SIZE(g4p_ioctls),
 	.fops = &g4p_drm_fops,
@@ -352,6 +471,9 @@ struct g4p *g4p_drm_alloc(struct device *dev)
 		INIT_LIST_HEAD(&g->sep_bos);
 		INIT_LIST_HEAD(&g->zombies);
 		INIT_DELAYED_WORK(&g->idle_work, g4p_idle_work);
+		INIT_DELAYED_WORK(&g->timeout_work, g4p_timeout_work);
+		spin_lock_init(&g->fence_lock);
+		g->fence_ctx = dma_fence_context_alloc(1);
 	}
 	return g;
 }
@@ -365,6 +487,7 @@ void g4p_drm_unregister(struct g4p *g)
 {
 	drm_dev_unplug(&g->drm);
 	cancel_delayed_work_sync(&g->idle_work);
+	cancel_delayed_work_sync(&g->timeout_work);
 }
 
 /* only once the GPU is powered off: until then it may still access the pool */

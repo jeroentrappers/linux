@@ -12,12 +12,14 @@
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/workqueue.h>
+#include <linux/spinlock.h>
 
 #include <drm/drm_device.h>
 
 #include "g4p_fw.h"
 
 struct dentry;
+struct dma_fence;
 struct device;
 struct seq_file;
 
@@ -79,6 +81,12 @@ struct g4p {
 	struct list_head zombies;		/* their memory, freed while the GPU was on */
 	u64 sep_next;				/* next free GPU VA for them */
 	struct delayed_work idle_work;		/* 8.67: power off after idle_ms without a submit */
+	/* 8.68: the one asynchronous job in flight */
+	bool job_async;				/* set during a submit: g4p_boot_cl_job returns after the kick */
+	spinlock_t fence_lock;
+	struct dma_fence *inflight;		/* signalled from the IRQ or the timeout work */
+	u64 fence_ctx, fence_seq;
+	struct delayed_work timeout_work;
 	bool drm_booted;			/* the running boot was started by the DRM path */
 	const void *job_img;			/* set during a DRM submit: C8 job image from memory */
 	size_t job_img_size;
@@ -162,6 +170,7 @@ int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size);
 void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size);
 int g4p_drm_map_separate(struct g4p *g);	/* g4p_drm.c: map all separate BOs into a new boot */
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
+bool g4p_boot_job_complete(struct g4p *g);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);
@@ -174,6 +183,7 @@ int g4p_drm_register(struct g4p *g);
 void g4p_drm_unregister(struct g4p *g);
 void g4p_drm_pool_free(struct g4p *g);
 void g4p_drm_reap(struct g4p *g);
+void g4p_drm_irq(struct g4p *g);
 
 
 #endif
