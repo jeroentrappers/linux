@@ -11,6 +11,7 @@
 #include <linux/wait.h>
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_device.h>
 
@@ -77,6 +78,8 @@ struct g4p {
 	struct list_head sep_bos;		/* separate BOs (8.65), mapped into every boot */
 	struct list_head zombies;		/* their memory, freed while the GPU was on */
 	u64 sep_next;				/* next free GPU VA for them */
+	struct delayed_work idle_work;		/* 8.67: power off after idle_ms without a submit */
+	bool drm_booted;			/* the running boot was started by the DRM path */
 	const void *job_img;			/* set during a DRM submit: C8 job image from memory */
 	size_t job_img_size;
 };
@@ -163,6 +166,7 @@ void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);
 void g4p_recover_locked(struct g4p *g);
+void g4p_idle_off_locked(struct g4p *g);
 
 /* g4p_drm.c */
 struct g4p *g4p_drm_alloc(struct device *dev);

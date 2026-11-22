@@ -327,6 +327,7 @@ void g4p_boot_free(struct g4p *g)
 	WARN_ON(g->powered);
 	g4p_boot_free_mem(g->dev, g->boot);
 	g->boot = NULL;
+	g->drm_booted = false;
 	g4p_drm_reap(g);
 }
 

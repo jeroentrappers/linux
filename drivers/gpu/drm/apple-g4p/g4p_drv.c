@@ -290,6 +290,13 @@ static int g4p_boot_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
+/* 8.67: the DRM path's idle power-off (only a boot the DRM path started; debugfs boots stay up) */
+void g4p_idle_off_locked(struct g4p *g)
+{
+	if (g->boot && g->drm_booted)
+		g4p_power_off_locked(g);
+}
+
 /* 8.65: after a job that did not complete (fault, hang): power off; the next submit boots again */
 void g4p_recover_locked(struct g4p *g)
 {
@@ -316,6 +323,7 @@ int g4p_ensure_booted_locked(struct g4p *g)
 		ret = -ENODEV;
 	if (!ret)
 		ret = g4p_boot_start(g);
+	g->drm_booted = !ret;
 	return ret;
 }
 

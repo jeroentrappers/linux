@@ -27,6 +27,10 @@
 
 #include "g4p.h"
 
+static unsigned int idle_ms = 1000;
+module_param(idle_ms, uint, 0644);
+MODULE_PARM_DESC(idle_ms, "power the GPU off this long after the last DRM submit (0 = stay on); 8.67");
+
 static unsigned int pool_mb = 4;
 module_param(pool_mb, uint, 0444);
 MODULE_PARM_DESC(pool_mb, "size of the DRM pool in MiB (contiguous, from CMA; mapped at GPU VA 0x300000000)");
@@ -276,6 +280,15 @@ static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	return 0;
 }
 
+static void g4p_idle_work(struct work_struct *w)
+{
+	struct g4p *g = container_of(to_delayed_work(w), struct g4p, idle_work);
+
+	mutex_lock(&g->lock);
+	g4p_idle_off_locked(g);	/* also releases parked separate-BO memory (g4p_drm_reap) */
+	mutex_unlock(&g->lock);
+}
+
 static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct g4p *g = to_g4p(drm);
@@ -305,6 +318,8 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 			ret = 0;
 		}
 	}
+	if (idle_ms && g->boot)
+		mod_delayed_work(system_wq, &g->idle_work, msecs_to_jiffies(idle_ms));
 	mutex_unlock(&g->lock);
 	kvfree(img);
 	return ret;
@@ -336,6 +351,7 @@ struct g4p *g4p_drm_alloc(struct device *dev)
 	if (!IS_ERR(g)) {
 		INIT_LIST_HEAD(&g->sep_bos);
 		INIT_LIST_HEAD(&g->zombies);
+		INIT_DELAYED_WORK(&g->idle_work, g4p_idle_work);
 	}
 	return g;
 }
@@ -348,6 +364,7 @@ int g4p_drm_register(struct g4p *g)
 void g4p_drm_unregister(struct g4p *g)
 {
 	drm_dev_unplug(&g->drm);
+	cancel_delayed_work_sync(&g->idle_work);
 }
 
 /* only once the GPU is powered off: until then it may still access the pool */
