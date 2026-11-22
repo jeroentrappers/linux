@@ -1458,7 +1458,8 @@ static const struct drm_plane_funcs adpt_plane_funcs = {
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
 };
 
-static const u32 adpt_formats[] = { DRM_FORMAT_XRGB8888 };
+/* one opaque layer: ARGB8888 is scanned out as XRGB8888 (GL clients with an alpha channel, glmark2) */
+static const u32 adpt_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
 
 static enum drm_mode_status adpt_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
 {
