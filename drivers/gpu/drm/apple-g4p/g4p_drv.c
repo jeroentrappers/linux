@@ -377,6 +377,43 @@ static ssize_t g4p_c8mem_read(struct file *f, char __user *ubuf, size_t len, lof
 	return ret;
 }
 
+/* 8.88: C9 graphics harness: any write runs /lib/firmware/agx-g4p-gfx.bin; gfxout reads its READ records */
+static ssize_t g4p_gfx_write(struct file *f, const char __user *ubuf, size_t len, loff_t *pos)
+{
+	struct g4p *g = f->private_data;
+	int ret;
+
+	if (!experimental)
+		return -EPERM;
+	mutex_lock(&g->lock);
+	ret = g4p_gfx_run(g);
+	mutex_unlock(&g->lock);
+	return ret ? ret : len;
+}
+
+static ssize_t g4p_gfxout_read(struct file *f, char __user *ubuf, size_t len, loff_t *pos)
+{
+	struct g4p *g = f->private_data;
+	ssize_t ret;
+
+	mutex_lock(&g->lock);
+	ret = g4p_gfx_out(g, ubuf, len, pos);
+	mutex_unlock(&g->lock);
+	return ret;
+}
+
+static const struct file_operations g4p_gfx_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = g4p_gfx_write,
+};
+
+static const struct file_operations g4p_gfxout_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = g4p_gfxout_read,
+};
+
 static const struct file_operations g4p_c8mem_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -459,6 +496,8 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("devctl", 0200, g->debugfs, g, &g4p_devctl_fops);
 	debugfs_create_file("cl", 0200, g->debugfs, g, &g4p_cl_fops);
 	debugfs_create_file("c8mem", 0400, g->debugfs, g, &g4p_c8mem_fops);
+	debugfs_create_file("gfx", 0200, g->debugfs, g, &g4p_gfx_fops);
+	debugfs_create_file("gfxout", 0400, g->debugfs, g, &g4p_gfxout_fops);
 	ret = g4p_drm_register(g);
 	if (ret)
 		dev_warn(dev, "DRM device not registered: %d\n", ret);

@@ -350,6 +350,7 @@ void g4p_boot_free(struct g4p *g)
 	if (!g->boot)
 		return;
 	WARN_ON(g->powered);
+	g4p_gfx_free(g);	/* 8.88: its pages were mapped in this boot's tables */
 	g4p_boot_free_mem(g->dev, g->boot);
 	g->boot = NULL;
 	g->drm_booted = false;
@@ -569,6 +570,63 @@ int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx)
 			return ret;
 		}
 	}
+	return 0;
+}
+
+/* ---- 8.88: hooks for the C9 graphics harness (g4p_gfx.c) ---- */
+static bool g4p_gpu_running(struct g4p *g);
+
+bool g4p_boot_alive(struct g4p *g)
+{
+	return g->boot && g->boot->alive && g->powered && g4p_gpu_running(g);
+}
+
+u64 g4p_boot_heap_pte(void)
+{
+	return heap_pte;
+}
+
+/* one page in the firmware heaps of the kernel context, with that heap's PTE flags (shared / private only) */
+int g4p_boot_fw_map_page(struct g4p *g, u64 va, dma_addr_t dma)
+{
+	int h = g4p_mmu_heap_of(va);
+
+	if (!g->boot || (h != G4P_HEAP_SHARED && h != G4P_HEAP_PRIVATE))
+		return -EINVAL;
+	return g4p_mmu_map(g->dev, &g->boot->mmu, va, dma, SZ_4K, g4p_mmu_heap_flags(h));
+}
+
+void g4p_boot_fw_pages_changed(struct g4p *g)
+{
+	wmb();	/* page tables and contents before the firmware's next MMU invalidate */
+	if (g->boot)
+		g4p_fwinit_gart_inval(&g->boot->fi, 0);
+}
+
+int g4p_boot_load_ctx(struct g4p *g, unsigned int slot, u64 pc_dma)
+{
+	if (!g->boot || !slot || slot >= G4P_NR_CTX)
+		return -EINVAL;
+	g4p_fwinit_set_ctx(&g->boot->fi, slot, pc_dma);
+	return g->boot->alive ? g4p_boot_devctl(g, 3, slot) : 0;
+}
+
+int g4p_boot_ring_kick(struct g4p *g, unsigned int ring, const u32 *entry, u32 kick, unsigned int slot)
+{
+	int wr;
+
+	if (!g4p_boot_alive(g) || ring > 2)
+		return -ENODEV;
+	g4p_fwinit_gart_inval(&g->boot->fi, slot);
+	wr = g4p_fwinit_ring_push(&g->boot->fi, ring, entry);
+	if (wr < 0)
+		return wr;
+	if (kick) {
+		writel(kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
+		readl(g->rgx + RGX_CR_MTS_SCHEDULE);
+	}
+	dev_info(g->dev, "C9 push ring %u {%08x %08x %08x %08x %08x} -> write index %d, kick %#x\n", ring, entry[0],
+		 entry[1], entry[2], entry[3], entry[4], wr, kick);
 	return 0;
 }
 

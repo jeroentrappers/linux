@@ -70,6 +70,7 @@ struct g4p {
 	wait_queue_head_t irq_wq;
 	bool irq_on;
 	struct g4p_boot *boot;			/* GPU memory of a META boot; freed after power-off */
+	struct g4p_gfx *gfx;			/* 8.88: C9 graphics harness state of this boot */
 	/*
 	 * DRM pool (8.64): one contiguous buffer, mapped at G4P_PDS_VA (0x300000000) before each firmware boot
 	 * that the DRM path starts; page 0 holds the driver's PDS programs, BOs are page ranges after it.
@@ -199,6 +200,19 @@ int g4p_boot_start(struct g4p *g);
 void g4p_boot_free(struct g4p *g);
 void g4p_boot_show(struct seq_file *s, struct g4p *g);
 int g4p_boot_devctl_nop(struct g4p *g, u32 type);
+/* 8.88: C9 graphics harness (g4p_gfx.c) and its hooks in g4p_boot.c */
+struct g4p_gfx;
+int g4p_gfx_run(struct g4p *g);
+ssize_t g4p_gfx_out(struct g4p *g, char __user *ubuf, size_t len, loff_t *pos);
+void g4p_gfx_free(struct g4p *g);
+bool g4p_boot_alive(struct g4p *g);
+u64 g4p_boot_heap_pte(void);
+int g4p_boot_fw_map_page(struct g4p *g, u64 va, dma_addr_t dma);
+void g4p_boot_fw_pages_changed(struct g4p *g);
+int g4p_boot_load_ctx(struct g4p *g, unsigned int slot, u64 pc_dma);
+int g4p_boot_ring_kick(struct g4p *g, unsigned int ring, const u32 *entry, u32 kick, unsigned int slot);
+u64 g4p_fw_to_gpuva(u32 fwaddr);
+int g4p_mmu_heap_of(u64 va);
 int g4p_boot_cl_c1(struct g4p *g);
 int g4p_boot_cl_job(struct g4p *g, unsigned int which);
 ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);

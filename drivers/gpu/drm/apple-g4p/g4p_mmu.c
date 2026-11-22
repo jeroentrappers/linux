@@ -51,6 +51,28 @@ u64 g4p_mmu_heap_flags(enum g4p_heap heap)
 }
 
 
+/*
+ * 8.88: with ios_layout the driver's own allocations in the shared and private heaps start 8 MiB in, so that the
+ * C9 harness can put iOS's objects at the addresses iOS used (all below +3 MiB in both heaps, 8.85).
+ */
+static bool ios_layout;
+module_param(ios_layout, bool, 0444);
+MODULE_PARM_DESC(ios_layout, "start the driver's shared/private firmware heap allocations 8 MiB in (C9 replays)");
+
+/* the firmware heap holding va, or -1 */
+int g4p_mmu_heap_of(u64 va)
+{
+	for (unsigned int i = 0; i < G4P_NR_HEAPS; i++)
+		if (va >= g4p_heap_cfg[i].base && va < g4p_heap_cfg[i].base + g4p_heap_cfg[i].size)
+			return i;
+	return -1;
+}
+
+u64 g4p_fw_to_gpuva(u32 fwaddr)
+{
+	return g4p_heap_cfg[G4P_HEAP_FW].base + (fwaddr & 0x3fffffff);
+}
+
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 {
 	u64 base = g4p_heap_cfg[G4P_HEAP_FW].base;
@@ -66,6 +88,10 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 	mmu->pc[mmu->pc_index] = ((mmu->pd_dma >> 12) << 4) | MMU_PC_VALID;
 	for (unsigned int i = 0; i < G4P_NR_HEAPS; i++)
 		mmu->heap_next[i] = g4p_heap_cfg[i].base;
+	if (ios_layout) {
+		mmu->heap_next[G4P_HEAP_SHARED] += SZ_8M;
+		mmu->heap_next[G4P_HEAP_PRIVATE] += SZ_8M;
+	}
 	return 0;
 }
 
