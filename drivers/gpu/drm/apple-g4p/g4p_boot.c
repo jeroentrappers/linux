@@ -1411,6 +1411,14 @@ void g4p_boot_stall_dbg(struct g4p *g)
 		 READ_ONCE(*(u32 *)(b->cl_ring.cpu + 0x10)), READ_ONCE(*(u32 *)(b->cl_ring.cpu + 0x40)));
 }
 
+/* 8.80: an MMU fault is latched in bank 0 or 1 (valid bit 0 of the MMU status); GPU on and running only */
+bool g4p_boot_mmu_fault(struct g4p *g)
+{
+	if (!g->boot || !g->powered || !g4p_gpu_running(g))
+		return false;
+	return (readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU) | readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU)) & 1;
+}
+
 /* diagnostics for a stuck fence entry: slot state of job n */
 void g4p_boot_job_dbg(struct g4p *g, u32 n)
 {

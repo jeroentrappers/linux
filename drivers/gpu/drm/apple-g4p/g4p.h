@@ -203,6 +203,7 @@ u32 g4p_boot_next_job(struct g4p *g);
 void g4p_boot_job_dbg(struct g4p *g, u32 n);
 void g4p_boot_job_retire(struct g4p *g, u32 n);
 void g4p_boot_stall_dbg(struct g4p *g);
+bool g4p_boot_mmu_fault(struct g4p *g);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);

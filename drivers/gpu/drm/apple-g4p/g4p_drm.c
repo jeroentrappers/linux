@@ -484,8 +484,8 @@ void g4p_drm_irq(struct g4p *g)
 		mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
 }
 
-/* fail every job in flight (timeout, or a job that was never kicked) */
-static void g4p_fail_inflight(struct g4p *g, int err)
+/* fail every job in flight (timeout, or a job that was never kicked): the oldest with err, the rest with rest */
+static void g4p_fail_inflight(struct g4p *g, int err, int rest)
 {
 	struct dma_fence *f;
 	unsigned long flags;
@@ -504,6 +504,7 @@ static void g4p_fail_inflight(struct g4p *g, int err)
 		dma_fence_set_error(f, err);
 		dma_fence_signal(f);
 		dma_fence_put(f);
+		err = rest;
 	}
 }
 
@@ -519,7 +520,11 @@ static void g4p_timeout_work(struct work_struct *w)
 			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ]);
 			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ] + 1);
 		}
-		g4p_fail_inflight(g, -ETIMEDOUT);
+		/*
+		 * 8.80: a job that faulted never completes; the BIF fault registers tell it from a hang. The oldest
+		 * job is the stuck one, the jobs behind it never ran (the recovery drops them).
+		 */
+		g4p_fail_inflight(g, g4p_boot_mmu_fault(g) ? -EFAULT : -ETIMEDOUT, -ECANCELED);
 		g4p_recover_locked(g);
 	}
 	mutex_unlock(&g->lock);
@@ -646,7 +651,7 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 				dma_fence_set_error(f, ret);	/* not queued: signal it here */
 				dma_fence_signal(f);
 			} else if (ret) {
-				g4p_fail_inflight(g, ret);	/* queued but never kicked */
+				g4p_fail_inflight(g, ret, ret);	/* queued but never kicked */
 			} else {
 				g4p_drm_irq(g);	/* very short jobs: already done */
 				if (!delayed_work_pending(&g->timeout_work))
