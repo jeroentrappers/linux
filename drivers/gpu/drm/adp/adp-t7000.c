@@ -453,12 +453,30 @@ static int adpt_dumb_create(struct drm_file *file, struct drm_device *drm,
 	return ret;
 }
 
+/*
+ * PRIME import of our own dma-bufs (another open file of this device, e.g. a GPU client's scanout buffer coming
+ * back to KMS): the core's self-import only knows the generic GEM dma-buf ops, ours are custom
+ */
+static struct drm_gem_object *adpt_gem_prime_import(struct drm_device *drm, struct dma_buf *dma_buf)
+{
+	if (dma_buf->ops == &adpt_dmabuf_ops) {
+		struct drm_gem_object *obj = dma_buf->priv;
+
+		if (obj->dev == drm) {
+			drm_gem_object_get(obj);
+			return obj;
+		}
+	}
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
 DEFINE_DRM_GEM_FOPS(adpt_fops);
 
 static const struct drm_driver adpt_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops = &adpt_fops,
 	.dumb_create = adpt_dumb_create,
+	.gem_prime_import = adpt_gem_prime_import,
 	.name = "adp-t7000",
 	.desc = "Apple A8 display pipe",
 	.major = 0,
