@@ -81,6 +81,7 @@ struct g4p {
 	struct list_head zombies;		/* their memory, freed while the GPU was on */
 	u64 sep_next;				/* next free GPU VA for them (context 0) */
 	unsigned long ctx_used;			/* R5: memory contexts owned by DRM files (bit n = context n) */
+	u8 *pool_owner;				/* 8.79: per pool page, the context of the file that owns it */
 	unsigned int job_ctx;			/* set during a DRM submit: the job's memory context */
 	struct delayed_work idle_work;		/* 8.67: power off after idle_ms without a submit */
 	/* 8.68: the one asynchronous job in flight */
@@ -129,16 +130,16 @@ struct g4p_mmu {
 	dma_addr_t xpd_dma, xpt_dma[512];
 	u64 xva;		/* 1 GiB aligned base of the entry, 0 = none */
 	/*
-	 * R5 (8.77): per-client memory contexts 1..7. Each has its own PC (a copy of the kernel's, context 0) with
-	 * its own PD for the extra entry: the low half (the pool, shared) points at the kernel's page tables, the
-	 * high half (the user VA range 0x320000000..) at the context's own. The firmware loads CAT_BASE[n] from
-	 * its context table; the CDM kick names the context (stream record 2, payload word 4).
+	 * R5 (8.77, 8.79): per-client memory contexts 1..7, allocated on use. Each has its own PC (a copy of the
+	 * kernel's, context 0) with its own PD and page tables for the extra GiB: pool page 0 (read-only) and the
+	 * client's own pool pages and separate buffers only. The firmware loads CAT_BASE[n] from its context
+	 * table; the CDM kick names the context (stream record 2, payload word 4).
 	 */
 	struct g4p_mmu_ctx {
 		u32 *pc;
-		u64 *pd, *pt[256];
-		dma_addr_t pc_dma, pd_dma, pt_dma[256];
-	} ctx[G4P_NR_CTX];
+		u64 *pd, *pt[512];
+		dma_addr_t pc_dma, pd_dma, pt_dma[512];
+	} *ctx[G4P_NR_CTX];
 };
 
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
@@ -192,6 +193,8 @@ bool g4p_boot_uses_pool(struct g4p *g);
 int g4p_boot_map_range(struct g4p *g, unsigned int ctx, u64 va, dma_addr_t dma, size_t size);
 void g4p_boot_unmap_range(struct g4p *g, unsigned int ctx, u64 va, size_t size);
 int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx);
+int g4p_boot_pool_map(struct g4p *g, unsigned int ctx, unsigned int first, unsigned int n);
+void g4p_boot_pool_unmap(struct g4p *g, unsigned int ctx, unsigned int first, unsigned int n);
 void g4p_boot_ctx_detach(struct g4p *g, unsigned int ctx);
 int g4p_drm_map_separate(struct g4p *g);	/* g4p_drm.c: map all separate BOs into a new boot */
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);

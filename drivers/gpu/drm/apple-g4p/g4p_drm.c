@@ -35,6 +35,10 @@ static unsigned int idle_ms = 1000;
 module_param(idle_ms, uint, 0644);
 MODULE_PARM_DESC(idle_ms, "power the GPU off this long after the last DRM submit (0 = stay on); 8.67");
 
+static bool raw_jobs;
+module_param(raw_jobs, bool, 0644);
+MODULE_PARM_DESC(raw_jobs, "accept HEAP, CMD and REG records in DRM job images (bring-up tools only: they reach memory and registers outside the file's context)");
+
 static unsigned int pool_mb = 4;
 module_param(pool_mb, uint, 0444);
 MODULE_PARM_DESC(pool_mb, "size of the DRM pool in MiB (contiguous, from CMA; mapped at GPU VA 0x300000000)");
@@ -86,12 +90,20 @@ static int g4p_pool_get_locked(struct g4p *g)
 	if (g->pool.cpu)
 		return 0;
 	g->pool_map = bitmap_zalloc(size / SZ_4K, GFP_KERNEL);
-	if (!g->pool_map)
+	g->pool_owner = kzalloc(size / SZ_4K, GFP_KERNEL);
+	if (!g->pool_map || !g->pool_owner) {
+		bitmap_free(g->pool_map);
+		kfree(g->pool_owner);
+		g->pool_map = NULL;
+		g->pool_owner = NULL;
 		return -ENOMEM;
+	}
 	g->pool.cpu = dma_alloc_coherent(g->dev, size, &g->pool.dma, GFP_KERNEL);
 	if (!g->pool.cpu) {
 		bitmap_free(g->pool_map);
+		kfree(g->pool_owner);
 		g->pool_map = NULL;
+		g->pool_owner = NULL;
 		return -ENOMEM;
 	}
 	g->pool.size = size;
@@ -125,6 +137,18 @@ static int g4p_flush_unmap_locked(struct g4p *g)
 	return ret;
 }
 
+/* 8.79: the same, in memory context @ctx (an unmap there: its invalidate word changes) */
+static int g4p_flush_ctx_locked(struct g4p *g, unsigned int ctx)
+{
+	unsigned int saved = g->job_ctx;
+	int ret;
+
+	g->job_ctx = ctx;
+	ret = g4p_flush_unmap_locked(g);
+	g->job_ctx = saved;
+	return ret;
+}
+
 static void g4p_gem_free(struct drm_gem_object *obj)
 {
 	struct g4p *g = to_g4p(obj->dev);
@@ -142,7 +166,7 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 	} else if (bo->separate) {
 		list_del(&bo->node);
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
-		if (g->powered && g->boot && g4p_flush_unmap_locked(g)) {
+		if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx)) {
 			/* the flush job failed: park the memory until the GPU is off (and recover) */
 			struct g4p_zombie *z = kmalloc(sizeof(*z), GFP_KERNEL);
 
@@ -155,6 +179,11 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 			dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
 		}
 	} else {
+		/* 8.79: out of its context first, so the pages can go to another file */
+		g4p_boot_pool_unmap(g, bo->ctx, bo->first, bo->npages);
+		if (bo->ctx && g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
+			g4p_recover_locked(g);	/* the next boot maps without these pages */
+		memset(g->pool_owner + bo->first, 0, bo->npages);
 		bitmap_clear(g->pool_map, bo->first, bo->npages);
 	}
 	mutex_unlock(&g->lock);
@@ -344,7 +373,7 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 		list_del(&bo->node);
 		bo->mapped = false;
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
-		if (g->powered && g->boot && g4p_flush_unmap_locked(g))
+		if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
 			g4p_recover_locked(g);	/* the flush job failed: power off, the next boot maps without it */
 		break;
 	default:
@@ -378,10 +407,20 @@ static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	ret = g4p_pool_get_locked(g);
 	if (!ret) {
 		first = bitmap_find_next_zero_area(g->pool_map, g->pool_pages, 1, n, 0);
-		if (first >= g->pool_pages)
+		if (first >= g->pool_pages) {
 			ret = -ENOSPC;
-		else
+		} else {
 			bitmap_set(g->pool_map, first, n);
+			/* 8.79: only the owner's context maps these pages */
+			memset(g->pool_owner + first, ((struct g4p_file *)file->driver_priv)->ctx, n);
+			memset(g->pool.cpu + (size_t)first * SZ_4K, 0, (size_t)n * SZ_4K);
+			ret = g4p_boot_pool_map(g, ((struct g4p_file *)file->driver_priv)->ctx, first, n);
+			if (ret) {
+				g4p_boot_pool_unmap(g, ((struct g4p_file *)file->driver_priv)->ctx, first, n);
+				memset(g->pool_owner + first, 0, n);
+				bitmap_clear(g->pool_map, first, n);
+			}
+		}
 	}
 	mutex_unlock(&g->lock);
 	if (ret) {
@@ -390,9 +429,9 @@ static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	}
 	bo->first = first;
 	bo->npages = n;
+	bo->ctx = ((struct g4p_file *)file->driver_priv)->ctx;
 	bo->base.funcs = &g4p_gem_funcs;
 	drm_gem_private_object_init(drm, &bo->base, (size_t)n * SZ_4K);
-	memset(g->pool.cpu + (size_t)first * SZ_4K, 0, (size_t)n * SZ_4K);
 	ret = drm_gem_create_mmap_offset(&bo->base);
 	if (!ret)
 		ret = drm_gem_handle_create(file, &bo->base, &a->handle);
@@ -507,6 +546,30 @@ static void g4p_idle_work(struct work_struct *w)
 	mutex_unlock(&g->lock);
 }
 
+/*
+ * 8.79: only STREAM records (the CDM control stream, run by the CDM in the file's own context) unless raw_jobs:
+ * HEAP writes anywhere in the pool, CMD fields are dereferenced by the firmware in its own context, REG writes
+ * MCU_FENCE. Full parsing is g4p_c8_job's; this only checks the record types.
+ */
+static bool g4p_job_stream_only(const void *img, size_t size)
+{
+	const u8 *d = img + 16, *end = img + size;
+
+	if (size < 16)
+		return false;
+	while (d < end) {
+		u32 r[3];
+
+		if (end - d < sizeof(r))
+			return false;
+		memcpy(r, d, sizeof(r));
+		if (r[0] != 2 /* G4P_JOB_STREAM */ || r[2] > end - d - sizeof(r))
+			return false;
+		d += sizeof(r) + ALIGN((size_t)r[2], 4);
+	}
+	return true;
+}
+
 static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct g4p *g = to_g4p(drm);
@@ -529,6 +592,10 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	if (IS_ERR(img)) {
 		ret = PTR_ERR(img);
 		goto out_sync;
+	}
+	if (!raw_jobs && !g4p_job_stream_only(img, a->job_size)) {
+		ret = -EPERM;
+		goto out_img;
 	}
 	/*
 	 * 8.69: up to G4P_FQ jobs in flight. An async submit waits only while every slot is busy; a synchronous one
@@ -671,7 +738,7 @@ static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 		any = true;
 	}
-	if (any && g->powered && g->boot && g4p_flush_unmap_locked(g))
+	if (any && g->powered && g->boot && g4p_flush_ctx_locked(g, gf->ctx))
 		g4p_recover_locked(g);
 	g4p_boot_ctx_detach(g, gf->ctx);
 	clear_bit(gf->ctx, &g->ctx_used);
@@ -730,5 +797,7 @@ void g4p_drm_pool_free(struct g4p *g)
 		dma_free_coherent(g->dev, g->pool.size, g->pool.cpu, g->pool.dma);
 	g->pool.cpu = NULL;
 	bitmap_free(g->pool_map);
+	kfree(g->pool_owner);
 	g->pool_map = NULL;
+	g->pool_owner = NULL;
 }

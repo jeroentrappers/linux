@@ -152,9 +152,9 @@ int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_
 }
 
 /*
- * R5 (8.77): memory context @ctx (1..7). Its PC is the kernel's with the extra entry replaced by the context's
- * PD. That PD's low half (the pool, PD entries 0..255) points at the kernel's page tables and is refreshed
- * here; call it again after the kernel mapped new pool page tables. Idempotent.
+ * R5 (8.77, 8.79): memory context @ctx (1..7). Its PC is the kernel's with the extra entry replaced by the
+ * context's own PD; that PD starts empty and has page tables of its own only: nothing of the extra GiB is
+ * shared with the kernel or other contexts (the caller maps the pool pages the context may use). Idempotent.
  */
 int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 {
@@ -163,28 +163,32 @@ int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 
 	if (!ctx || ctx >= G4P_NR_CTX)
 		return -EINVAL;
+	if (mmu->ctx[ctx])
+		return 0;
 	ret = g4p_mmu_xpd_get(dev, mmu, APPLE_G4P_POOL_VA_K);
 	if (ret)
 		return ret;
-	c = &mmu->ctx[ctx];
-	if (!c->pc) {
-		c->pc = dma_alloc_coherent(dev, SZ_4K, &c->pc_dma, GFP_KERNEL);
-		c->pd = dma_alloc_coherent(dev, SZ_4K, &c->pd_dma, GFP_KERNEL);
-		if (!c->pc || !c->pd) {
-			g4p_mmu_ctx_fini(dev, mmu, ctx);
-			return -ENOMEM;
-		}
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
+	mmu->ctx[ctx] = c;
+	c->pc = dma_alloc_coherent(dev, SZ_4K, &c->pc_dma, GFP_KERNEL);
+	c->pd = dma_alloc_coherent(dev, SZ_4K, &c->pd_dma, GFP_KERNEL);
+	if (!c->pc || !c->pd) {
+		g4p_mmu_ctx_fini(dev, mmu, ctx);
+		return -ENOMEM;
 	}
 	memcpy(c->pc, mmu->pc, SZ_4K);
 	c->pc[MMU_PC_INDEX(mmu->xva)] = ((c->pd_dma >> 12) << 4) | MMU_PC_VALID;
-	memcpy(c->pd, mmu->xpd, 256 * sizeof(u64));
 	return 0;
 }
 
 void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 {
-	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+	struct g4p_mmu_ctx *c = mmu->ctx[ctx];
 
+	if (!c)
+		return;
 	for (unsigned int i = 0; i < ARRAY_SIZE(c->pt); i++)
 		if (c->pt[i])
 			dma_free_coherent(dev, SZ_4K, c->pt[i], c->pt_dma[i]);
@@ -192,38 +196,38 @@ void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 		dma_free_coherent(dev, SZ_4K, c->pd, c->pd_dma);
 	if (c->pc)
 		dma_free_coherent(dev, SZ_4K, c->pc, c->pc_dma);
-	memset(c, 0, sizeof(*c));
+	kfree(c);
+	mmu->ctx[ctx] = NULL;
 }
 
-/* one page in context @ctx's own half of the extra entry (VA 0x320000000..0x33fffffff) */
+/* one page of the extra GiB (pool or user range) in context @ctx */
 int g4p_mmu_ctx_map_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, phys_addr_t pa,
 			 u64 flags)
 {
-	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
 	unsigned int d = MMU_PD_INDEX(va);
 
-	if (!ctx || ctx >= G4P_NR_CTX || !c->pc || (va & ~(u64)(SZ_1G - 1)) != mmu->xva || d < 256 ||
-	    !IS_ALIGNED(va | pa, SZ_4K) || pa & ~GENMASK_ULL(39, 0))
+	if (!c || (va & ~(u64)(SZ_1G - 1)) != mmu->xva || !IS_ALIGNED(va | pa, SZ_4K) || pa & ~GENMASK_ULL(39, 0))
 		return -EINVAL;
-	if (!c->pt[d - 256]) {
-		c->pt[d - 256] = dma_alloc_coherent(dev, SZ_4K, &c->pt_dma[d - 256], GFP_KERNEL);
-		if (!c->pt[d - 256])
+	if (!c->pt[d]) {
+		c->pt[d] = dma_alloc_coherent(dev, SZ_4K, &c->pt_dma[d], GFP_KERNEL);
+		if (!c->pt[d])
 			return -ENOMEM;
-		c->pd[d] = (c->pt_dma[d - 256] & MMU_PA_MASK) | MMU_PD_VALID;
+		c->pd[d] = (c->pt_dma[d] & MMU_PA_MASK) | MMU_PD_VALID;
 	}
-	if (c->pt[d - 256][MMU_PT_INDEX(va)])
+	if (c->pt[d][MMU_PT_INDEX(va)])
 		return -EEXIST;
-	c->pt[d - 256][MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
+	c->pt[d][MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
 	return 0;
 }
 
 void g4p_mmu_ctx_unmap_page(struct g4p_mmu *mmu, unsigned int ctx, u64 va)
 {
-	struct g4p_mmu_ctx *c = &mmu->ctx[ctx];
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
 	unsigned int d = MMU_PD_INDEX(va);
 
-	if (ctx && ctx < G4P_NR_CTX && c->pc && (va & ~(u64)(SZ_1G - 1)) == mmu->xva && d >= 256 && c->pt[d - 256])
-		c->pt[d - 256][MMU_PT_INDEX(va)] = 0;
+	if (c && (va & ~(u64)(SZ_1G - 1)) == mmu->xva && c->pt[d])
+		c->pt[d][MMU_PT_INDEX(va)] = 0;
 }
 
 /* clear one page of the extra entry (the next job's MMU invalidate makes it visible) */

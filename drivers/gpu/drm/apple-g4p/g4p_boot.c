@@ -539,11 +539,28 @@ int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx)
 
 	if (!b || !ctx)
 		return 0;
-	fresh = !b->mmu.ctx[ctx].pc;
+	fresh = !b->mmu.ctx[ctx];
 	ret = g4p_mmu_ctx_init(g->dev, &b->mmu, ctx);
 	if (ret)
 		return ret;
-	g4p_fwinit_set_ctx(&b->fi, ctx, b->mmu.ctx[ctx].pc_dma);
+	if (fresh) {
+		/* 8.79: pool page 0 (the driver's PDS programs) read-only, then the file's own pool pages */
+		u64 f = heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS);
+
+		bool pool = g4p_boot_uses_pool(g);	/* not in a debugfs boot */
+
+		ret = pool ? g4p_mmu_ctx_map_page(g->dev, &b->mmu, ctx, G4P_PDS_VA, g->pool.dma,
+						  f | G4P_PTE_READ_ONLY) : 0;
+		for (unsigned int p = 1; pool && !ret && g->pool_owner && p < g->pool_pages; p++)
+			if (g->pool_owner[p] == ctx)
+				ret = g4p_mmu_ctx_map_page(g->dev, &b->mmu, ctx, G4P_PDS_VA + (u64)p * SZ_4K,
+							   g->pool.dma + (u64)p * SZ_4K, f);
+		if (ret) {
+			g4p_mmu_ctx_fini(g->dev, &b->mmu, ctx);
+			return ret;
+		}
+	}
+	g4p_fwinit_set_ctx(&b->fi, ctx, b->mmu.ctx[ctx]->pc_dma);
 	if (fresh && b->alive)
 		return g4p_boot_devctl(g, 3, ctx);
 	return 0;
@@ -557,8 +574,37 @@ void g4p_boot_ctx_detach(struct g4p *g, unsigned int ctx)
 {
 	struct g4p_boot *b = g->boot;
 
-	if (b && ctx && b->mmu.ctx[ctx].pc)
+	if (b && ctx && b->mmu.ctx[ctx])
 		g4p_fwinit_set_ctx(&b->fi, ctx, 0);
+}
+
+/* 8.79: a new pool BO of context @ctx in the running boot (attaching the context maps all its pool pages) */
+int g4p_boot_pool_map(struct g4p *g, unsigned int ctx, unsigned int first, unsigned int n)
+{
+	struct g4p_boot *b = g->boot;
+	u64 f = heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS);
+	int ret = 0;
+
+	if (!b || !ctx || !g4p_boot_uses_pool(g))
+		return 0;
+	if (!b->mmu.ctx[ctx])
+		return g4p_boot_ctx_attach(g, ctx);
+	for (unsigned int p = first; p < first + n && !ret; p++)
+		ret = g4p_mmu_ctx_map_page(g->dev, &b->mmu, ctx, G4P_PDS_VA + (u64)p * SZ_4K,
+					   g->pool.dma + (u64)p * SZ_4K, f);
+	wmb();
+	return ret;
+}
+
+void g4p_boot_pool_unmap(struct g4p *g, unsigned int ctx, unsigned int first, unsigned int n)
+{
+	struct g4p_boot *b = g->boot;
+
+	if (!b || !ctx || !b->mmu.ctx[ctx])
+		return;
+	for (unsigned int p = first; p < first + n; p++)
+		g4p_mmu_ctx_unmap_page(&b->mmu, ctx, G4P_PDS_VA + (u64)p * SZ_4K);
+	wmb();
 }
 
 /*
