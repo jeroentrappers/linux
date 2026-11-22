@@ -137,12 +137,17 @@ static int g4p_flush_unmap_locked(struct g4p *g)
 	return ret;
 }
 
-/* 8.79: the same, in memory context @ctx (an unmap there: its invalidate word changes) */
+/*
+ * 8.79: the same, in address space @ctx (an unmap there: its invalidate word changes). 8.84: one that is in no
+ * hardware slot needs none: its jobs are done, and loading it into a slot again flushes the MMU caches.
+ */
 static int g4p_flush_ctx_locked(struct g4p *g, unsigned int ctx)
 {
 	unsigned int saved = g->job_ctx;
 	int ret;
 
+	if (!g4p_boot_ctx_resident(g, ctx))
+		return 0;
 	g->job_ctx = ctx;
 	ret = g4p_flush_unmap_locked(g);
 	g->job_ctx = saved;
@@ -641,8 +646,21 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 	ret = g4p_pool_get_locked(g);
 	if (!ret)
 		ret = g4p_ensure_booted_locked(g);
-	if (!ret)	/* R5: the file's memory context in this boot (CAT_BASE[ctx] loaded before the kick) */
-		ret = g4p_boot_ctx_attach(g, ((struct g4p_file *)file->driver_priv)->ctx);
+	/* R5: the file's address space in a hardware slot of this boot (CAT_BASE[slot] loaded before the kick) */
+	while (!ret && (ret = g4p_boot_ctx_bind(g, ((struct g4p_file *)file->driver_priv)->ctx)) == -EAGAIN) {
+		/* 8.84: all seven slots have jobs in flight: wait for them, then bind again */
+		mutex_unlock(&g->lock);
+		ret = 0;
+		while (!ret && (prev = g4p_wait_target(g, true))) {
+			ret = dma_fence_wait(prev, true);
+			dma_fence_put(prev);
+		}
+		mutex_lock(&g->lock);
+		if (!ret)
+			ret = g4p_pool_get_locked(g);
+		if (!ret)
+			ret = g4p_ensure_booted_locked(g);
+	}
 	g->job_ctx = ((struct g4p_file *)file->driver_priv)->ctx;
 	if (!ret && async) {
 		struct dma_fence *f = kzalloc(sizeof(*f), GFP_KERNEL);
@@ -718,7 +736,10 @@ static const struct drm_ioctl_desc g4p_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_VM_BIND, g4p_ioctl_vm_bind, DRM_RENDER_ALLOW),
 };
 
-/* R5 (8.77): each open file gets one of the firmware's memory contexts 1..7 (0 is the kernel's) */
+/*
+ * R5 (8.77): each open file gets its own GPU address space 1..G4P_NR_VM - 1 (0 is the kernel's); 8.84: it is
+ * loaded into one of the firmware's seven memory context slots when the file submits
+ */
 static int g4p_drm_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct g4p *g = to_g4p(drm);
@@ -728,13 +749,13 @@ static int g4p_drm_open(struct drm_device *drm, struct drm_file *file)
 	if (!gf)
 		return -ENOMEM;
 	mutex_lock(&g->lock);
-	c = find_next_zero_bit(&g->ctx_used, G4P_NR_CTX, 1);
-	if (c < G4P_NR_CTX)
+	c = find_next_zero_bit(&g->ctx_used, G4P_NR_VM, 1);
+	if (c < G4P_NR_VM)
 		set_bit(c, &g->ctx_used);
 	mutex_unlock(&g->lock);
-	if (c >= G4P_NR_CTX) {
+	if (c >= G4P_NR_VM) {
 		kfree(gf);
-		return -EBUSY;	/* all seven in use */
+		return -EBUSY;	/* all address spaces in use */
 	}
 	gf->ctx = c;
 	file->driver_priv = gf;

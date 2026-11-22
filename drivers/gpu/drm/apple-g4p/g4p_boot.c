@@ -25,6 +25,7 @@
 
 #include "g4p.h"
 
+#define G4P_STAMP_VALUE		0x5a5a0001
 #define G4P_JOB_SLOTS	8
 
 /* Rogue registers (upstream ROGUE_CR_*), as AGX writes them (re/GPU-BRINGUP.md 4.1) */
@@ -112,6 +113,13 @@ struct g4p_boot {
 		u64 fault[4];
 	} jobs[G4P_JOB_SLOTS];	/* 8.69: job slots, used round robin */
 	u32 events_seen;	/* firmware events drained after the boot (8.78) */
+	/*
+	 * 8.84: which address space each hardware context slot 1..7 holds in this boot, and back; the job number
+	 * of the slot's last kick (its jobs are done once that one is) and whether it had one
+	 */
+	u8 slot_vm[G4P_NR_CTX], vm_slot[G4P_NR_VM];
+	u32 slot_last[G4P_NR_CTX];
+	bool slot_kicked[G4P_NR_CTX];
 	u32 job_n;		/* jobs kicked in this boot; job k uses slot k % G4P_JOB_SLOTS, stamp base + k */
 	int cl_ret;
 	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd, cl_state_24;
@@ -561,22 +569,89 @@ int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx)
 			return ret;
 		}
 	}
-	g4p_fwinit_set_ctx(&b->fi, ctx, b->mmu.ctx[ctx]->pc_dma);
-	if (fresh && b->alive)
-		return g4p_boot_devctl(g, 3, ctx);
 	return 0;
 }
 
+/* 8.84: all jobs kicked in hardware slot @s are complete (jobs run in order; a reused job slot means done) */
+static bool g4p_boot_slot_idle(struct g4p_boot *b, unsigned int s)
+{
+	u32 n = b->slot_last[s];
+	struct g4p_cljob *j = &b->jobs[n % G4P_JOB_SLOTS];
+
+	if (!b->slot_kicked[s] || j->expect != G4P_STAMP_VALUE + n)
+		return true;
+	return j->stamp0 == j->expect || READ_ONCE(*(u32 *)j->misc.cpu) == j->expect;
+}
+
+bool g4p_boot_ctx_resident(struct g4p *g, unsigned int ctx)
+{
+	return !ctx || (g->boot && ctx < G4P_NR_VM && g->boot->vm_slot[ctx]);
+}
+
 /*
- * the context's owner went away: drop its table entry. Its tables stay until the boot ends (CAT_BASE[ctx]
- * still points at them); a later owner of the same number reuses them, by then empty in the user half.
+ * 8.84: load address space @ctx into a hardware context slot for a kick: the slot it already has, a free one,
+ * or the least recently kicked slot whose jobs are all done (its address space keeps its tables and gets a
+ * slot again on its next submit). The context table entry, and once the firmware runs a device-control type 3
+ * (loads CAT_BASE[slot], copies the slot's invalidate word, flushes the MMU caches). -EAGAIN: every slot has
+ * jobs in flight (the caller waits for them and retries).
+ */
+int g4p_boot_ctx_bind(struct g4p *g, unsigned int ctx)
+{
+	struct g4p_boot *b = g->boot;
+	unsigned int s, best = 0;
+	int ret;
+
+	if (!b || !ctx)
+		return 0;
+	if (ctx >= G4P_NR_VM)
+		return -EINVAL;
+	ret = g4p_boot_ctx_attach(g, ctx);
+	if (ret || b->vm_slot[ctx])
+		return ret;
+	for (s = 1; s < G4P_NR_CTX && !best; s++)
+		if (!b->slot_vm[s])
+			best = s;
+	for (s = 1; s < G4P_NR_CTX && !best; s++)
+		if (g4p_boot_slot_idle(b, s))
+			best = s;
+	for (s = best + 1; best && b->slot_vm[best] && s < G4P_NR_CTX; s++)	/* the least recently kicked */
+		if (b->slot_vm[s] && g4p_boot_slot_idle(b, s) &&
+		    (!b->slot_kicked[s] || (b->slot_kicked[best] && (s32)(b->slot_last[s] - b->slot_last[best]) < 0)))
+			best = s;
+	if (!best)
+		return -EAGAIN;
+	if (b->slot_vm[best])
+		b->vm_slot[b->slot_vm[best]] = 0;
+	b->slot_vm[best] = ctx;
+	b->vm_slot[ctx] = best;
+	b->slot_kicked[best] = false;
+	g4p_fwinit_set_ctx(&b->fi, best, b->mmu.ctx[ctx]->pc_dma);
+	if (b->alive) {
+		ret = g4p_boot_devctl(g, 3, best);
+		if (ret) {
+			b->slot_vm[best] = 0;
+			b->vm_slot[ctx] = 0;
+			g4p_fwinit_set_ctx(&b->fi, best, 0);
+		}
+	}
+	return ret;
+}
+
+/*
+ * the address space's owner went away: out of its slot. Its tables stay until the boot ends (CAT_BASE[slot]
+ * may still point at them until the slot is reused); a later owner of the same number reuses them, by then
+ * empty in the user half.
  */
 void g4p_boot_ctx_detach(struct g4p *g, unsigned int ctx)
 {
 	struct g4p_boot *b = g->boot;
+	unsigned int s;
 
-	if (b && ctx && b->mmu.ctx[ctx])
-		g4p_fwinit_set_ctx(&b->fi, ctx, 0);
+	if (!b || !ctx || ctx >= G4P_NR_VM || !(s = b->vm_slot[ctx]))
+		return;
+	g4p_fwinit_set_ctx(&b->fi, s, 0);
+	b->slot_vm[s] = 0;
+	b->vm_slot[ctx] = 0;
 }
 
 /* 8.79: a new pool BO of context @ctx in the running boot (attaching the context maps all its pool pages) */
@@ -726,7 +801,6 @@ int g4p_boot_cl_c1(struct g4p *g)
  * {FW(stamp0), FW(stamp1), value, index}. Results: channel ring read index, stamp, events, live BIF faults.
  */
 #define G4P_CDM_CMD_SIZE	0x2c0	/* iOS CDM pool slot size (capture 1) */
-#define G4P_STAMP_VALUE		0x5a5a0001
 
 static void w32a(void *p, u32 off, u32 v)
 {
@@ -1115,7 +1189,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	u32 entry[5] = { 2 };
 	u32 fcmd, fchan, fa3, *w;
 	void *ctl;
-	unsigned int n = 0, end;
+	unsigned int n = 0, end, hw;
 	int wr, cwr, ret;
 	u32 stamp;
 	bool first;
@@ -1165,6 +1239,9 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	 * 8.81: a job in a user context reads its stream and terminate page from that context's private copies,
 	 * mapped read-only at the slot's VAs in the context only; the slot's own pages (stamps) stay unreachable.
 	 */
+	hw = which == 8 && g->job_ctx < G4P_NR_VM ? b->vm_slot[g->job_ctx] : 0;
+	if (which == 8 && g->job_ctx && !hw)
+		return -EINVAL;	/* not bound (g4p_boot_ctx_bind) */
 	j->sp = j->misc.cpu;
 	j->tp = j->cdm.cpu;
 	if (which == 8 && g->job_ctx) {
@@ -1265,7 +1342,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 
 		/* 2: CDM kick */
 		w[n++] = hdr2; w[n++] = fcmd + 0x18; w[n++] = fcmd + 0x68; w[n++] = fa3 + 0x720; w[n++] = fchan;
-		w[n++] = g->job_ctx;	/* +16: memory context (fw 0x10021648: CDM CAT_BASE index, 8.77) */
+		w[n++] = hw;	/* +16: memory context slot (fw 0x10021648: CDM CAT_BASE index, 8.77, 8.84) */
 		w[n++] = 0; w[n++] = 0; w[n++] = 0; w[n++] = fcmd + 0x1f0; w[n++] = 0; w[n++] = 0;
 		w[n++] = 0;
 		/* 3: timestamps */
@@ -1292,7 +1369,11 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	cwr = (cwr + 1) % G4P_CHAN_RING_SIZE;
 	*(u32 *)(ctl + 0x40) = cwr;
 	if (gart_inval)
-		g4p_fwinit_gart_inval(&b->fi, g->job_ctx);
+		g4p_fwinit_gart_inval(&b->fi, hw);
+	if (hw) {
+		b->slot_last[hw] = b->job_n;
+		b->slot_kicked[hw] = true;
+	}
 
 	entry[1] = fchan;
 	entry[2] = cwr;
@@ -1436,8 +1517,8 @@ void g4p_boot_stall_dbg(struct g4p *g)
 }
 
 /*
- * 8.80/8.83: an MMU fault latched in bank 0 or 1 (MMU status bit 0 valid, bits 15:12 the memory context, as
- * 0x1001 for context 1): returns 1 + that context, or 0 (none, or the GPU is not on and running)
+ * 8.80/8.83: an MMU fault latched in bank 0 or 1 (MMU status bit 0 valid, bits 15:12 the memory context slot,
+ * as 0x1001 for slot 1): returns 1 + the address space in that slot, or 0 (none, or the GPU is not on and running)
  */
 int g4p_boot_mmu_fault(struct g4p *g)
 {
@@ -1448,7 +1529,10 @@ int g4p_boot_mmu_fault(struct g4p *g)
 	v = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
 	if (!(v & 1))
 		v = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
-	return v & 1 ? 1 + ((v >> 12) & 0xf) : 0;
+	if (!(v & 1))
+		return 0;
+	v = (v >> 12) & 0xf;	/* the hardware slot: its address space (8.84) */
+	return 1 + (v && v < G4P_NR_CTX ? g->boot->slot_vm[v] : 0);
 }
 
 /* diagnostics for a stuck fence entry: slot state of job n */

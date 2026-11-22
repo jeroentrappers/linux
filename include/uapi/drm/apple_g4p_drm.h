@@ -32,7 +32,7 @@ enum drm_apple_g4p_param {
 	DRM_APPLE_G4P_PARAM_POOL_SIZE = 2,	/* bytes */
 	DRM_APPLE_G4P_PARAM_CORE_ID = 3,	/* RGX CORE_ID, valid once the GPU has been powered */
 	DRM_APPLE_G4P_PARAM_CORE_REVISION = 4,
-	DRM_APPLE_G4P_PARAM_MEMORY_CONTEXT = 5,	/* this file's GPU memory context (1..7), 8.77 */
+	DRM_APPLE_G4P_PARAM_MEMORY_CONTEXT = 5,	/* this file's GPU address space (1..31), 8.77, 8.84 */
 };
 
 struct drm_apple_g4p_get_param {
@@ -85,7 +85,9 @@ struct drm_apple_g4p_submit {
 /*
  * VM_BIND (8.71): map a NOMAP buffer at a GPU VA chosen by user space, or unmap it. Since 8.77 every open file
  * has its own GPU address space for the user range [APPLE_G4P_USER_VA_START, APPLE_G4P_USER_VA_END): separate
- * buffers are only visible to the jobs of the file that created them, like its pool buffers. At most seven files can be open at once (open fails with EBUSY). Bindings are 4 KiB aligned, one per
+ * buffers are only visible to the jobs of the file that created them, like its pool buffers. At most 31 files can be
+ * open at once (open fails with EBUSY); the firmware's seven memory context slots are shared among them (8.84).
+ * Bindings are 4 KiB aligned, one per
  * buffer, whole buffer, no overlaps. Unmapping (and freeing a bound buffer) waits for the jobs in flight and
  * makes the unmap effective before it returns.
  */

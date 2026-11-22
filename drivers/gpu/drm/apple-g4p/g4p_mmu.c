@@ -71,7 +71,7 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu)
 {
-	for (unsigned int c = 1; c < G4P_NR_CTX; c++)
+	for (unsigned int c = 1; c < G4P_NR_VM; c++)
 		g4p_mmu_ctx_fini(dev, mmu, c);
 	for (unsigned int i = 0; i < ARRAY_SIZE(mmu->xpt); i++)
 		if (mmu->xpt[i])
@@ -152,7 +152,8 @@ int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_
 }
 
 /*
- * R5 (8.77, 8.79): memory context @ctx (1..7). Its PC is the kernel's with the extra entry replaced by the
+ * R5 (8.77, 8.79, 8.84): address space @ctx (1..G4P_NR_VM - 1; loaded into a hardware context slot by
+ * g4p_boot_ctx_bind). Its PC is the kernel's with the extra entry replaced by the
  * context's own PD; that PD starts empty and has page tables of its own only: nothing of the extra GiB is
  * shared with the kernel or other contexts (the caller maps the pool pages the context may use). Idempotent.
  */
@@ -161,7 +162,7 @@ int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 	struct g4p_mmu_ctx *c;
 	int ret;
 
-	if (!ctx || ctx >= G4P_NR_CTX)
+	if (!ctx || ctx >= G4P_NR_VM)
 		return -EINVAL;
 	if (mmu->ctx[ctx])
 		return 0;
@@ -224,7 +225,7 @@ void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 int g4p_mmu_ctx_map_fw_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, unsigned int page,
 			    u64 flags)
 {
-	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_VM ? mmu->ctx[ctx] : NULL;
 	unsigned int d = MMU_PD_INDEX(va);
 	u64 pte;
 
@@ -247,7 +248,7 @@ int g4p_mmu_ctx_map_fw_page(struct device *dev, struct g4p_mmu *mmu, unsigned in
 int g4p_mmu_ctx_map_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, phys_addr_t pa,
 			 u64 flags)
 {
-	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_VM ? mmu->ctx[ctx] : NULL;
 	unsigned int d = MMU_PD_INDEX(va);
 
 	if (!c || (va & ~(u64)(SZ_1G - 1)) != mmu->xva || !IS_ALIGNED(va | pa, SZ_4K) || pa & ~GENMASK_ULL(39, 0))
@@ -266,7 +267,7 @@ int g4p_mmu_ctx_map_page(struct device *dev, struct g4p_mmu *mmu, unsigned int c
 
 void g4p_mmu_ctx_unmap_page(struct g4p_mmu *mmu, unsigned int ctx, u64 va)
 {
-	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_VM ? mmu->ctx[ctx] : NULL;
 	unsigned int d = MMU_PD_INDEX(va);
 
 	if (c && (va & ~(u64)(SZ_1G - 1)) == mmu->xva && c->pt[d])
