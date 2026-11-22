@@ -438,6 +438,9 @@ int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const voi
 			 READ_ONCE(*(u32 *)r->ring[1].cpu), READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x10)),
 			 READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x20)), READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x30)), r->wr[1],
 			 g4p_boot_mmu_fault(g));
+		if (g4p_boot_mmu_fault(g))	/* 9.53: where (bank MMU status / request: the faulting address) */
+			dev_info(g->dev, "render: BIF fault bank0 %016llx / %016llx bank1 %016llx / %016llx\n",
+				 readq(g->rgx + 0x12b0), readq(g->rgx + 0x12b8), readq(g->rgx + 0x12c0), readq(g->rgx + 0x12c8));
 	}
 	return 0;
 }
