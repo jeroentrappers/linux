@@ -244,6 +244,13 @@ struct adpt {
 	u16 tag;
 	u64 flush_seq;		/* vblank count at the last flush */
 	struct drm_pending_vblank_event *event;
+	/*
+	 * direct mode: the new scanout base waits for the next VBI (written from the IRQ, so the switch happens in
+	 * blanking, not at the scan line: no tearing); base_seq = the vblank count it was written at. Under event_lock.
+	 */
+	u32 pending_base;
+	bool base_pending;
+	u64 base_seq;
 	unsigned long storm_jiffies;
 	unsigned int storm_count;
 	bool irq_dead;		/* storm guard disabled the line; vbl_timer fakes vblanks */
@@ -493,6 +500,11 @@ static void adpt_handle_events(struct adpt *adp, u32 st)
 		drm_crtc_handle_vblank(crtc);
 
 	spin_lock(&adp->drm.event_lock);
+	if ((st & ADP_IRQ_VBI) && adp->base_pending) {
+		writel(adp->pending_base, adp->adp + PIPE(0) + PIPE_BASE);
+		adp->base_pending = false;
+		adp->base_seq = drm_crtc_vblank_count(crtc);
+	}
 	if (adp->event) {
 		bool done;
 
@@ -500,8 +512,12 @@ static void adpt_handle_events(struct adpt *adp, u32 st)
 
 		if (fifo_sync)	/* packet applied; two VBIs without one = give up waiting */
 			done = (st & ADP_IRQ_PKT_DONE) || seq > adp->flush_seq + 1;
-		else	/* direct writes latch at the next frame start: the first VBI after the flush */
-			done = (st & ADP_IRQ_VBI) && seq > adp->flush_seq;
+		else	/*
+			 * the base is written in this VBI's blanking: the old buffer is no longer scanned out once
+			 * the frame starts, so complete now (one VBI later halves the rate of a double-buffered
+			 * swapchain: 30 fps)
+			 */
+			done = (st & ADP_IRQ_VBI) && seq > adp->flush_seq && !adp->base_pending;
 		if (done) {
 			drm_crtc_send_vblank_event(crtc, adp->event);
 			adp->event = NULL;
@@ -1387,7 +1403,17 @@ static void adpt_plane_atomic_update(struct drm_plane *plane, struct drm_atomic_
 		writel(fb->pitches[0], adp->adp + PIPE(0) + PIPE_STRIDE);
 		adp->pitch = fb->pitches[0];
 	}
-	writel(to_bo(fb->obj[0])->iova + fb->offsets[0], adp->adp + PIPE(0) + PIPE_BASE);
+	if (!fifo_sync && READ_ONCE(adp->vbl_on) && !READ_ONCE(adp->irq_dead)) {
+		/* written from the next VBI (adpt_handle_events): a mid-frame base write tears */
+		unsigned long flags;
+
+		spin_lock_irqsave(&adp->drm.event_lock, flags);
+		adp->pending_base = to_bo(fb->obj[0])->iova + fb->offsets[0];
+		adp->base_pending = true;
+		spin_unlock_irqrestore(&adp->drm.event_lock, flags);
+	} else {
+		writel(to_bo(fb->obj[0])->iova + fb->offsets[0], adp->adp + PIPE(0) + PIPE_BASE);
+	}
 	drm_dev_exit(idx);
 }
 
