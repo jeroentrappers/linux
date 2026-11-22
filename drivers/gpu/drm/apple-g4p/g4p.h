@@ -80,6 +80,7 @@ struct g4p {
 	unsigned long *pool_map;		/* bitmap of used pages */
 	unsigned int pool_pages;
 	struct list_head sep_bos;		/* separate BOs (8.65), mapped into every boot */
+	struct list_head maps;			/* 9.22: VM_BIND range mappings, mapped into every boot */
 	struct list_head zombies;		/* their memory, freed while the GPU was on */
 	u64 sep_next;				/* next free GPU VA for them (context 0) */
 	unsigned long ctx_used;			/* R5: address spaces owned by DRM files (bit n = address space n) */

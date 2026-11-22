@@ -56,6 +56,14 @@ struct g4p_gem {
 	struct sg_table *sgt;
 };
 
+/* 9.22: a VM_BIND range mapping; holds a reference on its buffer */
+struct g4p_map {
+	struct list_head node;		/* g->maps */
+	struct g4p_gem *bo;
+	unsigned int ctx;
+	u64 va, offset, size;
+};
+
 /* R5 (8.77): per DRM file: its own GPU memory context (1..7) and VA allocator for separate BOs */
 struct g4p_file {
 	unsigned int ctx;
@@ -272,9 +280,14 @@ int g4p_drm_map_separate(struct g4p *g)
 	struct g4p_gem *bo;
 	int ret = 0;
 
+	struct g4p_map *m;
+
 	list_for_each_entry(bo, &g->sep_bos, node)
 		if (!ret)
 			ret = g4p_boot_map_range(g, bo->ctx, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
+	list_for_each_entry(m, &g->maps, node)
+		if (!ret)
+			ret = g4p_boot_map_range(g, m->ctx, m->va, m->bo->mem.dma + m->offset, m->size);
 	return ret;
 }
 
@@ -339,10 +352,62 @@ static bool g4p_va_busy(struct g4p *g, unsigned int ctx, u64 va, u64 size)
 {
 	struct g4p_gem *o;
 
+	struct g4p_map *m;
+
 	list_for_each_entry(o, &g->sep_bos, node)
 		if (o->ctx == ctx && va < o->mem.gpuva + o->mem.size && o->mem.gpuva < va + size)
 			return true;
+	list_for_each_entry(m, &g->maps, node)
+		if (m->ctx == ctx && va < m->va + m->size && m->va < va + size)
+			return true;
 	return false;
+}
+
+/* 9.22: map / unmap a range of a buffer; called with g->lock held */
+static int g4p_vm_bind_range_locked(struct g4p *g, struct g4p_gem *bo, struct drm_apple_g4p_vm_bind *a)
+{
+	struct g4p_map *m;
+	int ret;
+
+	if (a->op == APPLE_G4P_VM_BIND_UNMAP) {
+		list_for_each_entry(m, &g->maps, node) {
+			if (m->bo != bo || m->va != a->gpu_va)
+				continue;
+			list_del(&m->node);
+			g4p_boot_unmap_range(g, m->ctx, m->va, m->size);
+			if (g->powered && g->boot && g4p_flush_ctx_locked(g, m->ctx))
+				g4p_recover_locked(g);
+			drm_gem_object_put(&bo->base);	/* the buffer itself is kept by its handle */
+			kfree(m);
+			return 0;
+		}
+		return -ENOENT;
+	}
+	if (a->op != APPLE_G4P_VM_BIND_MAP)
+		return -EINVAL;
+	{
+		bool user = a->gpu_va >= APPLE_G4P_USER_VA_START && a->gpu_va + a->size <= APPLE_G4P_USER_VA_END;
+		bool code = a->gpu_va >= APPLE_G4P_CODE_VA_START && a->gpu_va + a->size <= APPLE_G4P_CODE_VA_END;
+
+		if (!IS_ALIGNED(a->gpu_va | a->offset | a->size, SZ_4K) || (!user && !code) ||
+		    a->offset >= bo->mem.size || a->size > bo->mem.size - a->offset)
+			return -EINVAL;
+	}
+	if (g4p_va_busy(g, bo->ctx, a->gpu_va, a->size))
+		return -EBUSY;
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return -ENOMEM;
+	*m = (struct g4p_map){ .bo = bo, .ctx = bo->ctx, .va = a->gpu_va, .offset = a->offset, .size = a->size };
+	ret = g4p_boot_map_range(g, m->ctx, m->va, bo->mem.dma + m->offset, m->size);
+	if (ret) {
+		g4p_boot_unmap_range(g, m->ctx, m->va, m->size);
+		kfree(m);
+		return ret;
+	}
+	drm_gem_object_get(&bo->base);
+	list_add_tail(&m->node, &g->maps);
+	return 0;
 }
 
 static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file *file)
@@ -371,6 +436,11 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 		}
 	}
 	mutex_lock(&g->lock);
+	if (a->size || (a->op == APPLE_G4P_VM_BIND_UNMAP && !(bo->mapped && bo->mem.gpuva == a->gpu_va))) {
+		ret = g4p_vm_bind_range_locked(g, bo, a);
+		mutex_unlock(&g->lock);
+		goto out;
+	}
 	switch (a->op) {
 	case APPLE_G4P_VM_BIND_MAP:
 		bool user = a->gpu_va >= APPLE_G4P_USER_VA_START && a->gpu_va + bo->mem.size <= APPLE_G4P_USER_VA_END;
@@ -843,6 +913,7 @@ static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
 	struct g4p_gem *bo, *t;
 	struct dma_fence *f;
 	bool any = false;
+	LIST_HEAD(dead);
 
 	while ((f = g4p_wait_target(g, true))) {
 		dma_fence_wait(f, false);
@@ -857,11 +928,30 @@ static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 		any = true;
 	}
+	{
+		struct g4p_map *m, *mt;
+
+		list_for_each_entry_safe(m, mt, &g->maps, node) {
+			if (m->ctx != gf->ctx)
+				continue;
+			list_move_tail(&m->node, &dead);
+			g4p_boot_unmap_range(g, m->ctx, m->va, m->size);
+			any = true;
+		}
+	}
 	if (any && g->powered && g->boot && g4p_flush_ctx_locked(g, gf->ctx))
 		g4p_recover_locked(g);
 	g4p_boot_ctx_detach(g, gf->ctx);
 	clear_bit(gf->ctx, &g->ctx_used);
 	mutex_unlock(&g->lock);
+	{	/* their buffer references: dropped outside the lock (the last one frees the buffer, which locks) */
+		struct g4p_map *m, *mt;
+
+		list_for_each_entry_safe(m, mt, &dead, node) {
+			drm_gem_object_put(&m->bo->base);
+			kfree(m);
+		}
+	}
 	kfree(gf);
 }
 
@@ -921,6 +1011,7 @@ struct g4p *g4p_drm_alloc(struct device *dev)
 
 	if (!IS_ERR(g)) {
 		INIT_LIST_HEAD(&g->sep_bos);
+		INIT_LIST_HEAD(&g->maps);
 		INIT_LIST_HEAD(&g->zombies);
 		INIT_DELAYED_WORK(&g->idle_work, g4p_idle_work);
 		INIT_DELAYED_WORK(&g->timeout_work, g4p_timeout_work);

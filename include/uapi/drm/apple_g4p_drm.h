@@ -107,7 +107,15 @@ struct drm_apple_g4p_submit {
 struct drm_apple_g4p_vm_bind {
 	__u32 handle;		/* in: GEM handle of a SEPARATE|NOMAP buffer */
 	__u32 op;		/* in: APPLE_G4P_VM_BIND_* */
-	__u64 gpu_va;		/* in (MAP): where */
+	__u64 gpu_va;		/* in (MAP): where; (UNMAP of a range mapping): which */
+	/*
+	 * 9.22: size 0 = the whole buffer, once (as before; older user space passes the shorter struct, DRM zero-fills
+	 * these). size != 0: a range mapping [offset, offset + size) of the buffer at gpu_va (4 KiB aligned); a buffer
+	 * can have any number of them (Vulkan binds buffers and images at offsets of one allocation). UNMAP with a
+	 * gpu_va of a range mapping removes that mapping.
+	 */
+	__u64 offset;
+	__u64 size;
 };
 
 /*
