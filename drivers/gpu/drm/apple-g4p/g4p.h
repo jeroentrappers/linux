@@ -89,6 +89,8 @@ struct g4p {
 	spinlock_t fence_lock;
 	struct dma_fence *fq[8];		/* 8.69: jobs in flight, oldest at fq_tail; IRQ / timeout signal */
 	u32 fq_job[8];				/* their job numbers in the boot */
+	u8 fq_ctx[8];				/* their memory contexts (8.83: whose job faulted) */
+	unsigned long fq_deadline;		/* 8.83: jiffies when the oldest job times out */
 	unsigned int fq_head, fq_tail;
 	u64 fence_ctx, fence_seq;
 	struct delayed_work timeout_work;
@@ -215,7 +217,7 @@ u32 g4p_boot_next_job(struct g4p *g);
 void g4p_boot_job_dbg(struct g4p *g, u32 n);
 void g4p_boot_job_retire(struct g4p *g, u32 n);
 void g4p_boot_stall_dbg(struct g4p *g);
-bool g4p_boot_mmu_fault(struct g4p *g);
+int g4p_boot_mmu_fault(struct g4p *g);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);

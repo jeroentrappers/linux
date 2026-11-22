@@ -64,7 +64,8 @@ struct drm_apple_g4p_bo_create {
  * an error after timeout_ms (the GPU is then powered off for recovery). Up to four submits are in flight; a
  * further async submit waits for the oldest, a synchronous one for all. A job's fence signals only once all of
  * its stores are in memory (8.78). status/stamp/elapsed_us/fault are only filled in for synchronous submits. Fence errors (8.80): -EFAULT the job faulted
- * (GPU MMU), -ECANCELED queued behind a failed job, -ETIMEDOUT; read them through a sync file (SYNC_IOC_FILE_INFO).
+ * (GPU MMU, found within ~20 ms), -ECANCELED dropped by the recovery after another job failed, -ETIMEDOUT (1 s);
+ * read them through a sync file (SYNC_IOC_FILE_INFO).
  */
 #define APPLE_G4P_SUBMIT_ASYNC		(1 << 0)
 

@@ -457,6 +457,8 @@ static const struct dma_fence_ops g4p_fence_ops = {
 #define G4P_FQ		8	/* = G4P_JOB_SLOTS (g4p_boot.c) */
 #define G4P_INFLIGHT	(G4P_FQ / 2)	/* submits in flight: two job slots each (8.78) */
 
+static void g4p_arm_timeout(struct g4p *g);
+
 /* complete jobs in flight, oldest first, while their stamps are in memory (IRQ or process context) */
 void g4p_drm_irq(struct g4p *g)
 {
@@ -481,52 +483,72 @@ void g4p_drm_irq(struct g4p *g)
 		dma_fence_put(done[i]);
 	}
 	if (n && g->fq_tail != g->fq_head)	/* the next oldest job gets a fresh timeout */
-		mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
+		g4p_arm_timeout(g);
 }
 
-/* fail every job in flight (timeout, or a job that was never kicked): the oldest with err, the rest with rest */
-static void g4p_fail_inflight(struct g4p *g, int err, int rest)
+/*
+ * fail every job in flight (timeout, fault, or a job that was never kicked): with @fctx (1 + the faulting
+ * context) the jobs of that context get -EFAULT, the others -ECANCELED (the recovery drops them); else the
+ * oldest gets @err and the rest @rest
+ */
+static void g4p_fail_inflight(struct g4p *g, int err, int rest, int fctx)
 {
 	struct dma_fence *f;
 	unsigned long flags;
+	int e;
 
 	for (;;) {
 		spin_lock_irqsave(&g->fence_lock, flags);
 		f = NULL;
 		if (g->fq_tail != g->fq_head) {
 			f = g->fq[g->fq_tail % G4P_FQ];
+			e = fctx ? (g->fq_ctx[g->fq_tail % G4P_FQ] + 1 == fctx ? -EFAULT : -ECANCELED) : err;
 			g->fq[g->fq_tail % G4P_FQ] = NULL;
 			g->fq_tail++;
 		}
 		spin_unlock_irqrestore(&g->fence_lock, flags);
 		if (!f)
 			break;
-		dma_fence_set_error(f, err);
+		dma_fence_set_error(f, e);
 		dma_fence_signal(f);
 		dma_fence_put(f);
 		err = rest;
 	}
 }
 
+#define G4P_TIMEOUT_MS		1000
+#define G4P_FAULT_POLL_MS	20	/* 8.83: a faulted job never completes; look for the fault this often */
+
+/* (re)start the oldest job's timeout */
+static void g4p_arm_timeout(struct g4p *g)
+{
+	g->fq_deadline = jiffies + msecs_to_jiffies(G4P_TIMEOUT_MS);
+	mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(G4P_FAULT_POLL_MS));
+}
+
 static void g4p_timeout_work(struct work_struct *w)
 {
 	struct g4p *g = container_of(to_delayed_work(w), struct g4p, timeout_work);
+	int fctx;
 
 	mutex_lock(&g->lock);
 	g4p_drm_irq(g);	/* a missed interrupt: check the stamps once more */
-	if (g->fq_tail != g->fq_head) {
-		g4p_boot_stall_dbg(g);
-		for (u32 i = g->fq_tail; i != g->fq_head; i++) {
-			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ]);
-			g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ] + 1);
-		}
-		/*
-		 * 8.80: a job that faulted never completes; the BIF fault registers tell it from a hang. The oldest
-		 * job is the stuck one, the jobs behind it never ran (the recovery drops them).
-		 */
-		g4p_fail_inflight(g, g4p_boot_mmu_fault(g) ? -EFAULT : -ETIMEDOUT, -ECANCELED);
-		g4p_recover_locked(g);
+	if (g->fq_tail == g->fq_head)
+		goto out;
+	/* 8.80/8.83: a job that faulted never completes; the BIF fault status names its context */
+	fctx = g4p_boot_mmu_fault(g);
+	if (!fctx && time_before(jiffies, g->fq_deadline)) {
+		mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(G4P_FAULT_POLL_MS));
+		goto out;
 	}
+	g4p_boot_stall_dbg(g);
+	for (u32 i = g->fq_tail; i != g->fq_head; i++) {
+		g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ]);
+		g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ] + 1);
+	}
+	g4p_fail_inflight(g, -ETIMEDOUT, -ECANCELED, fctx);
+	g4p_recover_locked(g);
+out:
 	mutex_unlock(&g->lock);
 }
 
@@ -637,6 +659,7 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 				ret = -EBUSY;	/* raced with another submitter: user space retries */
 			} else {
 				g->fq_job[g->fq_head % G4P_FQ] = g4p_boot_next_job(g);
+				g->fq_ctx[g->fq_head % G4P_FQ] = g->job_ctx;
 				g->fq[g->fq_head % G4P_FQ] = dma_fence_get(f);	/* before the kick: the IRQ may come */
 				g->fq_head++;
 			}
@@ -651,11 +674,11 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 				dma_fence_set_error(f, ret);	/* not queued: signal it here */
 				dma_fence_signal(f);
 			} else if (ret) {
-				g4p_fail_inflight(g, ret, ret);	/* queued but never kicked */
+				g4p_fail_inflight(g, ret, ret, 0);	/* queued but never kicked */
 			} else {
 				g4p_drm_irq(g);	/* very short jobs: already done */
 				if (!delayed_work_pending(&g->timeout_work))
-					mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
+					g4p_arm_timeout(g);
 			}
 			if (sync)
 				drm_syncobj_replace_fence(sync, f);
