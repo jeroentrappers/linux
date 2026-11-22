@@ -22,6 +22,7 @@ extern "C" {
 #define DRM_APPLE_G4P_GET_PARAM		0x00
 #define DRM_APPLE_G4P_BO_CREATE		0x01
 #define DRM_APPLE_G4P_SUBMIT		0x02
+#define DRM_APPLE_G4P_VM_BIND		0x03
 
 enum drm_apple_g4p_param {
 	DRM_APPLE_G4P_PARAM_POOL_VA = 1,	/* GPU VA of the pool (APPLE_G4P_POOL_VA) */
@@ -42,6 +43,8 @@ struct drm_apple_g4p_get_param {
  * invalidate) and before every later boot. Its GPU VA is not a code offset (keep code in pool BOs).
  */
 #define APPLE_G4P_BO_SEPARATE		(1 << 0)
+/* with SEPARATE: no GPU VA yet, user space binds it with VM_BIND (gpu_va returns 0) */
+#define APPLE_G4P_BO_NOMAP		(1 << 1)
 
 struct drm_apple_g4p_bo_create {
 	__u64 size;		/* in: bytes, rounded up to 4 KiB */
@@ -72,9 +75,27 @@ struct drm_apple_g4p_submit {
 	__u32 pad2;
 };
 
+/*
+ * VM_BIND (8.71): map a NOMAP buffer at a GPU VA chosen by user space, or unmap it. One GPU address space for the
+ * device for now (all clients share it: bring-up only); the user range is [APPLE_G4P_USER_VA_START,
+ * APPLE_G4P_USER_VA_END), 4 KiB aligned; one binding per buffer, whole buffer, no overlaps. Unmapping (and
+ * freeing a bound buffer) waits for the jobs in flight and makes the unmap effective before it returns.
+ */
+#define APPLE_G4P_USER_VA_START		0x320000000ULL
+#define APPLE_G4P_USER_VA_END		0x340000000ULL
+#define APPLE_G4P_VM_BIND_MAP		0
+#define APPLE_G4P_VM_BIND_UNMAP		1
+
+struct drm_apple_g4p_vm_bind {
+	__u32 handle;		/* in: GEM handle of a SEPARATE|NOMAP buffer */
+	__u32 op;		/* in: APPLE_G4P_VM_BIND_* */
+	__u64 gpu_va;		/* in (MAP): where */
+};
+
 #define DRM_IOCTL_APPLE_G4P_GET_PARAM	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_GET_PARAM, struct drm_apple_g4p_get_param)
 #define DRM_IOCTL_APPLE_G4P_BO_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_BO_CREATE, struct drm_apple_g4p_bo_create)
 #define DRM_IOCTL_APPLE_G4P_SUBMIT	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_SUBMIT, struct drm_apple_g4p_submit)
+#define DRM_IOCTL_APPLE_G4P_VM_BIND	DRM_IOW(DRM_COMMAND_BASE + DRM_APPLE_G4P_VM_BIND, struct drm_apple_g4p_vm_bind)
 
 #if defined(__cplusplus)
 }

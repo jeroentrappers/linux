@@ -43,7 +43,8 @@ struct g4p_gem {
 	/* APPLE_G4P_BO_SEPARATE (8.65) */
 	bool separate;
 	struct g4p_bo mem;		/* own allocation, mapped at mem.gpuva */
-	struct list_head node;		/* g->sep_bos */
+	struct list_head node;		/* g->sep_bos, while mapped */
+	bool mapped;
 };
 
 #define G4P_SEP_VA	0x320000000ULL
@@ -122,7 +123,9 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 		dma_fence_put(f);
 	}
 	mutex_lock(&g->lock);
-	if (bo->separate) {
+	if (bo->separate && !bo->mapped) {
+		dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
+	} else if (bo->separate) {
 		list_del(&bo->node);
 		g4p_boot_unmap_range(g, bo->mem.gpuva, bo->mem.size);
 		if (g->powered && g->boot && g4p_flush_unmap_locked(g)) {
@@ -224,13 +227,19 @@ static int g4p_bo_create_separate(struct g4p *g, struct drm_file *file, struct g
 	}
 	bo->mem.size = size;
 	mutex_lock(&g->lock);
-	if (!g->sep_next)
-		g->sep_next = G4P_SEP_VA;
-	bo->mem.gpuva = g->sep_next;
-	g->sep_next += ALIGN(size, SZ_64K);	/* a gap between buffers: overruns fault */
-	ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, size);	/* post-boot if running */
-	if (!ret)
-		list_add_tail(&bo->node, &g->sep_bos);
+	ret = 0;
+	if (!(a->flags & APPLE_G4P_BO_NOMAP)) {
+		/* driver-chosen VA from the top half of the user range (VM_BIND users get the bottom half) */
+		if (!g->sep_next)
+			g->sep_next = G4P_SEP_VA;
+		bo->mem.gpuva = g->sep_next;
+		g->sep_next += ALIGN(size, SZ_64K);	/* a gap between buffers: overruns fault */
+		ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, size);	/* post-boot if running */
+		if (!ret) {
+			list_add_tail(&bo->node, &g->sep_bos);
+			bo->mapped = true;
+		}
+	}
 	mutex_unlock(&g->lock);
 	if (ret) {
 		dma_free_coherent(g->dev, size, bo->mem.cpu, bo->mem.dma);
@@ -246,10 +255,81 @@ static int g4p_bo_create_separate(struct g4p *g, struct drm_file *file, struct g
 		drm_gem_object_put(&bo->base);
 		return ret;
 	}
-	a->gpu_va = bo->mem.gpuva;
+	a->gpu_va = bo->mapped ? bo->mem.gpuva : 0;
 	a->mmap_offset = drm_vma_node_offset_addr(&bo->base.vma_node);
 	drm_gem_object_put(&bo->base);
 	return 0;
+}
+
+/* 8.71: does [va, va + size) overlap a mapped separate BO? */
+static bool g4p_va_busy(struct g4p *g, u64 va, u64 size)
+{
+	struct g4p_gem *o;
+
+	list_for_each_entry(o, &g->sep_bos, node)
+		if (va < o->mem.gpuva + o->mem.size && o->mem.gpuva < va + size)
+			return true;
+	return false;
+}
+
+static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct g4p *g = to_g4p(drm);
+	struct drm_apple_g4p_vm_bind *a = data;
+	struct drm_gem_object *obj;
+	struct g4p_gem *bo;
+	struct dma_fence *f;
+	int ret = 0;
+
+	obj = drm_gem_object_lookup(file, a->handle);
+	if (!obj)
+		return -ENOENT;
+	bo = to_g4p_gem(obj);
+	if (!bo->separate) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (a->op == APPLE_G4P_VM_BIND_UNMAP) {
+		while ((f = g4p_wait_target(g, true))) {	/* jobs in flight may use it */
+			dma_fence_wait(f, false);
+			dma_fence_put(f);
+		}
+	}
+	mutex_lock(&g->lock);
+	switch (a->op) {
+	case APPLE_G4P_VM_BIND_MAP:
+		if (bo->mapped || !IS_ALIGNED(a->gpu_va, SZ_4K) || a->gpu_va < APPLE_G4P_USER_VA_START ||
+		    a->gpu_va + bo->mem.size > APPLE_G4P_USER_VA_END) {
+			ret = -EINVAL;
+		} else if (g4p_va_busy(g, a->gpu_va, bo->mem.size)) {
+			ret = -EBUSY;
+		} else {
+			bo->mem.gpuva = a->gpu_va;
+			ret = g4p_boot_map_range(g, bo->mem.gpuva, bo->mem.dma, bo->mem.size);
+			if (!ret) {
+				list_add_tail(&bo->node, &g->sep_bos);
+				bo->mapped = true;
+			}
+		}
+		break;
+	case APPLE_G4P_VM_BIND_UNMAP:
+		if (!bo->mapped) {
+			ret = -EINVAL;
+			break;
+		}
+		list_del(&bo->node);
+		bo->mapped = false;
+		g4p_boot_unmap_range(g, bo->mem.gpuva, bo->mem.size);
+		if (g->powered && g->boot && g4p_flush_unmap_locked(g))
+			g4p_recover_locked(g);	/* the flush job failed: power off, the next boot maps without it */
+		break;
+	default:
+		ret = -EINVAL;
+	}
+	mutex_unlock(&g->lock);
+out:
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_file *file)
@@ -261,7 +341,8 @@ static int g4p_ioctl_bo_create(struct drm_device *drm, void *data, struct drm_fi
 	unsigned int n;
 	int ret;
 
-	if ((a->flags & ~APPLE_G4P_BO_SEPARATE) || !a->size || a->size > SZ_64M)
+	if ((a->flags & ~(APPLE_G4P_BO_SEPARATE | APPLE_G4P_BO_NOMAP)) || !a->size || a->size > SZ_64M ||
+	    ((a->flags & APPLE_G4P_BO_NOMAP) && !(a->flags & APPLE_G4P_BO_SEPARATE)))
 		return -EINVAL;
 	n = DIV_ROUND_UP(a->size, SZ_4K);
 	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
@@ -496,6 +577,7 @@ static const struct drm_ioctl_desc g4p_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_GET_PARAM, g4p_ioctl_get_param, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_BO_CREATE, g4p_ioctl_bo_create, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_SUBMIT, g4p_ioctl_submit, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(APPLE_G4P_VM_BIND, g4p_ioctl_vm_bind, DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(g4p_drm_fops);
