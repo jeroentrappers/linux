@@ -91,30 +91,49 @@ static int g4p_pool_get_locked(struct g4p *g)
 	return 0;
 }
 
+static struct dma_fence *g4p_wait_target(struct g4p *g, bool all);
+
+/*
+ * 8.70: the GPU MMU invalidate that the firmware runs at a kick (gart_inval) only takes effect for the job after
+ * that one: a job right after an unmap can still use the old translation, any later job faults. So after an
+ * unmap one empty job (STREAM_TERMINATE only) makes the unmap effective, and the memory can be freed.
+ */
+static int g4p_flush_unmap_locked(struct g4p *g)
+{
+	static const u32 empty[4] = { 0x4a503447, 1, 0, 1000 };	/* "G4PJ", v1, no records */
+	int ret;
+
+	g->job_img = empty;
+	g->job_img_size = sizeof(empty);
+	ret = g4p_boot_cl_job(g, 8);
+	g->job_img = NULL;
+	return ret;
+}
+
 static void g4p_gem_free(struct drm_gem_object *obj)
 {
 	struct g4p *g = to_g4p(obj->dev);
 	struct g4p_gem *bo = to_g4p_gem(obj);
+	struct dma_fence *f;
 
+	/* jobs in flight may still use this buffer: let them finish first */
+	while ((f = g4p_wait_target(g, true))) {
+		dma_fence_wait(f, false);
+		dma_fence_put(f);
+	}
 	mutex_lock(&g->lock);
 	if (bo->separate) {
-		/*
-		 * Unmap, then free. The GPU only runs jobs inside SUBMIT (synchronous, under g->lock), so no job can
-		 * reach these pages; the next job's MMU invalidate drops stale translations.
-		 */
 		list_del(&bo->node);
 		g4p_boot_unmap_range(g, bo->mem.gpuva, bo->mem.size);
-		/*
-		 * 8.65: the per-job MMU invalidate does not drop cached translations (a job wrote through a freed
-		 * BO's old VA), so the memory is only released once the GPU is off: park it until then.
-		 */
-		if (g->powered) {
+		if (g->powered && g->boot && g4p_flush_unmap_locked(g)) {
+			/* the flush job failed: park the memory until the GPU is off (and recover) */
 			struct g4p_zombie *z = kmalloc(sizeof(*z), GFP_KERNEL);
 
 			if (z) {
 				z->mem = bo->mem;
 				list_add_tail(&z->node, &g->zombies);
 			} /* else: leak rather than let the GPU write freed memory */
+			g4p_recover_locked(g);
 		} else {
 			dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
 		}
