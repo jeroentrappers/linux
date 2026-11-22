@@ -112,6 +112,7 @@ enum g4p_heap {
 #define G4P_PTE_SLC_BYPASS	BIT_ULL(3)
 #define G4P_PTE_PM_META_PROTECT	BIT_ULL(62)
 
+#define G4P_CTX_FW_PAGES	16	/* 8.81: two per job slot */
 #define G4P_NR_CTX	8	/* firmware memory contexts (CAT_BASE0..7); 0 = kernel */
 
 struct g4p_mmu {
@@ -139,10 +140,21 @@ struct g4p_mmu {
 		u32 *pc;
 		u64 *pd, *pt[512];
 		dma_addr_t pc_dma, pd_dma, pt_dma[512];
+		/*
+		 * 8.81: the firmware heaps' GiB in this context: its own PD, nothing mapped but the context's
+		 * private pages (the CDM's stream and terminate pages per job slot, at the slots' VAs)
+		 */
+		u64 *fpd, *fpt[512];
+		dma_addr_t fpd_dma, fpt_dma[512];
+		void *fpage[G4P_CTX_FW_PAGES];
+		dma_addr_t fpage_dma[G4P_CTX_FW_PAGES];
 	} *ctx[G4P_NR_CTX];
 };
 
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
+int g4p_mmu_ctx_map_fw_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, unsigned int page,
+			    u64 flags);
+u64 g4p_mmu_heap_flags(enum g4p_heap heap);
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu);
 int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, size_t size, u64 flags);
 int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags);

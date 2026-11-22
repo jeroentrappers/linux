@@ -41,7 +41,7 @@ static bool slc_bypass = true;
 module_param(slc_bypass, bool, 0444);
 MODULE_PARM_DESC(slc_bypass, "map the shared/private firmware heaps SLC-bypass instead of cache-coherent");
 
-static u64 g4p_heap_flags(enum g4p_heap heap)
+u64 g4p_mmu_heap_flags(enum g4p_heap heap)
 {
 	u64 f = g4p_heap_cfg[heap].flags;
 
@@ -174,12 +174,21 @@ int g4p_mmu_ctx_init(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 	mmu->ctx[ctx] = c;
 	c->pc = dma_alloc_coherent(dev, SZ_4K, &c->pc_dma, GFP_KERNEL);
 	c->pd = dma_alloc_coherent(dev, SZ_4K, &c->pd_dma, GFP_KERNEL);
-	if (!c->pc || !c->pd) {
+	c->fpd = dma_alloc_coherent(dev, SZ_4K, &c->fpd_dma, GFP_KERNEL);
+	for (unsigned int i = 0; i < G4P_CTX_FW_PAGES && c->fpd; i++)
+		if (!(c->fpage[i] = dma_alloc_coherent(dev, SZ_4K, &c->fpage_dma[i], GFP_KERNEL)))
+			break;
+	if (!c->pc || !c->pd || !c->fpd || !c->fpage[G4P_CTX_FW_PAGES - 1]) {
 		g4p_mmu_ctx_fini(dev, mmu, ctx);
 		return -ENOMEM;
 	}
-	memcpy(c->pc, mmu->pc, SZ_4K);
+	/*
+	 * 8.81: only two PC entries: the extra GiB (own PD) and the firmware heaps' GiB (own PD, empty until the
+	 * job slots' private pages are mapped). The kernel's firmware heaps, PIO register windows included, are
+	 * not reachable from a user context.
+	 */
 	c->pc[MMU_PC_INDEX(mmu->xva)] = ((c->pd_dma >> 12) << 4) | MMU_PC_VALID;
+	c->pc[mmu->pc_index] = ((c->fpd_dma >> 12) << 4) | MMU_PC_VALID;
 	return 0;
 }
 
@@ -192,12 +201,46 @@ void g4p_mmu_ctx_fini(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx)
 	for (unsigned int i = 0; i < ARRAY_SIZE(c->pt); i++)
 		if (c->pt[i])
 			dma_free_coherent(dev, SZ_4K, c->pt[i], c->pt_dma[i]);
+	for (unsigned int i = 0; i < ARRAY_SIZE(c->fpt); i++)
+		if (c->fpt[i])
+			dma_free_coherent(dev, SZ_4K, c->fpt[i], c->fpt_dma[i]);
+	for (unsigned int i = 0; i < G4P_CTX_FW_PAGES; i++)
+		if (c->fpage[i])
+			dma_free_coherent(dev, SZ_4K, c->fpage[i], c->fpage_dma[i]);
+	if (c->fpd)
+		dma_free_coherent(dev, SZ_4K, c->fpd, c->fpd_dma);
 	if (c->pd)
 		dma_free_coherent(dev, SZ_4K, c->pd, c->pd_dma);
 	if (c->pc)
 		dma_free_coherent(dev, SZ_4K, c->pc, c->pc_dma);
 	kfree(c);
 	mmu->ctx[ctx] = NULL;
+}
+
+/*
+ * 8.81: private page @page of context @ctx at @va in the firmware heaps' GiB of that context only (idempotent:
+ * the same page at the same VA again is fine)
+ */
+int g4p_mmu_ctx_map_fw_page(struct device *dev, struct g4p_mmu *mmu, unsigned int ctx, u64 va, unsigned int page,
+			    u64 flags)
+{
+	struct g4p_mmu_ctx *c = ctx && ctx < G4P_NR_CTX ? mmu->ctx[ctx] : NULL;
+	unsigned int d = MMU_PD_INDEX(va);
+	u64 pte;
+
+	if (!c || page >= G4P_CTX_FW_PAGES || MMU_PC_INDEX(va) != mmu->pc_index || !IS_ALIGNED(va, SZ_4K))
+		return -EINVAL;
+	if (!c->fpt[d]) {
+		c->fpt[d] = dma_alloc_coherent(dev, SZ_4K, &c->fpt_dma[d], GFP_KERNEL);
+		if (!c->fpt[d])
+			return -ENOMEM;
+		c->fpd[d] = (c->fpt_dma[d] & MMU_PA_MASK) | MMU_PD_VALID;
+	}
+	pte = (c->fpage_dma[page] & MMU_PA_MASK) | flags | G4P_PTE_VALID;
+	if (c->fpt[d][MMU_PT_INDEX(va)] && c->fpt[d][MMU_PT_INDEX(va)] != pte)
+		return -EEXIST;
+	c->fpt[d][MMU_PT_INDEX(va)] = pte;
+	return 0;
 }
 
 /* one page of the extra GiB (pool or user range) in context @ctx */
@@ -253,7 +296,7 @@ int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, si
 		return -ENOMEM;
 	bo->size = size;
 	bo->gpuva = va;
-	ret = g4p_mmu_map(dev, mmu, va, bo->dma, size, g4p_heap_flags(heap));
+	ret = g4p_mmu_map(dev, mmu, va, bo->dma, size, g4p_mmu_heap_flags(heap));
 	if (ret) {
 		dma_free_coherent(dev, size, bo->cpu, bo->dma);
 		bo->cpu = NULL;

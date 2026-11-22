@@ -3,7 +3,8 @@
  * Apple A8 GPU (G4P) DRM interface, bring-up version (linux-on-iphone6 re/GPU-BRINGUP.md 8.64).
  *
  * Experimental and not stable: compute only. Every open file has its own GPU address space (8.77, 8.79): its pool
- * buffers and separate buffers are mapped only in it (plus pool page 0, the driver's programs, read-only). Job
+ * buffers and separate buffers are mapped only in it (plus pool page 0, the driver's programs, read-only; none of
+ * the firmware's memory, 8.81). Job
  * images may contain STREAM records only, unless the module runs with raw_jobs=1 (bring-up tools). Buffers are carved
  * from a pool that is mapped at GPU VA APPLE_G4P_POOL_VA before the firmware boots; a buffer's GPU VA minus
  * that base is also its PDS/USC code offset. A submission is a job image in the record format of the C8 debugfs

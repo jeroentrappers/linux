@@ -104,6 +104,7 @@ struct g4p_boot {
 	struct g4p_bo pds;		/* one page at G4P_PDS_VA: C4's CDM terminate program */
 	struct g4p_cljob {
 		struct g4p_bo cmd, stream, cdm, misc;
+		void *sp, *tp;	/* where this job's CDM stream (+0x800) and terminate page are written (8.81) */
 		unsigned int which, stream_words, us, timeout_ms, seq;	/* seq: jobs run in this boot */
 		u32 expect;	/* stamp of the job in flight (async, 8.68) */
 		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
@@ -999,7 +1000,7 @@ static int g4p_c8_job(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 		goto out;
 	j->timeout_ms = hdr[3] ? min(hdr[3], 10000U) : 1000;
 	/* default stream: STREAM_TERMINATE only */
-	w32a(j->misc.cpu, 0x800, 0x80000000);
+	w32a(j->sp, 0x800, 0x80000000);
 	d = fw->data + sizeof(hdr);
 	end = fw->data + fw->size;
 	while (d < end) {
@@ -1023,7 +1024,7 @@ static int g4p_c8_job(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 		case G4P_JOB_STREAM:
 			if ((u64)r[1] + r[2] > G4P_JOB_STREAM_MAX)
 				goto out;
-			memcpy(j->misc.cpu + 0x800 + r[1], d, r[2]);
+			memcpy(j->sp + 0x800 + r[1], d, r[2]);
 			break;
 		case G4P_JOB_CMD:
 			if ((u64)r[1] + r[2] > G4P_CDM_CMD_SIZE)
@@ -1160,6 +1161,29 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		if (ret)
 			return ret;
 	}
+	/*
+	 * 8.81: a job in a user context reads its stream and terminate page from that context's private copies,
+	 * mapped read-only at the slot's VAs in the context only; the slot's own pages (stamps) stay unreachable.
+	 */
+	j->sp = j->misc.cpu;
+	j->tp = j->cdm.cpu;
+	if (which == 8 && g->job_ctx) {
+		unsigned int s = b->job_n % G4P_JOB_SLOTS;
+		struct g4p_mmu_ctx *c = b->mmu.ctx[g->job_ctx];
+		u64 f = g4p_mmu_heap_flags(G4P_HEAP_SHARED) | G4P_PTE_READ_ONLY;
+
+		if (!c)
+			return -EINVAL;
+		ret = g4p_mmu_ctx_map_fw_page(g->dev, &b->mmu, g->job_ctx, j->misc.gpuva, 2 * s, f);
+		if (!ret)
+			ret = g4p_mmu_ctx_map_fw_page(g->dev, &b->mmu, g->job_ctx, j->cdm.gpuva, 2 * s + 1, f);
+		if (ret)
+			return ret;
+		j->sp = c->fpage[2 * s];
+		j->tp = c->fpage[2 * s + 1];
+		memset(j->sp, 0, SZ_4K);
+		memset(j->tp, 0, SZ_4K);
+	}
 	stamp = G4P_STAMP_VALUE + b->job_n;
 	j->expect = stamp;
 	j->stamp0 = 0;
@@ -1168,7 +1192,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	fa3 = g4p_fw_addr(g4p_fwinit_list_a_va(&b->fi) + 0x2400, true);	/* list A #3: CDM DM state */
 
 	/* CDM control stream: STREAM_TERMINATE (block_type 2, Mesa cdm.xml) */
-	w32a(j->cdm.cpu, 0, 0x80000000);
+	w32a(j->tp, 0, 0x80000000);
 	/* the command (§3.1); stamps at misc +0 / +4, the +0x0c buffer at misc +0x100 */
 	w32a(j->cmd.cpu, 0x000, 3);			/* CDM */
 	w32a(j->cmd.cpu, 0x008, 0);			/* context 0 = the boot page catalogue */
