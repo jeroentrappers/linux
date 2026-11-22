@@ -70,8 +70,9 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu)
 
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu)
 {
-	if (mmu->xpt)
-		dma_free_coherent(dev, SZ_4K, mmu->xpt, mmu->xpt_dma);
+	for (unsigned int i = 0; i < ARRAY_SIZE(mmu->xpt); i++)
+		if (mmu->xpt[i])
+			dma_free_coherent(dev, SZ_4K, mmu->xpt[i], mmu->xpt_dma[i]);
 	if (mmu->xpd)
 		dma_free_coherent(dev, SZ_4K, mmu->xpd, mmu->xpd_dma);
 	for (unsigned int i = 0; i < ARRAY_SIZE(mmu->pt); i++)
@@ -108,30 +109,34 @@ int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa,
 }
 
 /*
- * One 4 KiB page at @va outside the firmware heaps' PC entry: all such pages share one 2 MiB window (own PD
- * and PT), set by the first call. For bring-up programs at fixed GPU VAs (the PDS heap, GPU-BRINGUP 8.35).
+ * One 4 KiB page at @va outside the firmware heaps' PC entry: all such pages share one 1 GiB PC entry (own PD,
+ * page tables per 2 MiB on demand), set by the first call. For the code heap / user pool at 0x300000000.
  */
 int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags)
 {
-	unsigned int pc = MMU_PC_INDEX(va);
+	unsigned int pc = MMU_PC_INDEX(va), d = MMU_PD_INDEX(va);
 
 	if (!IS_ALIGNED(va | pa, SZ_4K) || pc == mmu->pc_index || va & ~GENMASK_ULL(39, 0) ||
 	    pa & ~GENMASK_ULL(39, 0))
 		return -EINVAL;
 	if (!mmu->xpd) {
 		mmu->xpd = dma_alloc_coherent(dev, SZ_4K, &mmu->xpd_dma, GFP_KERNEL);
-		mmu->xpt = dma_alloc_coherent(dev, SZ_4K, &mmu->xpt_dma, GFP_KERNEL);
-		if (!mmu->xpd || !mmu->xpt)
+		if (!mmu->xpd)
 			return -ENOMEM;
-		mmu->xva = va & ~(u64)(SZ_2M - 1);
-		mmu->xpd[MMU_PD_INDEX(va)] = (mmu->xpt_dma & MMU_PA_MASK) | MMU_PD_VALID;
+		mmu->xva = va & ~(u64)(SZ_1G - 1);
 		mmu->pc[pc] = ((mmu->xpd_dma >> 12) << 4) | MMU_PC_VALID;
 	}
-	if ((va & ~(u64)(SZ_2M - 1)) != mmu->xva)
+	if ((va & ~(u64)(SZ_1G - 1)) != mmu->xva)
 		return -EINVAL;
-	if (mmu->xpt[MMU_PT_INDEX(va)])
+	if (!mmu->xpt[d]) {
+		mmu->xpt[d] = dma_alloc_coherent(dev, SZ_4K, &mmu->xpt_dma[d], GFP_KERNEL);
+		if (!mmu->xpt[d])
+			return -ENOMEM;
+		mmu->xpd[d] = (mmu->xpt_dma[d] & MMU_PA_MASK) | MMU_PD_VALID;
+	}
+	if (mmu->xpt[d][MMU_PT_INDEX(va)])
 		return -EEXIST;
-	mmu->xpt[MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
+	mmu->xpt[d][MMU_PT_INDEX(va)] = (pa & MMU_PA_MASK) | flags | G4P_PTE_VALID;
 	return 0;
 }
 

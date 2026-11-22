@@ -11,6 +11,8 @@
 #include <linux/wait.h>
 #include <linux/types.h>
 
+#include <drm/drm_device.h>
+
 #include "g4p_fw.h"
 
 struct dentry;
@@ -34,7 +36,16 @@ struct seq_file;
 /* PMGR MiscACG (XNU _regGroups[kRegGroupMiscACG]); bit 0 = auto clock gating enable */
 #define PMGR_MISC_ACG_EN	BIT(0)
 
+struct g4p_bo {
+	void *cpu;
+	dma_addr_t dma;
+	size_t size;
+	u64 gpuva;
+	bool view;	/* carved out of another buffer: not freed on its own */
+};
+
 struct g4p {
+	struct drm_device drm;			/* render node (g4p_drm.c, GPU-BRINGUP 8.64) */
 	struct device *dev;
 	void __iomem *rgx;
 	void __iomem *fender;
@@ -55,6 +66,15 @@ struct g4p {
 	wait_queue_head_t irq_wq;
 	bool irq_on;
 	struct g4p_boot *boot;			/* GPU memory of a META boot; freed after power-off */
+	/*
+	 * DRM pool (8.64): one contiguous buffer, mapped at G4P_PDS_VA (0x300000000) before each firmware boot
+	 * that the DRM path starts; page 0 holds the driver's PDS programs, BOs are page ranges after it.
+	 */
+	struct g4p_bo pool;
+	unsigned long *pool_map;		/* bitmap of used pages */
+	unsigned int pool_pages;
+	const void *job_img;			/* set during a DRM submit: C8 job image from memory */
+	size_t job_img_size;
 };
 
 /* g4p_mmu.c: GPU MMU and buffers in the firmware heaps (AGXGart heaps 5..8) */
@@ -80,18 +100,13 @@ struct g4p_mmu {
 	u64 *pt[512];
 	dma_addr_t pt_dma[512];
 	u64 heap_next[G4P_NR_HEAPS];
-	/* one extra 2 MiB window outside the firmware heaps (the PDS heap at 0x300000000, GPU-BRINGUP 8.35) */
-	u64 *xpd, *xpt;
-	dma_addr_t xpd_dma, xpt_dma;
-	u64 xva;		/* 2 MiB aligned base of the window, 0 = none */
-};
-
-struct g4p_bo {
-	void *cpu;
-	dma_addr_t dma;
-	size_t size;
-	u64 gpuva;
-	bool view;	/* carved out of another buffer: not freed on its own */
+	/*
+	 * One extra 1 GiB PC entry outside the firmware heaps (the code heap / user pool at 0x300000000,
+	 * GPU-BRINGUP 8.35, 8.64): its PD and page tables on demand, one per 2 MiB.
+	 */
+	u64 *xpd, *xpt[512];
+	dma_addr_t xpd_dma, xpt_dma[512];
+	u64 xva;		/* 1 GiB aligned base of the entry, 0 = none */
 };
 
 int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
@@ -134,6 +149,17 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which);
 ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);
 void g4p_boot_irq_off(struct g4p *g);
 void g4p_boot_irq_rings(struct g4p *g);
+bool g4p_boot_uses_pool(struct g4p *g);
+void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
+
+/* g4p_drv.c */
+int g4p_ensure_booted_locked(struct g4p *g);
+
+/* g4p_drm.c */
+struct g4p *g4p_drm_alloc(struct device *dev);
+int g4p_drm_register(struct g4p *g);
+void g4p_drm_unregister(struct g4p *g);
+void g4p_drm_pool_free(struct g4p *g);
 
 
 #endif

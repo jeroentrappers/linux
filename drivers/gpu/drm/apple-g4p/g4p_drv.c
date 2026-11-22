@@ -290,6 +290,28 @@ static int g4p_boot_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
+/*
+ * 8.64: for the DRM path. Power up and boot the firmware with the DRM pool mapped, unless a boot that maps it
+ * is already running. A boot started through debugfs without the pool is refused (power it off first).
+ */
+int g4p_ensure_booted_locked(struct g4p *g)
+{
+	int ret;
+
+	if (!experimental)
+		return -EPERM;
+	if (g->boot)
+		return g4p_boot_uses_pool(g) ? 0 : -EBUSY;
+	ret = g4p_fw_load_locked(g);
+	if (!ret)
+		ret = g4p_power_on_locked(g);
+	if (!ret && !g->have_id)
+		ret = -ENODEV;
+	if (!ret)
+		ret = g4p_boot_start(g);
+	return ret;
+}
+
 /* M5: echo 9 > devctl queues a device-control no-op (types 9..11 only) and waits for the firmware */
 static int g4p_devctl_set(void *data, u64 val)
 {
@@ -361,9 +383,9 @@ static int g4p_probe(struct platform_device *pdev)
 	struct g4p *g;
 	int ret;
 
-	g = devm_kzalloc(dev, sizeof(*g), GFP_KERNEL);
-	if (!g)
-		return -ENOMEM;
+	g = g4p_drm_alloc(dev);
+	if (IS_ERR(g))
+		return PTR_ERR(g);
 	g->dev = dev;
 	mutex_init(&g->lock);
 
@@ -421,6 +443,9 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("devctl", 0200, g->debugfs, g, &g4p_devctl_fops);
 	debugfs_create_file("cl", 0200, g->debugfs, g, &g4p_cl_fops);
 	debugfs_create_file("c8mem", 0400, g->debugfs, g, &g4p_c8mem_fops);
+	ret = g4p_drm_register(g);
+	if (ret)
+		dev_warn(dev, "DRM device not registered: %d\n", ret);
 	dev_info(dev, "bound; GPU left off (power-up: experimental=1, debugfs apple-g4p/power)\n");
 	return 0;
 }
@@ -429,9 +454,11 @@ static void g4p_remove(struct platform_device *pdev)
 {
 	struct g4p *g = platform_get_drvdata(pdev);
 
+	g4p_drm_unregister(g);
 	debugfs_remove_recursive(g->debugfs);
 	mutex_lock(&g->lock);
 	g4p_power_off_locked(g);
+	g4p_drm_pool_free(g);
 	vfree(g->fw_image);
 	g4p_fw_release(&g->fw);
 	mutex_unlock(&g->lock);

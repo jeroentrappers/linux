@@ -237,11 +237,19 @@ static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
 	size_t size = clamp(heap_pages, 1U, (unsigned int)G4P_HEAP_PAGES_MAX) * SZ_4K;
 	int ret = 0;
 
-	p->cpu = dma_alloc_coherent(g->dev, size, &p->dma, GFP_KERNEL);
-	if (!p->cpu)
-		return -ENOMEM;
-	p->size = size;
-	p->gpuva = G4P_PDS_VA + (c4_prog == 4 ? SZ_4K : 0);
+	if (g->pool.cpu) {
+		/* 8.64: the DRM pool replaces the window (same VA); the driver programs go to its page 0 */
+		*p = (struct g4p_bo){ .cpu = g->pool.cpu, .dma = g->pool.dma, .size = g->pool.size,
+				      .gpuva = G4P_PDS_VA, .view = true };
+		memset(p->cpu, 0, SZ_4K);
+		size = p->size;
+	} else {
+		p->cpu = dma_alloc_coherent(g->dev, size, &p->dma, GFP_KERNEL);
+		if (!p->cpu)
+			return -ENOMEM;
+		p->size = size;
+		p->gpuva = G4P_PDS_VA + (c4_prog == 4 ? SZ_4K : 0);
+	}
 	if (c4_prog == 3)
 		*(u32 *)p->cpu = 0xd3000000;	/* halt: for a program that the CDM runs from a zero register */
 	*(u32 *)(p->cpu + 0x300) = 0xd3000000;	/* halt: c4_ctx's context program; data at +0x400 (zero) */
@@ -861,9 +869,15 @@ static int g4p_c8_job(struct g4p *g, struct g4p_boot *b, struct g4p_cljob *j)
 	unsigned int nrec = 0;
 	int ret;
 
-	ret = request_firmware(&fw, "agx-g4p-job.bin", g->dev);
-	if (ret)
-		return ret;
+	struct firmware mem = { .data = g->job_img, .size = g->job_img_size };
+
+	if (g->job_img) {
+		fw = &mem;	/* 8.64: a DRM submit's job image */
+	} else {
+		ret = request_firmware(&fw, "agx-g4p-job.bin", g->dev);
+		if (ret)
+			return ret;
+	}
 	ret = -EINVAL;
 	if (fw->size < sizeof(hdr) || fw->size > SZ_1M)
 		goto out;
@@ -929,7 +943,8 @@ reg_ok:
 out:
 	if (ret)
 		dev_err(g->dev, "C8: bad job image at record %u\n", nrec);
-	release_firmware(fw);
+	if (fw != &mem)
+		release_firmware(fw);
 	return ret;
 }
 
@@ -968,7 +983,7 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
 		memcpy(buf + 0x2000, j->stream.cpu, SZ_4K);
 	if (j->cdm.cpu)
 		memcpy(buf + 0x3000, j->cdm.cpu, SZ_4K);
-	memcpy(buf + G4P_C8MEM_HEAP, b->pds.cpu, b->pds.size);
+	memcpy(buf + G4P_C8MEM_HEAP, b->pds.cpu, min_t(size_t, b->pds.size, G4P_C8MEM_IMAGE - G4P_C8MEM_HEAP));
 	if (b->image.cpu)
 		memcpy(buf + G4P_C8MEM_IMAGE, b->image.cpu, min_t(size_t, b->image.size, SZ_256K));
 	if (b->fi.list_a.cpu)
@@ -1203,6 +1218,22 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);
 	j->seq++;
 	return j->stamp0 == stamp || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
+}
+
+/* 8.64: did the running boot map the DRM pool? */
+bool g4p_boot_uses_pool(struct g4p *g)
+{
+	return g->boot && g->pool.cpu && g->boot->pds.view && g->boot->pds.cpu == g->pool.cpu;
+}
+
+void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault)
+{
+	struct g4p_cljob *j = &g->boot->job;
+
+	*stamp = j->stamp0;
+	*us = j->us;
+	fault[0] = j->fault[0];
+	fault[1] = j->fault[1];
 }
 
 void g4p_boot_show(struct seq_file *s, struct g4p *g)
