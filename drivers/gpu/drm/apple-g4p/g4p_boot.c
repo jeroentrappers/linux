@@ -152,6 +152,24 @@ static int g4p_meta_read(struct g4p *g, u32 addr, u32 *val)
 	return 0;
 }
 
+/* slave-port write (mainline pvr_meta_cr_write32: MSLVCTRL0 = addr, then MSLVDATAT = value) */
+static int g4p_meta_write(struct g4p *g, u32 addr, u32 val)
+{
+	u32 v;
+	int ret;
+
+	ret = readl_poll_timeout(g->rgx + RGX_CR_META_SP_MSLVCTRL1, v,
+				 (v & RGX_CR_META_SP_MSLVCTRL1_IDLE) == RGX_CR_META_SP_MSLVCTRL1_IDLE, 10, 10000);
+	if (ret)
+		return ret;
+	writel(addr, g->rgx + RGX_CR_META_SP_MSLVCTRL0);
+	readl(g->rgx + RGX_CR_META_SP_MSLVCTRL0);
+	writel(val, g->rgx + 0x0a08);	/* MSLVDATAT */
+	readl(g->rgx + 0x0a08);
+	return readl_poll_timeout(g->rgx + RGX_CR_META_SP_MSLVCTRL1, v,
+				  (v & RGX_CR_META_SP_MSLVCTRL1_IDLE) == RGX_CR_META_SP_MSLVCTRL1_IDLE, 10, 10000);
+}
+
 static void g4p_wr64_fenced(struct g4p *g, u64 val, u32 reg)
 {
 	writeq(val, g->rgx + reg);
@@ -498,10 +516,25 @@ int g4p_boot_start(struct g4p *g)
  * (fw 0x1000328c: they branch to 0x100033d4, which advances the read index), so the response to check is
  * the firmware read index catching up with ours.
  */
+static int g4p_boot_devctl_entry(struct g4p *g, const u32 *entry);
+
 static int g4p_boot_devctl(struct g4p *g, u32 type, u32 arg)
 {
-	struct g4p_boot *b = g->boot;
 	u32 entry[5] = { type, arg };
+
+	return g4p_boot_devctl_entry(g, entry);
+}
+
+/* 8.89: a device-control ring entry of five words (devctl 12 DevicePMAllocation carries three) */
+int g4p_boot_devctl5(struct g4p *g, const u32 *entry)
+{
+	return g4p_boot_devctl_entry(g, entry);
+}
+
+static int g4p_boot_devctl_entry(struct g4p *g, const u32 *entry)
+{
+	struct g4p_boot *b = g->boot;
+	u32 type = entry[0];
 	u32 perf;
 	int wr;
 
@@ -516,7 +549,8 @@ static int g4p_boot_devctl(struct g4p *g, u32 type, u32 arg)
 	writel(RGX_CR_MTS_SCHEDULE_DM0, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 	b->devctl_sent++;
-	for (b->devctl_last_us = 0; b->devctl_last_us < 100000; b->devctl_last_us += 10) {
+	for (b->devctl_last_us = 0; b->devctl_last_us < (type == 12 ? 2000000 : 100000); b->devctl_last_us += 10) {
+		g4p_fwinit_ack_trace_stats(&b->fi);	/* 8.89: the firmware blocks on a full statistics ring */
 		if (g4p_fwinit_ring_read_index(&b->fi, 3) == (u32)wr) {
 			b->devctl_done++;
 			dev_info(g->dev, "devctl type %u: consumed after %u us (index %d)\n", type, b->devctl_last_us, wr);
@@ -524,7 +558,7 @@ static int g4p_boot_devctl(struct g4p *g, u32 type, u32 arg)
 		}
 		udelay(10);
 	}
-	dev_warn(g->dev, "devctl type %u: not consumed in 100 ms (read %u, write %d)\n", type,
+	dev_warn(g->dev, "devctl type %u: not consumed in %u us (read %u, write %d)\n", type, b->devctl_last_us,
 		 g4p_fwinit_ring_read_index(&b->fi, 3), wr);
 	return -ETIMEDOUT;
 }
@@ -576,9 +610,41 @@ int g4p_boot_ctx_attach(struct g4p *g, unsigned int ctx)
 /* ---- 8.88: hooks for the C9 graphics harness (g4p_gfx.c) ---- */
 static bool g4p_gpu_running(struct g4p *g);
 
+void g4p_boot_ack_rings(struct g4p *g)
+{
+	if (g->boot)
+		g4p_fwinit_ack_trace_stats(&g->boot->fi);
+}
+
+/* 8.89: a META core register over the slave port (unit 5 = PC: reg 0 PC, 1 PCX), for C9 diagnostics */
+int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, unsigned int reg, u32 *val)
+{
+	u32 rq = (thr << 12) | (reg << 4) | unit | 0x10000, v;
+	int ret;
+
+	if (!g->boot || !g->powered || !g4p_gpu_running(g))
+		return -ENODEV;
+	ret = g4p_meta_write(g, 0x0480fff8, rq);
+	for (unsigned int i = 0; !ret && i < 1000; i++) {
+		ret = g4p_meta_read(g, 0x0480fff8, &v);
+		if (!ret && (v & 0x80000000))
+			return g4p_meta_read(g, 0x0480fff0, val);
+		udelay(1);
+	}
+	return ret ? ret : -ETIMEDOUT;
+}
+
 bool g4p_boot_alive(struct g4p *g)
 {
 	return g->boot && g->boot->alive && g->powered && g4p_gpu_running(g);
+}
+
+/* a word of the firmware image at offset off (C9 READ where 3; data address a = offset 0x1000 + a - 0x10000000) */
+u32 *g4p_boot_image_ptr(struct g4p *g, u64 off)
+{
+	if (!g->boot || !g->boot->image.cpu || off + 4 > g->boot->image.size)
+		return NULL;
+	return g->boot->image.cpu + off;
 }
 
 /* a word of the driver's own list A / list B at GPU VA va (C9 READ where 2), or NULL */

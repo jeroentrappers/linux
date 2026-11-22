@@ -14,6 +14,10 @@
  *   6 READ     {u32 where (0 C9's firmware heap pages, 1 C9 space, 2 the driver's own lists A/B), u32 len,
  *              u64 gpuva}: appended to gfxout
  *   7 SLEEP    {u32 ms}
+ *   8 PBALLOC  {u32 nblocks, u32 0, u64 desc_va}: the parameter buffer, as iOS's AGXParameterManagementPhysical
+ *              does it (8.89): nblocks physically contiguous 128 KiB blocks; descriptors {u32 next FW address,
+ *              u32 page[32] = PA >> 12}, 0x84 apart at desc_va (pages FWPAGES put into the shared heap): block 0
+ *              alone, blocks 1.. chained; then devctl 12 {12, FW(desc 1), FW(desc 0), 1, 0}
  * Only for bring-up (module parameter experimental), only pages that C9 mapped itself are written or read, and the
  * firmware heap pages must not collide with the driver's own (module parameter ios_layout moves those away).
  */
@@ -45,8 +49,14 @@ struct g4p_gfx_gib {
 	dma_addr_t pt_dma[512];
 };
 
+#define G4P_GFX_PB_BLOCK	SZ_128K
+#define G4P_GFX_PB_MAX		64
+
 struct g4p_gfx {
 	struct list_head pages;
+	void *pb_cpu[G4P_GFX_PB_MAX];
+	dma_addr_t pb_dma[G4P_GFX_PB_MAX];
+	unsigned int pb_n;
 	u32 *pc;
 	dma_addr_t pc_dma;
 	struct g4p_gfx_gib *gib[G4P_GFX_GIBS];
@@ -172,6 +182,8 @@ void g4p_gfx_free(struct g4p *g)
 	}
 	if (x->pc)
 		dma_free_coherent(g->dev, SZ_4K, x->pc, x->pc_dma);
+	for (unsigned int i = 0; i < x->pb_n; i++)
+		dma_free_coherent(g->dev, G4P_GFX_PB_BLOCK, x->pb_cpu[i], x->pb_dma[i]);
 	kvfree(x->out);
 	kfree(x);
 	g->gfx = NULL;
@@ -193,12 +205,50 @@ static int g4p_gfx_read(struct g4p *g, struct g4p_gfx *x, u32 where, u64 va, u32
 	*(u32 *)(x->out + x->out_len + 12) = len;
 	x->out_len += 16;
 	for (u32 o = 0; o < len; o += 4) {
-		u32 *s = where == 2 ? g4p_boot_drv_ptr(g, va + o) : g4p_gfx_ptr(x, va + o, user);
+		u32 *s = where == 3 ? g4p_boot_image_ptr(g, va + o) :
+			 where == 2 ? g4p_boot_drv_ptr(g, va + o) : g4p_gfx_ptr(x, va + o, user);
 
 		*(u32 *)(x->out + x->out_len + o) = s ? READ_ONCE(*s) : 0xeeeeeeee;
 	}
 	x->out_len += ALIGN(len, 4);
 	return 0;
+}
+
+static int g4p_gfx_pballoc(struct g4p *g, struct g4p_gfx *x, unsigned int n, u64 desc_va)
+{
+	u32 e[5];
+
+	if (n < 2 || x->pb_n + n > G4P_GFX_PB_MAX)
+		return -EINVAL;
+	for (unsigned int i = 0; i < n; i++) {
+		unsigned int k = x->pb_n + i;
+
+		x->pb_cpu[k] = dma_alloc_coherent(g->dev, G4P_GFX_PB_BLOCK, &x->pb_dma[k], GFP_KERNEL);
+		if (!x->pb_cpu[k])
+			return -ENOMEM;
+	}
+	for (unsigned int i = 0; i < n; i++) {
+		u64 d = desc_va + 0x84ULL * i;
+		dma_addr_t pa = x->pb_dma[x->pb_n + i];
+		u32 next = (i == 0 || i == n - 1) ? 0 : g4p_fw_addr(d + 0x84, false);
+		u32 *w = g4p_gfx_ptr(x, d, false);
+
+		if (!w || !g4p_gfx_ptr(x, d + 0x80, false))
+			return -EINVAL;	/* the descriptor pages must be C9's (FWPAGES) */
+		*w = next;
+		for (unsigned int p = 0; p < G4P_GFX_PB_BLOCK / SZ_4K; p++)
+			*(u32 *)g4p_gfx_ptr(x, d + 4 + 4 * p, false) = (pa + (u64)p * SZ_4K) >> 12;
+	}
+	x->pb_n += n;
+	wmb();	/* descriptors before the firmware is told about them */
+	e[0] = 12;
+	e[1] = g4p_fw_addr(desc_va + 0x84, false);
+	e[2] = g4p_fw_addr(desc_va, false);
+	e[3] = 1;
+	e[4] = 0;
+	dev_info(g->dev, "C9 PB: %u blocks of 128 KiB (first PA %pad), devctl 12 {%08x %08x 1 0}\n", n,
+		 &x->pb_dma[x->pb_n - n], e[1], e[2]);
+	return g4p_boot_devctl5(g, e);
 }
 
 int g4p_gfx_run(struct g4p *g)
@@ -295,6 +345,8 @@ int g4p_gfx_run(struct g4p *g)
 				break;
 			}
 			for (us = 0; us < ms * 1000; us += 50) {
+				if (!(us % 1000))
+					g4p_boot_ack_rings(g);	/* host-bound trace / statistics rings (8.89) */
 				if ((READ_ONCE(*w) & mask) == val)
 					break;
 				udelay(50);
@@ -311,6 +363,25 @@ int g4p_gfx_run(struct g4p *g)
 			rmb();
 			ret = g4p_gfx_read(g, x, get_unaligned_le32(p), get_unaligned_le64(p + 8), get_unaligned_le32(p + 4));
 			break;
+		case 8:	/* PBALLOC */
+			if (len < 16) {
+				ret = -EINVAL;
+				break;
+			}
+			ret = g4p_gfx_pballoc(g, x, get_unaligned_le32(p), get_unaligned_le64(p + 8));
+			if (ret == -ETIMEDOUT)
+				ret = 0;	/* logged; keep going so that later records show the state */
+			break;
+		case 9: {	/* METAPC: T0/T1 PC and PCX into gfxout and the log */
+			u32 v[4] = { 0 };
+
+			for (unsigned int t = 0; t < 2; t++) {
+				g4p_boot_meta_core_read(g, t, 5, 0, &v[2 * t]);
+				g4p_boot_meta_core_read(g, t, 5, 1, &v[2 * t + 1]);
+			}
+			dev_info(g->dev, "C9 META: T0 PC %08x PCX %08x, T1 PC %08x PCX %08x\n", v[0], v[1], v[2], v[3]);
+			break;
+		}
 		case 7:	/* SLEEP */
 			msleep(min(len >= 4 ? get_unaligned_le32(p) : 0, 10000U));
 			break;

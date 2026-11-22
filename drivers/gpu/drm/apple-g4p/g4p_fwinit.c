@@ -20,6 +20,10 @@
 #include "g4p.h"
 
 /* list A (§1.2) and list B (§1.3) object offsets */
+static unsigned int timer_us = 1000;
+module_param(timer_us, uint, 0644);
+MODULE_PARM_DESC(timer_us, "firmware timer period (config +0x280, read at boot; iOS 1000 us); slower = later lockup verdicts");
+
 static unsigned int lockup_detect = 1;
 module_param(lockup_detect, uint, 0644);
 MODULE_PARM_DESC(lockup_detect, "firmware lockup detection (config +0x254, read at boot): 1 = on (iOS), 0 = off (bring-up)");
@@ -183,7 +187,7 @@ static void g4p_config(struct g4p *g, void *c, const u64 *pio_va)
 	w32(c, 0x274, 1);		/* agf_timeslice */
 	w32(c, 0x278, 1);
 	w32(c, 0x27c, 1);		/* agf_timer */
-	w32(c, 0x280, 24000);		/* agf_timer_period 1000 us in 24 MHz ticks */
+	w32(c, 0x280, 24 * clamp(timer_us, 100U, 1000000U));	/* agf_timer_period, 24 MHz ticks */
 	w32(c, 0x284, 0x10);
 	w32(c, 0x290, 1);		/* agf_dwb */
 	w32(c, 0x294, 1);		/* agf_itr_cache */
