@@ -581,6 +581,21 @@ bool g4p_boot_alive(struct g4p *g)
 	return g->boot && g->boot->alive && g->powered && g4p_gpu_running(g);
 }
 
+/* a word of the driver's own list A / list B at GPU VA va (C9 READ where 2), or NULL */
+u32 *g4p_boot_drv_ptr(struct g4p *g, u64 va)
+{
+	struct g4p_bo *l[2];
+
+	if (!g->boot)
+		return NULL;
+	l[0] = &g->boot->fi.list_a;
+	l[1] = &g->boot->fi.list_b;
+	for (unsigned int i = 0; i < 2; i++)
+		if (l[i]->cpu && va >= l[i]->gpuva && va + 4 <= l[i]->gpuva + l[i]->size)
+			return l[i]->cpu + (va - l[i]->gpuva);
+	return NULL;
+}
+
 u64 g4p_boot_heap_pte(void)
 {
 	return heap_pte;

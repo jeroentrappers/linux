@@ -20,6 +20,10 @@
 #include "g4p.h"
 
 /* list A (§1.2) and list B (§1.3) object offsets */
+static unsigned int lockup_detect = 1;
+module_param(lockup_detect, uint, 0644);
+MODULE_PARM_DESC(lockup_detect, "firmware lockup detection (config +0x254, read at boot): 1 = on (iOS), 0 = off (bring-up)");
+
 #define LA_ROOT_A	0x0000
 #define LA_1		0x1140
 #define LA_2		0x1b00
@@ -174,7 +178,7 @@ static void g4p_config(struct g4p *g, void *c, const u64 *pio_va)
 	w64(c, 0x190 + 16 * 3, 0x201000000ULL);		/* slot 3 RGXRegs: listed, not mapped */
 	w32(c, 0x190 + 16 * 3 + 0xc, 0x20000);
 	w32(c, 0x250, 0);		/* GPC mode off: direct boot */
-	w32(c, 0x254, 1);		/* lockup detection */
+	w32(c, 0x254, lockup_detect);	/* lockup detection (8.88: 0 to watch a stalled TA) */
 	w32(c, 0x258, 1);
 	w32(c, 0x274, 1);		/* agf_timeslice */
 	w32(c, 0x278, 1);

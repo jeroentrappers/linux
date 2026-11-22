@@ -213,6 +213,7 @@ int g4p_boot_load_ctx(struct g4p *g, unsigned int slot, u64 pc_dma);
 int g4p_boot_ring_kick(struct g4p *g, unsigned int ring, const u32 *entry, u32 kick, unsigned int slot);
 u64 g4p_fw_to_gpuva(u32 fwaddr);
 int g4p_mmu_heap_of(u64 va);
+u32 *g4p_boot_drv_ptr(struct g4p *g, u64 va);
 int g4p_boot_cl_c1(struct g4p *g);
 int g4p_boot_cl_job(struct g4p *g, unsigned int which);
 ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);

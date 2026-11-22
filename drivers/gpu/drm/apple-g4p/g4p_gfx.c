@@ -11,7 +11,8 @@
  *   4 PUSH     {u32 ring, u32 kick, u32 entry[5]}: a device ring entry (ring 0 TA, 1 3D, 2 CL), then
  *              MTS_SCHEDULE = kick if non-zero
  *   5 WAIT     {u32 fwaddr, u32 mask, u32 value, u32 timeout_ms}: until (word & mask) == value
- *   6 READ     {u32 where (0 firmware heaps, 1 C9 space), u32 len, u64 gpuva}: appended to gfxout
+ *   6 READ     {u32 where (0 C9's firmware heap pages, 1 C9 space, 2 the driver's own lists A/B), u32 len,
+ *              u64 gpuva}: appended to gfxout
  *   7 SLEEP    {u32 ms}
  * Only for bring-up (module parameter experimental), only pages that C9 mapped itself are written or read, and the
  * firmware heap pages must not collide with the driver's own (module parameter ios_layout moves those away).
@@ -176,8 +177,9 @@ void g4p_gfx_free(struct g4p *g)
 	g->gfx = NULL;
 }
 
-static int g4p_gfx_read(struct g4p_gfx *x, bool user, u64 va, u32 len)
+static int g4p_gfx_read(struct g4p *g, struct g4p_gfx *x, u32 where, u64 va, u32 len)
 {
+	bool user = where == 1;
 	void *n;
 
 	if (x->out_len + 16 + len > G4P_GFX_OUT_MAX)
@@ -191,7 +193,7 @@ static int g4p_gfx_read(struct g4p_gfx *x, bool user, u64 va, u32 len)
 	*(u32 *)(x->out + x->out_len + 12) = len;
 	x->out_len += 16;
 	for (u32 o = 0; o < len; o += 4) {
-		u32 *s = g4p_gfx_ptr(x, va + o, user);
+		u32 *s = where == 2 ? g4p_boot_drv_ptr(g, va + o) : g4p_gfx_ptr(x, va + o, user);
 
 		*(u32 *)(x->out + x->out_len + o) = s ? READ_ONCE(*s) : 0xeeeeeeee;
 	}
@@ -307,7 +309,7 @@ int g4p_gfx_run(struct g4p *g)
 				break;
 			}
 			rmb();
-			ret = g4p_gfx_read(x, get_unaligned_le32(p) == 1, get_unaligned_le64(p + 8), get_unaligned_le32(p + 4));
+			ret = g4p_gfx_read(g, x, get_unaligned_le32(p), get_unaligned_le64(p + 8), get_unaligned_le32(p + 4));
 			break;
 		case 7:	/* SLEEP */
 			msleep(min(len >= 4 ? get_unaligned_le32(p) : 0, 10000U));
