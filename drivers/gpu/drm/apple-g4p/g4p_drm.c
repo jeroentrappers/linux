@@ -52,6 +52,8 @@ struct g4p_gem {
 	struct list_head node;		/* g->sep_bos, while mapped */
 	bool mapped;
 	unsigned int ctx;		/* R5: the memory context of the file that created it */
+	/* 9.15: imported dma-buf (one contiguous DMA segment, no CPU mapping); its context is set by VM_BIND */
+	struct sg_table *sgt;
 };
 
 /* R5 (8.77): per DRM file: its own GPU memory context (1..7) and VA allocator for separate BOs */
@@ -166,6 +168,19 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 		dma_fence_put(f);
 	}
 	mutex_lock(&g->lock);
+	if (bo->sgt) {	/* 9.15: imported: out of the GPU MMU, then back to the exporter */
+		if (bo->mapped) {
+			list_del(&bo->node);
+			g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
+			if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
+				g4p_recover_locked(g);
+		}
+		mutex_unlock(&g->lock);
+		drm_prime_gem_destroy(obj, bo->sgt);
+		drm_gem_object_release(obj);
+		kfree(bo);
+		return;
+	}
 	if (bo->separate && !bo->mapped) {
 		dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
 	} else if (bo->separate) {
@@ -343,6 +358,8 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 	if (!obj)
 		return -ENOENT;
 	bo = to_g4p_gem(obj);
+	if (bo->sgt && !bo->ctx)	/* 9.15: an import belongs to the address space that binds it first */
+		bo->ctx = ((struct g4p_file *)file->driver_priv)->ctx;
 	if (!bo->separate || bo->ctx != ((struct g4p_file *)file->driver_priv)->ctx) {
 		ret = -EINVAL;
 		goto out;
@@ -847,10 +864,45 @@ static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
 
 DEFINE_DRM_GEM_FOPS(g4p_drm_fops);
 
+/*
+ * 9.15: PRIME import (a scanout buffer of the display driver as a render target): one contiguous DMA segment,
+ * mapped into an address space with VM_BIND; no CPU mapping through this driver
+ */
+static struct drm_gem_object *g4p_gem_prime_import_sg_table(struct drm_device *drm, struct dma_buf_attachment *attach,
+							    struct sg_table *sgt)
+{
+	struct g4p_gem *bo;
+	struct scatterlist *sg;
+	dma_addr_t next = 0;
+	size_t size = attach->dmabuf->size;
+	unsigned int i;
+
+	if (!sgt->nents || !IS_ALIGNED(size, SZ_4K))
+		return ERR_PTR(-EINVAL);
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		if (i && sg_dma_address(sg) != next)
+			return ERR_PTR(-EINVAL);	/* not contiguous in the GPU's DMA space */
+		next = sg_dma_address(sg) + sg_dma_len(sg);
+	}
+	if (next - sg_dma_address(sgt->sgl) < size || !IS_ALIGNED(sg_dma_address(sgt->sgl), SZ_4K))
+		return ERR_PTR(-EINVAL);
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return ERR_PTR(-ENOMEM);
+	bo->separate = true;
+	bo->sgt = sgt;
+	bo->mem.dma = sg_dma_address(sgt->sgl);
+	bo->mem.size = size;
+	bo->base.funcs = &g4p_gem_funcs;
+	drm_gem_private_object_init(drm, &bo->base, size);
+	return &bo->base;
+}
+
 static const struct drm_driver g4p_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_SYNCOBJ,
 	.open = g4p_drm_open,
 	.postclose = g4p_drm_postclose,
+	.gem_prime_import_sg_table = g4p_gem_prime_import_sg_table,
 	.ioctls = g4p_ioctls,
 	.num_ioctls = ARRAY_SIZE(g4p_ioctls),
 	.fops = &g4p_drm_fops,
