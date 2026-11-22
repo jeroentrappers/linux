@@ -8,7 +8,7 @@
  *   - two channels (TA, 3D) as the CL one: state {ring control, ring array, ..., +0x18 ~0} and a 0x144-entry ring;
  *   - per submission slot: the TA command, the 3D command, their scheduler nodes (type 0x23 / 0x25, 9.06), the
  *     type-4 wait record the 3D channel runs before its command;
- *   - the parameter buffer (8.89): 11 physically contiguous 128 KiB blocks, descriptors {next, 32 x PA >> 12};
+ *   - the parameter buffer (8.89): 30 physically contiguous 128 KiB blocks, descriptors {next, 32 x PA >> 12};
  *   - the PM header with 36 per-pass entries (8.91, 9.00) and, in the submitting address space, the PM buffers and
  *     the free-page stack (they must be in the PB's memory context); installed with a type-5 TA ring record
  *     {5, slot, PM index, FW(header), FW(descriptor 1), FW(descriptor 0)} whenever the address space changes;
@@ -29,7 +29,7 @@
 #define G4P_RING_N		0x144
 #define G4P_RSLOTS		2
 #define G4P_PM_ENTRIES		36
-#define G4P_PB_BLOCKS		11
+#define G4P_PB_BLOCKS		30			/* the descriptor page holds 30 (iOS: 11 for small passes); dense meshes ran out, 9.60 */
 #define G4P_PB_BLOCK		SZ_128K
 #define G4P_PM_VA		0x33c000000ULL		/* = APPLE_G4P_USER_VA_END: kernel-owned top of each space */
 #define G4P_PM_FSTACK		0x18000			/* free-page stack (0x300 blocks x 32 pages x 4 bytes) */
