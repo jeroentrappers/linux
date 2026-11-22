@@ -14,7 +14,7 @@
  *   6 READ     {u32 where (0 C9's firmware heap pages, 1 C9 space, 2 the driver's own lists A/B), u32 len,
  *              u64 gpuva}: appended to gfxout
  *   7 SLEEP    {u32 ms}
- *   8 PBALLOC  {u32 nblocks, u32 0, u64 desc_va}: the parameter buffer, as iOS's AGXParameterManagementPhysical
+ *   8 PBALLOC  {u32 nblocks, u32 flags (1 = no devctl), u64 desc_va}: the parameter buffer, as iOS's AGXParameterManagementPhysical
  *              does it (8.89): nblocks physically contiguous 128 KiB blocks; descriptors {u32 next FW address,
  *              u32 page[32] = PA >> 12}, 0x84 apart at desc_va (pages FWPAGES put into the shared heap): block 0
  *              alone, blocks 1.. chained; then devctl 12 {12, FW(desc 1), FW(desc 0), 1, 0}
@@ -214,7 +214,7 @@ static int g4p_gfx_read(struct g4p *g, struct g4p_gfx *x, u32 where, u64 va, u32
 	return 0;
 }
 
-static int g4p_gfx_pballoc(struct g4p *g, struct g4p_gfx *x, unsigned int n, u64 desc_va)
+static int g4p_gfx_pballoc(struct g4p *g, struct g4p_gfx *x, unsigned int n, u64 desc_va, u32 flags)
 {
 	u32 e[5];
 
@@ -246,9 +246,9 @@ static int g4p_gfx_pballoc(struct g4p *g, struct g4p_gfx *x, unsigned int n, u64
 	e[2] = g4p_fw_addr(desc_va, false);
 	e[3] = 1;
 	e[4] = 0;
-	dev_info(g->dev, "C9 PB: %u blocks of 128 KiB (first PA %pad), devctl 12 {%08x %08x 1 0}\n", n,
-		 &x->pb_dma[x->pb_n - n], e[1], e[2]);
-	return g4p_boot_devctl5(g, e);
+	dev_info(g->dev, "C9 PB: %u blocks of 128 KiB (first PA %pad), %s {%08x %08x 1 0}\n", n,
+		 &x->pb_dma[x->pb_n - n], flags & 1 ? "no devctl" : "devctl 12", e[1], e[2]);
+	return flags & 1 ? 0 : g4p_boot_devctl5(g, e);	/* flag 1: descriptors only (a type-5 ring record installs them) */
 }
 
 int g4p_gfx_run(struct g4p *g)
@@ -368,7 +368,7 @@ int g4p_gfx_run(struct g4p *g)
 				ret = -EINVAL;
 				break;
 			}
-			ret = g4p_gfx_pballoc(g, x, get_unaligned_le32(p), get_unaligned_le64(p + 8));
+			ret = g4p_gfx_pballoc(g, x, get_unaligned_le32(p), get_unaligned_le64(p + 8), get_unaligned_le32(p + 4));
 			if (ret == -ETIMEDOUT)
 				ret = 0;	/* logged; keep going so that later records show the state */
 			break;
