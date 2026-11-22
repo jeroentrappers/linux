@@ -39,7 +39,7 @@ static bool raw_jobs;
 module_param(raw_jobs, bool, 0644);
 MODULE_PARM_DESC(raw_jobs, "accept HEAP, CMD and REG records in DRM job images (bring-up tools only: they reach memory and registers outside the file's context)");
 
-static unsigned int pool_mb = 4;
+static unsigned int pool_mb = 4;	/* at most 64: the VM_BIND code window starts at pool + 64 MiB (9.19) */
 module_param(pool_mb, uint, 0444);
 MODULE_PARM_DESC(pool_mb, "size of the DRM pool in MiB (contiguous, from CMA; mapped at GPU VA 0x300000000)");
 
@@ -373,8 +373,11 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 	mutex_lock(&g->lock);
 	switch (a->op) {
 	case APPLE_G4P_VM_BIND_MAP:
-		if (bo->mapped || !IS_ALIGNED(a->gpu_va, SZ_4K) || a->gpu_va < APPLE_G4P_USER_VA_START ||
-		    a->gpu_va + bo->mem.size > APPLE_G4P_USER_VA_END) {
+		bool user = a->gpu_va >= APPLE_G4P_USER_VA_START && a->gpu_va + bo->mem.size <= APPLE_G4P_USER_VA_END;
+		bool code = a->gpu_va >= APPLE_G4P_CODE_VA_START && a->gpu_va + bo->mem.size <= APPLE_G4P_CODE_VA_END;
+
+		if (bo->mapped || !IS_ALIGNED(a->gpu_va, SZ_4K) || (!user && !code) ||
+		    a->gpu_va + bo->mem.size < a->gpu_va) {
 			ret = -EINVAL;
 		} else if (g4p_va_busy(g, bo->ctx, a->gpu_va, bo->mem.size)) {
 			ret = -EBUSY;

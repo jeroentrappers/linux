@@ -94,6 +94,13 @@ struct drm_apple_g4p_submit {
  */
 #define APPLE_G4P_USER_VA_START		0x320000000ULL
 #define APPLE_G4P_USER_VA_END		0x33c000000ULL	/* 9.09: the top 64 MiB of a space are the kernel's (PM) */
+/*
+ * 9.19: VM_BIND also places buffers in the code window [APPLE_G4P_CODE_VA_START, APPLE_G4P_CODE_VA_END): PDS and USC
+ * programs are addressed relative to APPLE_G4P_POOL_VA (the code base), so a user-space heap of programs (Mesa's
+ * PDS / USC heaps) lives here instead of in the kernel-placed pool.
+ */
+#define APPLE_G4P_CODE_VA_START		0x304000000ULL
+#define APPLE_G4P_CODE_VA_END		0x320000000ULL
 #define APPLE_G4P_VM_BIND_MAP		0
 #define APPLE_G4P_VM_BIND_UNMAP		1
 
