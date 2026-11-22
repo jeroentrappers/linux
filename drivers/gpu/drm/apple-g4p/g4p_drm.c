@@ -729,11 +729,61 @@ out_sync:
 	return ret;
 }
 
+/* 9.09: one render pass of the file's address space, synchronous (g4p_render.c) */
+static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct drm_file *file)
+{
+	struct g4p *g = to_g4p(drm);
+	struct drm_apple_g4p_submit_render *a = data;
+	unsigned int ctx = ((struct g4p_file *)file->driver_priv)->ctx;
+	void *ta, *td = NULL;
+	struct dma_fence *prev;
+	int ret;
+
+	if (!raw_jobs)
+		return -EPERM;
+	if (a->flags)
+		return -EINVAL;
+	ta = memdup_user(u64_to_user_ptr(a->ta_cmd), APPLE_G4P_TA_CMD_SIZE);
+	if (IS_ERR(ta))
+		return PTR_ERR(ta);
+	td = memdup_user(u64_to_user_ptr(a->td_cmd), APPLE_G4P_3D_CMD_SIZE);
+	if (IS_ERR(td)) {
+		ret = PTR_ERR(td);
+		td = NULL;
+		goto out;
+	}
+	ret = 0;
+	while (!ret && (prev = g4p_wait_target(g, true))) {	/* nothing else in flight */
+		ret = dma_fence_wait(prev, true);
+		dma_fence_put(prev);
+	}
+	if (ret)
+		goto out;
+	mutex_lock(&g->lock);
+	ret = g4p_pool_get_locked(g);
+	if (!ret)
+		ret = g4p_ensure_booted_locked(g);
+	if (!ret)
+		ret = g4p_boot_ctx_bind(g, ctx);
+	if (!ret)
+		ret = g4p_render_submit(g, ctx, ta, td, &a->status, &a->elapsed_us);
+	if (!ret && a->status)
+		g4p_recover_locked(g);	/* the next submit boots the firmware again */
+	if (idle_ms && g->boot)
+		mod_delayed_work(system_wq, &g->idle_work, msecs_to_jiffies(idle_ms));
+	mutex_unlock(&g->lock);
+out:
+	kfree(td);
+	kfree(ta);
+	return ret;
+}
+
 static const struct drm_ioctl_desc g4p_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_GET_PARAM, g4p_ioctl_get_param, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_BO_CREATE, g4p_ioctl_bo_create, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_SUBMIT, g4p_ioctl_submit, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_G4P_VM_BIND, g4p_ioctl_vm_bind, DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(APPLE_G4P_SUBMIT_RENDER, g4p_ioctl_submit_render, DRM_RENDER_ALLOW),
 };
 
 /*

@@ -26,6 +26,7 @@ extern "C" {
 #define DRM_APPLE_G4P_BO_CREATE		0x01
 #define DRM_APPLE_G4P_SUBMIT		0x02
 #define DRM_APPLE_G4P_VM_BIND		0x03
+#define DRM_APPLE_G4P_SUBMIT_RENDER	0x04
 
 enum drm_apple_g4p_param {
 	DRM_APPLE_G4P_PARAM_POOL_VA = 1,	/* GPU VA of the pool (APPLE_G4P_POOL_VA) */
@@ -92,7 +93,7 @@ struct drm_apple_g4p_submit {
  * makes the unmap effective before it returns.
  */
 #define APPLE_G4P_USER_VA_START		0x320000000ULL
-#define APPLE_G4P_USER_VA_END		0x340000000ULL
+#define APPLE_G4P_USER_VA_END		0x33c000000ULL	/* 9.09: the top 64 MiB of a space are the kernel's (PM) */
 #define APPLE_G4P_VM_BIND_MAP		0
 #define APPLE_G4P_VM_BIND_UNMAP		1
 
@@ -102,9 +103,30 @@ struct drm_apple_g4p_vm_bind {
 	__u64 gpu_va;		/* in (MAP): where */
 };
 
+/*
+ * SUBMIT_RENDER (9.09, experimental: module parameter raw_jobs): one render pass, synchronous. ta_cmd / td_cmd point
+ * at the firmware TA (APPLE_G4P_TA_CMD_SIZE) and 3D (APPLE_G4P_3D_CMD_SIZE) command bodies as user space builds
+ * them (tools/gpuios/g4prender.py: sizes, the VDM stream, scratch buffers, render target state and programs, all
+ * in the submitter's address space); the kernel fills in every firmware word and owns the channels, the
+ * parameter buffer and the PM state. status: 0 done, 1 the TA did not finish, 2 the 3D did not finish (the GPU is
+ * then reset).
+ */
+#define APPLE_G4P_TA_CMD_SIZE		0x580
+#define APPLE_G4P_3D_CMD_SIZE		0x8c0
+
+struct drm_apple_g4p_submit_render {
+	__u64 ta_cmd;		/* in: user pointer */
+	__u64 td_cmd;		/* in: user pointer */
+	__u32 flags;		/* in: 0 */
+	__u32 status;		/* out */
+	__u32 elapsed_us;	/* out */
+	__u32 pad;
+};
+
 #define DRM_IOCTL_APPLE_G4P_GET_PARAM	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_GET_PARAM, struct drm_apple_g4p_get_param)
 #define DRM_IOCTL_APPLE_G4P_BO_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_BO_CREATE, struct drm_apple_g4p_bo_create)
 #define DRM_IOCTL_APPLE_G4P_SUBMIT	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_SUBMIT, struct drm_apple_g4p_submit)
+#define DRM_IOCTL_APPLE_G4P_SUBMIT_RENDER DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_SUBMIT_RENDER, struct drm_apple_g4p_submit_render)
 #define DRM_IOCTL_APPLE_G4P_VM_BIND	DRM_IOW(DRM_COMMAND_BASE + DRM_APPLE_G4P_VM_BIND, struct drm_apple_g4p_vm_bind)
 
 #if defined(__cplusplus)

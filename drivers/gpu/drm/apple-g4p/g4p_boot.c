@@ -320,7 +320,7 @@ static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 	kfree(b);
 }
 
-#define G4P_ARENA_SIZE	SZ_128K	/* 8.69: G4P_JOB_SLOTS x 8 KiB per heap + channel state / ring */
+#define G4P_ARENA_SIZE	SZ_256K	/* 8.69: G4P_JOB_SLOTS x 8 KiB per heap + channel state / ring; 9.09: render objects */
 
 /* a 4 KiB aligned piece of the pre-boot arena: [0] private (heap 7), [1] shared (heap 6) */
 static int g4p_carve(struct g4p_boot *b, unsigned int which, size_t size, struct g4p_bo *bo)
@@ -335,6 +335,24 @@ static int g4p_carve(struct g4p_boot *b, unsigned int which, size_t size, struct
 	memset(bo->cpu, 0, size);
 	b->arena_used[which] = off + size;
 	return 0;
+}
+
+/* 9.09: firmware objects of the render path, out of this boot's arenas ([0] private, [1] shared heap) */
+int g4p_boot_carve(struct g4p *g, unsigned int which, size_t size, struct g4p_bo *bo)
+{
+	return g->boot && which < 2 ? g4p_carve(g->boot, which, size, bo) : -ENODEV;
+}
+
+/* cached firmware address of a list A offset (the DM state slots the scheduler nodes name) */
+u32 g4p_boot_list_a_fw(struct g4p *g, u32 off)
+{
+	return g4p_fw_addr(g4p_fwinit_list_a_va(&g->boot->fi) + off, true);
+}
+
+/* hardware context slot address space @ctx is loaded in (0 = none) */
+unsigned int g4p_boot_vm_slot(struct g4p *g, unsigned int ctx)
+{
+	return g->boot && ctx < G4P_NR_VM ? g->boot->vm_slot[ctx] : 0;
 }
 
 /* the IRQ handler reads RGX: on only between a boot and the power-off */
@@ -369,6 +387,7 @@ void g4p_boot_free(struct g4p *g)
 		return;
 	WARN_ON(g->powered);
 	g4p_gfx_free(g);	/* 8.88: its pages were mapped in this boot's tables */
+	g4p_render_free(g);	/* 9.09 */
 	g4p_boot_free_mem(g->dev, g->boot);
 	g->boot = NULL;
 	g->drm_booted = false;

@@ -71,6 +71,7 @@ struct g4p {
 	bool irq_on;
 	struct g4p_boot *boot;			/* GPU memory of a META boot; freed after power-off */
 	struct g4p_gfx *gfx;			/* 8.88: C9 graphics harness state of this boot */
+	struct g4p_render *render;		/* 9.09: render submission state of this boot */
 	/*
 	 * DRM pool (8.64): one contiguous buffer, mapped at G4P_PDS_VA (0x300000000) before each firmware boot
 	 * that the DRM path starts; page 0 holds the driver's PDS programs, BOs are page ranges after it.
@@ -205,6 +206,12 @@ struct g4p_gfx;
 int g4p_gfx_run(struct g4p *g);
 ssize_t g4p_gfx_out(struct g4p *g, char __user *ubuf, size_t len, loff_t *pos);
 void g4p_gfx_free(struct g4p *g);
+/* 9.09 render submission (g4p_render.c) */
+int g4p_boot_carve(struct g4p *g, unsigned int which, size_t size, struct g4p_bo *bo);
+u32 g4p_boot_list_a_fw(struct g4p *g, u32 off);
+unsigned int g4p_boot_vm_slot(struct g4p *g, unsigned int ctx);
+void g4p_render_free(struct g4p *g);
+int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const void *td, u32 *status, u32 *elapsed_us);
 bool g4p_boot_alive(struct g4p *g);
 int g4p_boot_rgx_read(struct g4p *g, u32 off, u64 *val);
 int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, unsigned int reg, u32 *val);
