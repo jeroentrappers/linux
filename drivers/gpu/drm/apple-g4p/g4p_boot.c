@@ -634,6 +634,15 @@ int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, 
 	return ret ? ret : -ETIMEDOUT;
 }
 
+/* 8.90: RGX registers for C9 diagnostics: 64-bit reads, only while the GPU runs, offsets < 0x10000, 8-aligned */
+int g4p_boot_rgx_read(struct g4p *g, u32 off, u64 *val)
+{
+	if (!g->boot || !g->powered || !g4p_gpu_running(g) || off >= 0x10000 || (off & 7))
+		return -ENODEV;
+	*val = readq(g->rgx + off);
+	return 0;
+}
+
 bool g4p_boot_alive(struct g4p *g)
 {
 	return g->boot && g->boot->alive && g->powered && g4p_gpu_running(g);

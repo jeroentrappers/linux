@@ -382,6 +382,18 @@ int g4p_gfx_run(struct g4p *g)
 			dev_info(g->dev, "C9 META: T0 PC %08x PCX %08x, T1 PC %08x PCX %08x\n", v[0], v[1], v[2], v[3]);
 			break;
 		}
+		case 10: {	/* REGS {u32 n, u32 off[n]}: RGX registers into the log */
+			u32 n = len >= 4 ? get_unaligned_le32(p) : 0;
+
+			for (u32 i = 0; i < n && 4 + 4 * (i + 1) <= len; i++) {
+				u32 off = get_unaligned_le32(p + 4 + 4 * i);
+				u64 v = 0;
+				int r = g4p_boot_rgx_read(g, off, &v);
+
+				dev_info(g->dev, "C9 RGX %04x = %016llx%s\n", off, v, r ? " (not read)" : "");
+			}
+			break;
+		}
 		case 7:	/* SLEEP */
 			msleep(min(len >= 4 ? get_unaligned_le32(p) : 0, 10000U));
 			break;

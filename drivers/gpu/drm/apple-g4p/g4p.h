@@ -206,6 +206,7 @@ int g4p_gfx_run(struct g4p *g);
 ssize_t g4p_gfx_out(struct g4p *g, char __user *ubuf, size_t len, loff_t *pos);
 void g4p_gfx_free(struct g4p *g);
 bool g4p_boot_alive(struct g4p *g);
+int g4p_boot_rgx_read(struct g4p *g, u32 off, u64 *val);
 int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, unsigned int reg, u32 *val);
 void g4p_boot_ack_rings(struct g4p *g);
 u64 g4p_boot_heap_pte(void);
