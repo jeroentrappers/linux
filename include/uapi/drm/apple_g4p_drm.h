@@ -36,9 +36,16 @@ struct drm_apple_g4p_get_param {
 	__u64 value;		/* out */
 };
 
+/*
+ * BO_CREATE flags. APPLE_G4P_BO_SEPARATE: own allocation outside the pool, at GPU VA 0x320000000 and up, mapped
+ * into the running firmware boot immediately (8.65: post-boot mappings, made visible by the per-job MMU
+ * invalidate) and before every later boot. Its GPU VA is not a code offset (keep code in pool BOs).
+ */
+#define APPLE_G4P_BO_SEPARATE		(1 << 0)
+
 struct drm_apple_g4p_bo_create {
 	__u64 size;		/* in: bytes, rounded up to 4 KiB */
-	__u32 flags;		/* in: 0 */
+	__u32 flags;		/* in: APPLE_G4P_BO_* */
 	__u32 handle;		/* out: GEM handle */
 	__u64 gpu_va;		/* out: GPU VA (pool offset = gpu_va - APPLE_G4P_POOL_VA) */
 	__u64 mmap_offset;	/* out: offset for mmap() on the DRM fd */

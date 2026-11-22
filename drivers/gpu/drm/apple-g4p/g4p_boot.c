@@ -263,6 +263,12 @@ static int g4p_boot_pds_page(struct g4p *g, struct g4p_boot *b)
 	return ret;
 }
 
+/* called from g4p_boot_start once g->boot is set, before the firmware runs */
+static int g4p_boot_map_separate(struct g4p *g)
+{
+	return g->pool.cpu ? g4p_drm_map_separate(g) : 0;
+}
+
 static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 {
 	g4p_bo_free(dev, &b->arena[0]);
@@ -321,6 +327,7 @@ void g4p_boot_free(struct g4p *g)
 	WARN_ON(g->powered);
 	g4p_boot_free_mem(g->dev, g->boot);
 	g->boot = NULL;
+	g4p_drm_reap(g);
 }
 
 static unsigned int g4p_count_nonzero(const void *p, size_t len)
@@ -365,8 +372,11 @@ int g4p_boot_start(struct g4p *g)
 		return ret;
 	}
 
-	wmb();	/* tables and image in memory before the GPU can fetch them */
 	g->boot = b;
+	ret = g4p_boot_map_separate(g);	/* 8.65: separate DRM BOs, before the firmware runs */
+	if (ret)
+		dev_warn(g->dev, "separate BOs not mapped: %d\n", ret);
+	wmb();	/* tables and image in memory before the GPU can fetch them */
 	if (g->irq >= 0 && !g->irq_on) {
 		atomic_set(&g->irq_count, 0);
 		enable_irq(g->irq);
@@ -1218,6 +1228,29 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);
 	j->seq++;
 	return j->stamp0 == stamp || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
+}
+
+/* 8.65: map / unmap a DRM separate BO in the running boot's GPU MMU (window PTE flags) */
+int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size)
+{
+	int ret = 0;
+
+	if (!g->boot)
+		return 0;
+	for (size_t off = 0; off < size && !ret; off += SZ_4K)
+		ret = g4p_mmu_map_page(g->dev, &g->boot->mmu, va + off, dma + off,
+				       heap_pte & (G4P_PTE_CC | G4P_PTE_SLC_BYPASS | G4P_PTE_READ_ONLY));
+	wmb();	/* page tables before the next kick (the firmware invalidates the GPU MMU caches then) */
+	return ret;
+}
+
+void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size)
+{
+	if (!g->boot)
+		return;
+	for (size_t off = 0; off < size; off += SZ_4K)
+		g4p_mmu_unmap_page(&g->boot->mmu, va + off);
+	wmb();
 }
 
 /* 8.64: did the running boot map the DRM pool? */

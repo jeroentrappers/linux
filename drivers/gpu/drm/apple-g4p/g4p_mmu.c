@@ -140,6 +140,15 @@ int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_
 	return 0;
 }
 
+/* clear one page of the extra entry (the next job's MMU invalidate makes it visible) */
+void g4p_mmu_unmap_page(struct g4p_mmu *mmu, u64 va)
+{
+	unsigned int d = MMU_PD_INDEX(va);
+
+	if (mmu->xpd && (va & ~(u64)(SZ_1G - 1)) == mmu->xva && mmu->xpt[d])
+		mmu->xpt[d][MMU_PT_INDEX(va)] = 0;
+}
+
 /* a zeroed, non-cacheable buffer mapped into @heap with the heap's PTE flags (bump allocated) */
 int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo)
 {

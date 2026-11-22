@@ -10,6 +10,7 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/types.h>
+#include <linux/list.h>
 
 #include <drm/drm_device.h>
 
@@ -73,6 +74,9 @@ struct g4p {
 	struct g4p_bo pool;
 	unsigned long *pool_map;		/* bitmap of used pages */
 	unsigned int pool_pages;
+	struct list_head sep_bos;		/* separate BOs (8.65), mapped into every boot */
+	struct list_head zombies;		/* their memory, freed while the GPU was on */
+	u64 sep_next;				/* next free GPU VA for them */
 	const void *job_img;			/* set during a DRM submit: C8 job image from memory */
 	size_t job_img_size;
 };
@@ -113,6 +117,7 @@ int g4p_mmu_init(struct device *dev, struct g4p_mmu *mmu);
 void g4p_mmu_fini(struct device *dev, struct g4p_mmu *mmu);
 int g4p_mmu_map(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, size_t size, u64 flags);
 int g4p_mmu_map_page(struct device *dev, struct g4p_mmu *mmu, u64 va, phys_addr_t pa, u64 flags);
+void g4p_mmu_unmap_page(struct g4p_mmu *mmu, u64 va);
 int g4p_mmu_map_pio(struct device *dev, struct g4p_mmu *mmu, phys_addr_t pa, size_t size, u64 *gpuva);
 int g4p_bo_alloc(struct device *dev, struct g4p_mmu *mmu, enum g4p_heap heap, size_t size, struct g4p_bo *bo);
 void g4p_bo_free(struct device *dev, struct g4p_bo *bo);
@@ -150,6 +155,9 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp);
 void g4p_boot_irq_off(struct g4p *g);
 void g4p_boot_irq_rings(struct g4p *g);
 bool g4p_boot_uses_pool(struct g4p *g);
+int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size);
+void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size);
+int g4p_drm_map_separate(struct g4p *g);	/* g4p_drm.c: map all separate BOs into a new boot */
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
 
 /* g4p_drv.c */
@@ -160,6 +168,7 @@ struct g4p *g4p_drm_alloc(struct device *dev);
 int g4p_drm_register(struct g4p *g);
 void g4p_drm_unregister(struct g4p *g);
 void g4p_drm_pool_free(struct g4p *g);
+void g4p_drm_reap(struct g4p *g);
 
 
 #endif
