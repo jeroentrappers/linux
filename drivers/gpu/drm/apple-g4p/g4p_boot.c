@@ -25,6 +25,8 @@
 
 #include "g4p.h"
 
+#define G4P_JOB_SLOTS	8
+
 /* Rogue registers (upstream ROGUE_CR_*), as AGX writes them (re/GPU-BRINGUP.md 4.1) */
 #define RGX_CR_SOFT_RESET		0x0100
 #define RGX_CR_EVENT_STATUS		0x0130
@@ -107,7 +109,8 @@ struct g4p_boot {
 		u32 ring2_rd, chan_rd, chan_10, stamp0, stamp1;
 		int irq0, irqs;
 		u64 fault[4];
-	} job;
+	} jobs[G4P_JOB_SLOTS];	/* 8.69: job slots, used round robin */
+	u32 job_n;		/* jobs kicked in this boot; job k uses slot k % G4P_JOB_SLOTS, stamp base + k */
 	int cl_ret;
 	u32 cl_us, cl_state_1c, cl_state_38, cl_ring_30, cl_rd, cl_state_24;
 	u64 cl_fault[4], cl_event_status;
@@ -275,10 +278,12 @@ static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 	g4p_bo_free(dev, &b->arena[0]);
 	g4p_bo_free(dev, &b->arena[1]);
 	g4p_bo_free(dev, &b->pds);
-	g4p_bo_free(dev, &b->job.cmd);
-	g4p_bo_free(dev, &b->job.stream);
-	g4p_bo_free(dev, &b->job.cdm);
-	g4p_bo_free(dev, &b->job.misc);
+	for (unsigned int i = 0; i < G4P_JOB_SLOTS; i++) {
+		g4p_bo_free(dev, &b->jobs[i].cmd);
+		g4p_bo_free(dev, &b->jobs[i].stream);
+		g4p_bo_free(dev, &b->jobs[i].cdm);
+		g4p_bo_free(dev, &b->jobs[i].misc);
+	}
 	g4p_bo_free(dev, &b->cl_state);
 	g4p_bo_free(dev, &b->cl_ring);
 	g4p_fwinit_free(dev, &b->fi);
@@ -287,7 +292,7 @@ static void g4p_boot_free_mem(struct device *dev, struct g4p_boot *b)
 	kfree(b);
 }
 
-#define G4P_ARENA_SIZE	SZ_64K
+#define G4P_ARENA_SIZE	SZ_128K	/* 8.69: G4P_JOB_SLOTS x 8 KiB per heap + channel state / ring */
 
 /* a 4 KiB aligned piece of the pre-boot arena: [0] private (heap 7), [1] shared (heap 6) */
 static int g4p_carve(struct g4p_boot *b, unsigned int which, size_t size, struct g4p_bo *bo)
@@ -981,7 +986,7 @@ ssize_t g4p_boot_c8mem(struct g4p *g, void **bufp)
 
 	if (!b || !b->pds.cpu)
 		return -ENODEV;
-	j = &b->job;
+	j = &b->jobs[(b->job_n + G4P_JOB_SLOTS - 1) % G4P_JOB_SLOTS];	/* the last job */
 	size = G4P_C8MEM_SIZE;
 	buf = vzalloc(size);
 	if (!buf)
@@ -1026,19 +1031,19 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	ret = g4p_cl_channel(b);	/* set up only: the first ring 2 entry carries the command */
 	if (ret)
 		return ret;
-	j = &b->job;
 	/*
-	 * GPU-BRINGUP 8.63: C8 jobs can follow each other in one firmware boot on the same channel (the previous
-	 * one has completed: its stamp was seen, or it timed out and the caller powers off). The command, streams
-	 * and misc page are reused and cleared; each job gets its own stamp value. C2..C7 stay one per boot.
+	 * GPU-BRINGUP 8.63/8.69: C8 jobs follow each other on the same channel in one firmware boot, using the job
+	 * slots round robin; each job gets the stamp G4P_STAMP_VALUE + its number. A slot is reused once its last
+	 * job's stamp was seen (the synchronous wait or g4p_boot_job_done). C2..C7 stay one per boot.
 	 */
-	if (j->cmd.cpu && which != 8)
+	if (b->job_n && which != 8)
 		return -EBUSY;
 	if (!g4p_gpu_running(g))
 		return -EIO;
+	j = &b->jobs[b->job_n % G4P_JOB_SLOTS];
 	if (j->cmd.cpu) {
-		if (j->stamp0 != (G4P_STAMP_VALUE + j->seq - 1))
-			return -EBUSY;	/* the previous job never completed: power-cycle first */
+		if (j->stamp0 != j->expect)
+			return -EBUSY;	/* that slot's job never completed: power-cycle first */
 		memset(j->cmd.cpu, 0, j->cmd.size);
 		memset(j->stream.cpu, 0, j->stream.size);
 		memset(j->cdm.cpu, 0, j->cdm.size);
@@ -1059,7 +1064,9 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		if (ret)
 			return ret;
 	}
-	stamp = G4P_STAMP_VALUE + j->seq;
+	stamp = G4P_STAMP_VALUE + b->job_n;
+	j->expect = stamp;
+	j->stamp0 = 0;
 	fcmd = g4p_fw_addr(j->cmd.gpuva, true);
 	fchan = g4p_fw_addr(b->cl_state.gpuva, false);
 	fa3 = g4p_fw_addr(g4p_fwinit_list_a_va(&b->fi) + 0x2400, true);	/* list A #3: CDM DM state */
@@ -1176,11 +1183,10 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	writel(cl_kick & 0xff, g->rgx + RGX_CR_MTS_SCHEDULE);
 	readl(g->rgx + RGX_CR_MTS_SCHEDULE);
 
-	if (which == 8 && g->job_async) {	/* 8.68: completion from the IRQ (g4p_boot_job_complete) */
+	if (which == 8 && g->job_async) {	/* 8.68: completion from the IRQ (g4p_boot_job_done) */
 		j->which = which;
-		j->expect = stamp;
 		j->stream_words = n;
-		j->seq++;
+		b->job_n++;
 		return 0;
 	}
 	for (j->us = 0; j->us < (which == 8 ? j->timeout_ms * 1000 : which >= 4 ? 1000000 : 200000); j->us += 20) {
@@ -1235,7 +1241,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 	dev_info(g->dev, "C%u: %u stream words; after %u us: ring 2 read %u (write %d), channel read %u (+0x10 %u, write %d), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
 		 which, n, j->us, j->ring2_rd, wr, j->chan_rd, j->chan_10, cwr, j->stamp0, j->stamp1, j->irqs,
 		 j->fault[0], j->fault[1], j->fault[2], j->fault[3]);
-	j->seq++;
+	b->job_n++;
 	return j->stamp0 == stamp || (which == 2 && j->chan_rd == (u32)cwr) ? 0 : -ETIMEDOUT;
 }
 
@@ -1263,18 +1269,24 @@ void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size)
 }
 
 /* 8.64: did the running boot map the DRM pool? */
-/* 8.68: has the async job in flight written its stamp? (IRQ context; memory only) */
-bool g4p_boot_job_complete(struct g4p *g)
+/* 8.68/8.69: has job number n of this boot written its stamp? (IRQ context; memory only) */
+bool g4p_boot_job_done(struct g4p *g, u32 n)
 {
 	struct g4p_cljob *j;
 
-	if (!g->boot || !g->boot->job.misc.cpu)
+	if (!g->boot)
 		return false;
-	j = &g->boot->job;
-	if (READ_ONCE(*(u32 *)j->misc.cpu) != j->expect)
+	j = &g->boot->jobs[n % G4P_JOB_SLOTS];
+	if (!j->misc.cpu || j->expect != G4P_STAMP_VALUE + n || READ_ONCE(*(u32 *)j->misc.cpu) != j->expect)
 		return false;
-	j->stamp0 = j->expect;	/* lets the next job reuse the buffers */
+	j->stamp0 = j->expect;	/* the slot can be reused */
 	return true;
+}
+
+/* number the next kicked job will get (8.69) */
+u32 g4p_boot_next_job(struct g4p *g)
+{
+	return g->boot ? g->boot->job_n : 0;
 }
 
 bool g4p_boot_uses_pool(struct g4p *g)
@@ -1284,7 +1296,8 @@ bool g4p_boot_uses_pool(struct g4p *g)
 
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault)
 {
-	struct g4p_cljob *j = &g->boot->job;
+	struct g4p_boot *b = g->boot;
+	struct g4p_cljob *j = &b->jobs[(b->job_n + G4P_JOB_SLOTS - 1) % G4P_JOB_SLOTS];
 
 	*stamp = j->stamp0;
 	*us = j->us;
@@ -1324,11 +1337,13 @@ void g4p_boot_show(struct seq_file *s, struct g4p *g)
 		seq_printf(s, "  C1 live: BIF fault 0x%llx/0x%llx 0x%llx/0x%llx event_status 0x%llx state +0x24 %u\n",
 			   b->cl_fault[0], b->cl_fault[1], b->cl_fault[2], b->cl_fault[3], b->cl_event_status,
 			   b->cl_state_24);
-	if (b->job.cmd.cpu)
-		seq_printf(s, "  C%u: %u us, ring 2 read %u, channel read %u (+0x10 %u), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
-			   b->job.which, b->job.us, b->job.ring2_rd, b->job.chan_rd, b->job.chan_10, b->job.stamp0,
-			   b->job.stamp1, b->job.irqs, b->job.fault[0], b->job.fault[1], b->job.fault[2],
-			   b->job.fault[3]);
+	if (b->job_n) {
+		struct g4p_cljob *lj = &b->jobs[(b->job_n - 1) % G4P_JOB_SLOTS];
+
+		seq_printf(s, "  %u jobs; last: C%u, %u us, ring 2 read %u, channel read %u (+0x10 %u), stamp 0x%08x/0x%08x, %d IRQs, BIF fault 0x%llx/0x%llx 0x%llx/0x%llx\n",
+			   b->job_n, lj->which, lj->us, lj->ring2_rd, lj->chan_rd, lj->chan_10, lj->stamp0,
+			   lj->stamp1, lj->irqs, lj->fault[0], lj->fault[1], lj->fault[2], lj->fault[3]);
+	}
 	g4p_fwinit_show_events(s, &b->fi);
 	g4p_fwinit_show_log(s, &b->fi);
 	seq_printf(s, "  boot args: first [0x%08x]=0x%08x\n", ((u32 *)(b->image.cpu + G4P_BOOTARG_OFFSET))[0],

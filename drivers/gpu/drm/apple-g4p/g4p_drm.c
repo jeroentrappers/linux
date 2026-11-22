@@ -291,33 +291,48 @@ static const struct dma_fence_ops g4p_fence_ops = {
 	.get_timeline_name = g4p_fence_timeline,
 };
 
-/* take the in-flight fence (NULL if none); caller signals and puts it */
-static struct dma_fence *g4p_take_inflight(struct g4p *g)
-{
-	struct dma_fence *f;
-	unsigned long flags;
+#define G4P_FQ	8	/* = G4P_JOB_SLOTS (g4p_boot.c) */
 
-	spin_lock_irqsave(&g->fence_lock, flags);
-	f = g->inflight;
-	g->inflight = NULL;
-	spin_unlock_irqrestore(&g->fence_lock, flags);
-	return f;
-}
-
-/* from the firmware IRQ: the job in flight has written its stamp */
+/* complete jobs in flight, oldest first, while their stamps are in memory (IRQ or process context) */
 void g4p_drm_irq(struct g4p *g)
 {
-	struct dma_fence *f;
+	struct dma_fence *done[G4P_FQ];
+	unsigned int n = 0;
 	unsigned long flags;
 
 	spin_lock_irqsave(&g->fence_lock, flags);
-	f = g->inflight;
-	if (f && g4p_boot_job_complete(g))
-		g->inflight = NULL;
-	else
-		f = NULL;
+	while (g->fq_tail != g->fq_head && g4p_boot_job_done(g, g->fq_job[g->fq_tail % G4P_FQ])) {
+		done[n++] = g->fq[g->fq_tail % G4P_FQ];
+		g->fq[g->fq_tail % G4P_FQ] = NULL;
+		g->fq_tail++;
+	}
 	spin_unlock_irqrestore(&g->fence_lock, flags);
-	if (f) {
+	for (unsigned int i = 0; i < n; i++) {
+		dma_fence_signal(done[i]);
+		dma_fence_put(done[i]);
+	}
+	if (n && g->fq_tail != g->fq_head)	/* the next oldest job gets a fresh timeout */
+		mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
+}
+
+/* fail every job in flight (timeout, or a job that was never kicked) */
+static void g4p_fail_inflight(struct g4p *g, int err)
+{
+	struct dma_fence *f;
+	unsigned long flags;
+
+	for (;;) {
+		spin_lock_irqsave(&g->fence_lock, flags);
+		f = NULL;
+		if (g->fq_tail != g->fq_head) {
+			f = g->fq[g->fq_tail % G4P_FQ];
+			g->fq[g->fq_tail % G4P_FQ] = NULL;
+			g->fq_tail++;
+		}
+		spin_unlock_irqrestore(&g->fence_lock, flags);
+		if (!f)
+			break;
+		dma_fence_set_error(f, err);
 		dma_fence_signal(f);
 		dma_fence_put(f);
 	}
@@ -326,18 +341,26 @@ void g4p_drm_irq(struct g4p *g)
 static void g4p_timeout_work(struct work_struct *w)
 {
 	struct g4p *g = container_of(to_delayed_work(w), struct g4p, timeout_work);
-	struct dma_fence *f;
 
 	mutex_lock(&g->lock);
-	g4p_drm_irq(g);	/* a missed interrupt: check the stamp once more */
-	f = g4p_take_inflight(g);
-	if (f) {
-		dma_fence_set_error(f, -ETIMEDOUT);
-		dma_fence_signal(f);
-		dma_fence_put(f);
+	g4p_drm_irq(g);	/* a missed interrupt: check the stamps once more */
+	if (g->fq_tail != g->fq_head) {
+		g4p_fail_inflight(g, -ETIMEDOUT);
 		g4p_recover_locked(g);
 	}
 	mutex_unlock(&g->lock);
+}
+
+/* the fence to wait for before submitting: the oldest if all slots are busy, or (all) the newest; referenced */
+static struct dma_fence *g4p_wait_target(struct g4p *g, bool all)
+{
+	struct dma_fence *f = NULL;
+
+	spin_lock_irq(&g->fence_lock);
+	if (g->fq_head - g->fq_tail >= (all ? 1 : G4P_FQ))
+		f = dma_fence_get(g->fq[(all ? g->fq_head - 1 : g->fq_tail) % G4P_FQ]);
+	spin_unlock_irq(&g->fence_lock);
+	return f;
 }
 
 static void g4p_idle_work(struct work_struct *w)
@@ -372,11 +395,12 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		ret = PTR_ERR(img);
 		goto out_sync;
 	}
-	/* one job in flight: wait for the previous one (signalled by the IRQ or the timeout work) */
+	/*
+	 * 8.69: up to G4P_FQ jobs in flight. An async submit waits only while every slot is busy; a synchronous one
+	 * waits for everything in flight (it reads its own result back directly).
+	 */
 	for (;;) {
-		spin_lock_irq(&g->fence_lock);
-		prev = g->inflight ? dma_fence_get(g->inflight) : NULL;
-		spin_unlock_irq(&g->fence_lock);
+		prev = g4p_wait_target(g, !async);
 		if (!prev)
 			break;
 		ret = dma_fence_wait(prev, true);
@@ -399,22 +423,27 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 			g->job_img_size = a->job_size;
 			g->job_async = true;
 			spin_lock_irq(&g->fence_lock);
-			g->inflight = dma_fence_get(f);	/* before the kick: the IRQ may come at once */
+			if (g->fq_head - g->fq_tail >= G4P_FQ) {
+				ret = -EBUSY;	/* raced with another submitter: user space retries */
+			} else {
+				g->fq_job[g->fq_head % G4P_FQ] = g4p_boot_next_job(g);
+				g->fq[g->fq_head % G4P_FQ] = dma_fence_get(f);	/* before the kick: the IRQ may come */
+				g->fq_head++;
+			}
 			spin_unlock_irq(&g->fence_lock);
-			ret = g4p_boot_cl_job(g, 8);
+			if (!ret)
+				ret = g4p_boot_cl_job(g, 8);
 			g->job_async = false;
 			g->job_img = NULL;
-			if (ret) {	/* never kicked: drop the in-flight reference again */
-				struct dma_fence *t = g4p_take_inflight(g);
-
-				if (t) {
-					dma_fence_set_error(t, ret);
-					dma_fence_signal(t);
-					dma_fence_put(t);
-				}
+			if (ret == -EBUSY && g->fq[(g->fq_head - 1) % G4P_FQ] != f) {
+				dma_fence_set_error(f, ret);	/* not queued: signal it here */
+				dma_fence_signal(f);
+			} else if (ret) {
+				g4p_fail_inflight(g, ret);	/* queued but never kicked */
 			} else {
 				g4p_drm_irq(g);	/* very short jobs: already done */
-				mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
+				if (!delayed_work_pending(&g->timeout_work))
+					mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(1000));
 			}
 			if (sync)
 				drm_syncobj_replace_fence(sync, f);

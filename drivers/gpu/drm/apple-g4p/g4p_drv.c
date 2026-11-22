@@ -294,7 +294,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 /* 8.67: the DRM path's idle power-off (only a boot the DRM path started; debugfs boots stay up) */
 void g4p_idle_off_locked(struct g4p *g)
 {
-	if (g->boot && g->drm_booted && !READ_ONCE(g->inflight))
+	if (g->boot && g->drm_booted && READ_ONCE(g->fq_head) == READ_ONCE(g->fq_tail))
 		g4p_power_off_locked(g);
 }
 

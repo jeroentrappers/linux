@@ -84,7 +84,9 @@ struct g4p {
 	/* 8.68: the one asynchronous job in flight */
 	bool job_async;				/* set during a submit: g4p_boot_cl_job returns after the kick */
 	spinlock_t fence_lock;
-	struct dma_fence *inflight;		/* signalled from the IRQ or the timeout work */
+	struct dma_fence *fq[8];		/* 8.69: jobs in flight, oldest at fq_tail; IRQ / timeout signal */
+	u32 fq_job[8];				/* their job numbers in the boot */
+	unsigned int fq_head, fq_tail;
 	u64 fence_ctx, fence_seq;
 	struct delayed_work timeout_work;
 	bool drm_booted;			/* the running boot was started by the DRM path */
@@ -170,7 +172,8 @@ int g4p_boot_map_range(struct g4p *g, u64 va, dma_addr_t dma, size_t size);
 void g4p_boot_unmap_range(struct g4p *g, u64 va, size_t size);
 int g4p_drm_map_separate(struct g4p *g);	/* g4p_drm.c: map all separate BOs into a new boot */
 void g4p_boot_job_result(struct g4p *g, u32 *stamp, u32 *us, u64 *fault);
-bool g4p_boot_job_complete(struct g4p *g);
+bool g4p_boot_job_done(struct g4p *g, u32 n);
+u32 g4p_boot_next_job(struct g4p *g);
 
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);
