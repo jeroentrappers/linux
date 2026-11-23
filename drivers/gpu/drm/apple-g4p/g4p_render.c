@@ -29,8 +29,14 @@
 #define G4P_RING_N		0x144
 #define G4P_RSLOTS		2
 #define G4P_PM_ENTRIES		36
-#define G4P_PB_BLOCKS		30			/* the descriptor page holds 30 (iOS: 11 for small passes); dense meshes ran out, 9.60 */
+#define G4P_PB_BLOCKS		61			/* most: 0x84-byte descriptors after 0x80 in 8 KiB (iOS starts at 11 and grows) */
 #define G4P_PB_BLOCK		SZ_128K
+
+/* no PB grow or partial render: a dense mesh that fills the PB stalls the TA (9.60: 11 -> 30, 9.62: glmark2 refract's
+ * bunny needs more than 30) */
+static unsigned int pb_blocks = G4P_PB_BLOCKS;
+module_param(pb_blocks, uint, 0444);
+MODULE_PARM_DESC(pb_blocks, "parameter buffer in 128 KiB blocks (2..61, default 61)");
 #define G4P_PM_VA		0x33c000000ULL		/* = APPLE_G4P_USER_VA_END: kernel-owned top of each space */
 #define G4P_PM_FSTACK		0x18000			/* free-page stack (0x300 blocks x 32 pages x 4 bytes) */
 #define G4P_PM_BUF		(G4P_PM_VA + 0x100000)
@@ -115,8 +121,9 @@ static int g4p_render_init(struct g4p *g)
 	if (!ret)
 		ret = g4p_boot_carve(g, 1, SZ_4K, &r->shared);
 	if (!ret)
-		ret = g4p_boot_carve(g, 1, SZ_4K, &r->pbd);
-	for (unsigned int i = 0; i < G4P_PB_BLOCKS && !ret; i++) {
+		ret = g4p_boot_carve(g, 1, SZ_8K, &r->pbd);
+	pb_blocks = clamp(pb_blocks, 2u, (unsigned int)G4P_PB_BLOCKS);
+	for (unsigned int i = 0; i < pb_blocks && !ret; i++) {
 		r->pb_cpu[i] = dma_alloc_coherent(g->dev, G4P_PB_BLOCK, &r->pb_dma[i], GFP_KERNEL);
 		if (!r->pb_cpu[i])
 			ret = -ENOMEM;
@@ -134,11 +141,11 @@ static int g4p_render_init(struct g4p *g)
 	}
 	/* PB descriptors (8.89): buffer header +0x60 = 1; block 0 alone, blocks 1.. chained */
 	w32(r->pbd.cpu, 0x60, 1);
-	for (unsigned int i = 0; i < G4P_PB_BLOCKS; i++) {
+	for (unsigned int i = 0; i < pb_blocks; i++) {
 		void *d = r->pbd.cpu + 0x80 + 0x84 * i;
 		u64 dva = r->pbd.gpuva + 0x80 + 0x84 * i;
 
-		w32(d, 0, (i == 0 || i == G4P_PB_BLOCKS - 1) ? 0 : g4p_fw_addr(dva + 0x84, false));
+		w32(d, 0, (i == 0 || i == pb_blocks - 1) ? 0 : g4p_fw_addr(dva + 0x84, false));
 		for (unsigned int p = 0; p < G4P_PB_BLOCK / SZ_4K; p++)
 			w32(d, 4 + 4 * p, (r->pb_dma[i] + (u64)p * SZ_4K) >> 12);
 	}
