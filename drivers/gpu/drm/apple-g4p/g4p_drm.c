@@ -819,6 +819,16 @@ out_sync:
 	return ret;
 }
 
+/*
+ * 9.63: a render of another address space than the boot's renders so far, in a boot whose renders began with one
+ * process (g4pvk) and continue with another (Zink), faults in the 3D stage (a read of address 0) on the new process's
+ * first render; after a fresh boot it does not. Until the firmware state behind it is known, such a switch powers the
+ * idle GPU off first (the next submit boots again, ~10 ms).
+ */
+static bool render_switch_reboot = true;
+module_param(render_switch_reboot, bool, 0644);
+MODULE_PARM_DESC(render_switch_reboot, "power-cycle the idle GPU when renders switch to another address space (default 1)");
+
 /* 9.09: one render pass of the file's address space, synchronous (g4p_render.c) */
 static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct drm_file *file)
 {
@@ -851,6 +861,14 @@ static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct dr
 		goto out;
 	mutex_lock(&g->lock);
 	ret = g4p_pool_get_locked(g);
+	if (!ret && render_switch_reboot && g->boot) {
+		const unsigned int last = g4p_render_ctx(g);
+
+		if (last && last != ctx) {
+			dev_info(g->dev, "renders switch from address space %u to %u: fresh boot\n", last, ctx);
+			g4p_idle_off_locked(g);
+		}
+	}
 	if (!ret)
 		ret = g4p_ensure_booted_locked(g);
 	if (!ret)

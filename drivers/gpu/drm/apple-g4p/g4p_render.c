@@ -80,6 +80,12 @@ static void w64(void *p, unsigned int off, u64 v)
 	*(u64 *)(p + off) = v;
 }
 
+/* the address space whose PB / PM set is installed (the boot's last render), 0 if none */
+unsigned int g4p_render_ctx(struct g4p *g)
+{
+	return g->render ? g->render->pm_vm : 0;
+}
+
 void g4p_render_free(struct g4p *g)
 {
 	struct g4p_render *r = g->render;

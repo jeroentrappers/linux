@@ -212,6 +212,7 @@ int g4p_boot_carve(struct g4p *g, unsigned int which, size_t size, struct g4p_bo
 u32 g4p_boot_list_a_fw(struct g4p *g, u32 off);
 unsigned int g4p_boot_vm_slot(struct g4p *g, unsigned int ctx);
 void g4p_render_free(struct g4p *g);
+unsigned int g4p_render_ctx(struct g4p *g);
 int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const void *td, u32 *status, u32 *elapsed_us);
 bool g4p_boot_alive(struct g4p *g);
 int g4p_boot_rgx_read(struct g4p *g, u32 off, u64 *val);
