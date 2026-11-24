@@ -243,9 +243,39 @@ static const struct vm_operations_struct g4p_gem_vm_ops = {
 	.close = drm_gem_vm_close,
 };
 
+/*
+ * 9.68: PRIME export of the driver's own buffers (Mesa's WSI exports swapchain images: vkmark's headless window at
+ * 750x1334 no longer fits the display carve-out). Both kinds are coherent DMA memory: a separate buffer is one
+ * allocation, a pool buffer a page range of the pool. Imported buffers are not re-exported.
+ */
+static struct sg_table *g4p_gem_get_sg_table(struct drm_gem_object *obj)
+{
+	struct g4p *g = to_g4p(obj->dev);
+	struct g4p_gem *bo = to_g4p_gem(obj);
+	struct sg_table *sgt;
+	int ret;
+
+	if (bo->sgt)
+		return ERR_PTR(-EINVAL);
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		return ERR_PTR(-ENOMEM);
+	if (bo->separate)
+		ret = dma_get_sgtable(g->dev, sgt, bo->mem.cpu, bo->mem.dma, bo->mem.size);
+	else
+		ret = dma_get_sgtable(g->dev, sgt, g->pool.cpu + (size_t)bo->first * SZ_4K,
+				      g->pool.dma + (dma_addr_t)bo->first * SZ_4K, (size_t)bo->npages * SZ_4K);
+	if (ret) {
+		kfree(sgt);
+		return ERR_PTR(ret);
+	}
+	return sgt;
+}
+
 static const struct drm_gem_object_funcs g4p_gem_funcs = {
 	.free = g4p_gem_free,
 	.mmap = g4p_gem_mmap,
+	.get_sg_table = g4p_gem_get_sg_table,
 	.vm_ops = &g4p_gem_vm_ops,
 };
 
