@@ -866,13 +866,16 @@ static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct dr
 	struct drm_apple_g4p_submit_render *a = data;
 	unsigned int ctx = ((struct g4p_file *)file->driver_priv)->ctx;
 	void *ta, *td = NULL;
+	u32 timeout_ms;
 	struct dma_fence *prev;
 	int ret;
 
 	if (!raw_jobs)
 		return -EPERM;
-	if (a->flags)
+	if (a->flags & ~APPLE_G4P_RENDER_TIMEOUT)
 		return -EINVAL;
+	/* 9.69: large renders (GLES3.1 draw_indirect 500 x 500 grids) took longer than the fixed 2 s */
+	timeout_ms = a->flags & APPLE_G4P_RENDER_TIMEOUT ? clamp(a->timeout_ms, 100U, 10000U) : 2000;
 	ta = memdup_user(u64_to_user_ptr(a->ta_cmd), APPLE_G4P_TA_CMD_SIZE);
 	if (IS_ERR(ta))
 		return PTR_ERR(ta);
@@ -904,7 +907,7 @@ static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct dr
 	if (!ret)
 		ret = g4p_boot_ctx_bind(g, ctx);
 	if (!ret)
-		ret = g4p_render_submit(g, ctx, ta, td, &a->status, &a->elapsed_us);
+		ret = g4p_render_submit(g, ctx, ta, td, timeout_ms, &a->status, &a->elapsed_us);
 	if (!ret && a->status)
 		g4p_recover_locked(g);	/* the next submit boots the firmware again */
 	if (idle_ms && g->boot)

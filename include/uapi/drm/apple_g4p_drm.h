@@ -129,13 +129,16 @@ struct drm_apple_g4p_vm_bind {
 #define APPLE_G4P_TA_CMD_SIZE		0x580
 #define APPLE_G4P_3D_CMD_SIZE		0x8c0
 
+/* 9.69: SUBMIT_RENDER flags: APPLE_G4P_RENDER_TIMEOUT: timeout_ms is the wait (at most 10 s; else 2 s) */
+#define APPLE_G4P_RENDER_TIMEOUT	(1 << 0)
+
 struct drm_apple_g4p_submit_render {
 	__u64 ta_cmd;		/* in: user pointer */
 	__u64 td_cmd;		/* in: user pointer */
-	__u32 flags;		/* in: 0 */
+	__u32 flags;		/* in: APPLE_G4P_RENDER_* */
 	__u32 status;		/* out */
 	__u32 elapsed_us;	/* out */
-	__u32 pad;
+	__u32 timeout_ms;	/* in (APPLE_G4P_RENDER_TIMEOUT) */
 };
 
 #define DRM_IOCTL_APPLE_G4P_GET_PARAM	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_G4P_GET_PARAM, struct drm_apple_g4p_get_param)

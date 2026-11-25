@@ -321,7 +321,8 @@ static void g4p_render_nodes(struct g4p *g, struct g4p_render *r, void *s, u64 s
  * One render pass of address space @ctx (bound to a hardware slot): @ta / @td are the user's command bodies.
  * Called with g->lock held, the firmware booted and nothing else in flight.
  */
-int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const void *td, u32 *status, u32 *elapsed_us)
+int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const void *td, u32 timeout_ms, u32 *status,
+		      u32 *elapsed_us)
 {
 	struct g4p_render *r;
 	unsigned int hw = g4p_boot_vm_slot(g, ctx), us;
@@ -426,7 +427,7 @@ int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const voi
 	}
 	if (ret)
 		return ret;
-	for (us = 0; us < 2000000; us += 50) {
+	for (us = 0; us < timeout_ms * 1000; us += 50) {
 		if (!(us % 1000))
 			g4p_boot_ack_rings(g);	/* host-bound trace / statistics rings (8.89) */
 		if (READ_ONCE(st[1]) == seq)
