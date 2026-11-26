@@ -24,9 +24,15 @@ static unsigned int timer_us = 1000;
 module_param(timer_us, uint, 0644);
 MODULE_PARM_DESC(timer_us, "firmware timer period (config +0x280, read at boot; iOS 1000 us); slower = later lockup verdicts");
 
-static unsigned int lockup_detect = 1;
+/*
+ * 9.69: off by default. With it on, the firmware stops a vertex or fragment job that runs longer than about 22 ms
+ * (TA / 3D never finish; the render times out after 2 s): a vertex-stage loop of 678491 iterations (462 ms) and the
+ * Vulkan CTS vertex-stage 128 x 128 image copies (54..69 ms) completed correctly with it off. What the firmware
+ * expects from the host after a lockup verdict is open. Hung jobs are still caught by the render wait timeout.
+ */
+static unsigned int lockup_detect;
 module_param(lockup_detect, uint, 0644);
-MODULE_PARM_DESC(lockup_detect, "firmware lockup detection (config +0x254, read at boot): 1 = on (iOS), 0 = off (bring-up)");
+MODULE_PARM_DESC(lockup_detect, "firmware lockup detection (config +0x254, read at boot): 0 = off (default: it stopped graphics jobs of more than ~22 ms), 1 = on (iOS)");
 
 #define LA_ROOT_A	0x0000
 #define LA_1		0x1140
