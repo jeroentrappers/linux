@@ -29,6 +29,7 @@ struct seq_file;
 #define FNDR_PERF_CTL_BUSY	BIT(4)
 #define FNDR_PERF_NEXT		0x1004	/* read only (iOS dumps it) */
 #define FNDR_SLEEP_TIMER	0x10000
+/* never touched: +0x20000 (PERF_STATE_OVERRIDE; a write to it hung, GPU-BRINGUP 8.14), whatever brkosebay's stop does */
 #define FNDR_TIMEOUT_US		100000
 
 /* Rogue core (upstream ROGUE_CR_*) */
@@ -39,6 +40,8 @@ struct seq_file;
 
 /* PMGR MiscACG (XNU _regGroups[kRegGroupMiscACG]); bit 0 = auto clock gating enable */
 #define PMGR_MISC_ACG_EN	BIT(0)
+/* PMGR PLL5 (0x20e005004, optional "gpu-pll" range): bit 30 = locked (brkosebay's T7000_PMGR_PLL5, re/GPU-RECOVERY.md) */
+#define PMGR_GPU_PLL_LOCKED	BIT(30)
 
 struct g4p_bo {
 	void *cpu;
@@ -56,6 +59,7 @@ struct g4p {
 	void __iomem *bridge10;
 	void __iomem *bridge11;
 	void __iomem *misc_acg;			/* NULL: not described, RGX access refused */
+	void __iomem *gpu_pll;			/* NULL: not described, diagnostic RGX reads not PLL-gated */
 	u32 bridge10_cfg[2];			/* offset, value */
 	u32 bridge11_cfg[G4P_BRIDGE11_WORDS];	/* words from offset 0 */
 	struct mutex lock;
@@ -100,6 +104,15 @@ struct g4p {
 	bool drm_booted;			/* the running boot was started by the DRM path */
 	const void *job_img;			/* set during a DRM submit: C8 job image from memory */
 	size_t job_img_size;
+	/*
+	 * Hang / fault recovery (re/GPU-RECOVERY.md). wedged: the Fender did not take the core to state 0, so the
+	 * META may still run in its memory: nothing of it is freed, no register is touched, the power reference is
+	 * kept, until debugfs "recover" stops it or the phone reboots. lost: boots keep failing (no alive event).
+	 */
+	bool wedged, lost;
+	unsigned int recoveries, boot_failures;
+	unsigned long off_at;			/* jiffies of the last power-off (the core stays off >= off_ms) */
+	char last_hang[64];
 };
 
 /* g4p_mmu.c: GPU MMU and buffers in the firmware heaps (AGXGart heaps 5..8) */
@@ -252,10 +265,17 @@ void g4p_boot_job_retire(struct g4p *g, u32 n);
 void g4p_boot_stall_dbg(struct g4p *g);
 int g4p_boot_mmu_fault(struct g4p *g);
 
+bool g4p_boot_fw_alive(struct g4p *g);
+void g4p_boot_hang_report(struct g4p *g);
+void g4p_boot_quiesce(struct g4p *g);
+
 /* g4p_drv.c */
 int g4p_ensure_booted_locked(struct g4p *g);
-void g4p_recover_locked(struct g4p *g);
+void g4p_recover_locked(struct g4p *g, const char *why);
 void g4p_idle_off_locked(struct g4p *g);
+bool g4p_rgx_running(struct g4p *g);
+bool g4p_rgx_diag_ok(struct g4p *g);
+bool g4p_recovery_on(void);
 
 /* g4p_drm.c */
 struct g4p *g4p_drm_alloc(struct device *dev);
@@ -264,6 +284,7 @@ void g4p_drm_unregister(struct g4p *g);
 void g4p_drm_pool_free(struct g4p *g);
 void g4p_drm_reap(struct g4p *g);
 void g4p_drm_irq(struct g4p *g);
+void g4p_drm_cancel_inflight(struct g4p *g, int err);
 
 
 #endif

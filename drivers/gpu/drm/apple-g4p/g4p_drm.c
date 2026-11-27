@@ -83,12 +83,26 @@ void g4p_drm_reap(struct g4p *g)
 	struct g4p_zombie *z, *t;
 
 	WARN_ON(g->powered);
+	if (g->wedged)	/* re/GPU-RECOVERY.md: never while the core may still write them */
+		return;
 	list_for_each_entry_safe(z, t, &g->zombies, node) {
 		dma_free_coherent(g->dev, z->mem.size, z->mem.cpu, z->mem.dma);
 		list_del(&z->node);
 		kfree(z);
 	}
 }	/* separate BOs: from here, never reused (bring-up) */
+
+/* memory the GPU may still reach: freed by g4p_drm_reap at the next power-off (never while wedged) */
+static bool g4p_park(struct g4p *g, const struct g4p_bo *mem)
+{
+	struct g4p_zombie *z = kmalloc(sizeof(*z), GFP_KERNEL);
+
+	if (!z)
+		return false;	/* leak rather than let the GPU write freed memory */
+	z->mem = *mem;
+	list_add_tail(&z->node, &g->zombies);
+	return true;
+}
 
 #define to_g4p(d)	container_of(d, struct g4p, drm)
 #define to_g4p_gem(o)	container_of(o, struct g4p_gem, base)
@@ -181,7 +195,13 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 			list_del(&bo->node);
 			g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 			if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
-				g4p_recover_locked(g);
+				g4p_recover_locked(g, "flush after an imported buffer's unmap");
+		}
+		if (g->wedged && bo->mapped) {
+			/* re/GPU-RECOVERY.md: the core may still write it: keep the import (and the exporter's pages) */
+			mutex_unlock(&g->lock);
+			dev_warn(g->dev, "GPU wedged: imported buffer kept until a reboot\n");
+			return;
 		}
 		mutex_unlock(&g->lock);
 		drm_prime_gem_destroy(obj, bo->sgt);
@@ -190,19 +210,23 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 		return;
 	}
 	if (bo->separate && !bo->mapped) {
-		dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
+		if (!g->wedged)
+			dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
+		else if (!g4p_park(g, &bo->mem))	/* re/GPU-RECOVERY.md: stale translations may remain */
+			dev_warn(g->dev, "GPU wedged: buffer memory leaked\n");
 	} else if (bo->separate) {
 		list_del(&bo->node);
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
-		if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx)) {
-			/* the flush job failed: park the memory until the GPU is off (and recover) */
+		if (g->wedged || (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))) {
+			/* the flush job failed (or the GPU is wedged): park the memory until the GPU is off (and recover) */
 			struct g4p_zombie *z = kmalloc(sizeof(*z), GFP_KERNEL);
 
 			if (z) {
 				z->mem = bo->mem;
 				list_add_tail(&z->node, &g->zombies);
 			} /* else: leak rather than let the GPU write freed memory */
-			g4p_recover_locked(g);
+			if (!g->wedged)
+				g4p_recover_locked(g, "flush after a buffer's unmap");
 		} else {
 			dma_free_coherent(g->dev, bo->mem.size, bo->mem.cpu, bo->mem.dma);
 		}
@@ -210,7 +234,7 @@ static void g4p_gem_free(struct drm_gem_object *obj)
 		/* 8.79: out of its context first, so the pages can go to another file */
 		g4p_boot_pool_unmap(g, bo->ctx, bo->first, bo->npages);
 		if (bo->ctx && g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
-			g4p_recover_locked(g);	/* the next boot maps without these pages */
+			g4p_recover_locked(g, "flush after a pool buffer's unmap");	/* the next boot maps without them */
 		memset(g->pool_owner + bo->first, 0, bo->npages);
 		bitmap_clear(g->pool_map, bo->first, bo->npages);
 	}
@@ -406,7 +430,7 @@ static int g4p_vm_bind_range_locked(struct g4p *g, struct g4p_gem *bo, struct dr
 			list_del(&m->node);
 			g4p_boot_unmap_range(g, m->ctx, m->va, m->size);
 			if (g->powered && g->boot && g4p_flush_ctx_locked(g, m->ctx))
-				g4p_recover_locked(g);
+				g4p_recover_locked(g, "flush after a VM_BIND unmap");
 			drm_gem_object_put(&bo->base);	/* the buffer itself is kept by its handle */
 			kfree(m);
 			return 0;
@@ -499,7 +523,7 @@ static int g4p_ioctl_vm_bind(struct drm_device *drm, void *data, struct drm_file
 		bo->mapped = false;
 		g4p_boot_unmap_range(g, bo->ctx, bo->mem.gpuva, bo->mem.size);
 		if (g->powered && g->boot && g4p_flush_ctx_locked(g, bo->ctx))
-			g4p_recover_locked(g);	/* the flush job failed: power off, the next boot maps without it */
+			g4p_recover_locked(g, "flush after a VM_BIND unmap");	/* the next boot maps without it */
 		break;
 	default:
 		ret = -EINVAL;
@@ -642,28 +666,53 @@ static void g4p_fail_inflight(struct g4p *g, int err, int rest, int fctx)
 }
 
 #define G4P_TIMEOUT_MS		1000
-#define G4P_FAULT_POLL_MS	20	/* 8.83: a faulted job never completes; look for the fault this often */
+
+/*
+ * 8.83: a faulted job never completes; the BIF fault status is read this often while jobs are in flight to fail it
+ * early. re/GPU-RECOVERY.md: brkosebay saw a tight poll of these registers during a job freeze the SoC (single reads
+ * were safe); 0 reads them only once, at the job's timeout.
+ */
+static unsigned int fault_poll_ms = 20;
+module_param(fault_poll_ms, uint, 0644);
+MODULE_PARM_DESC(fault_poll_ms, "BIF fault check period while compute jobs are in flight, ms (default 20; 0 = only at the timeout)");
+
+static unsigned long g4p_poll_delay(struct g4p *g)
+{
+	unsigned int ms = READ_ONCE(fault_poll_ms);
+
+	if (!ms)	/* wake at the deadline only */
+		return time_before(jiffies, g->fq_deadline) ? g->fq_deadline - jiffies : 0;
+	return msecs_to_jiffies(max(ms, 5U));
+}
 
 /* (re)start the oldest job's timeout */
 static void g4p_arm_timeout(struct g4p *g)
 {
 	g->fq_deadline = jiffies + msecs_to_jiffies(G4P_TIMEOUT_MS);
-	mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(G4P_FAULT_POLL_MS));
+	mod_delayed_work(system_wq, &g->timeout_work, g4p_poll_delay(g));
+}
+
+void g4p_drm_cancel_inflight(struct g4p *g, int err)
+{
+	g4p_fail_inflight(g, err, err, 0);
 }
 
 static void g4p_timeout_work(struct work_struct *w)
 {
 	struct g4p *g = container_of(to_delayed_work(w), struct g4p, timeout_work);
-	int fctx;
+	bool expired;
+	int fctx = 0;
 
 	mutex_lock(&g->lock);
 	g4p_drm_irq(g);	/* a missed interrupt: check the stamps once more */
 	if (g->fq_tail == g->fq_head)
 		goto out;
+	expired = !time_before(jiffies, g->fq_deadline);
 	/* 8.80/8.83: a job that faulted never completes; the BIF fault status names its context */
-	fctx = g4p_boot_mmu_fault(g);
-	if (!fctx && time_before(jiffies, g->fq_deadline)) {
-		mod_delayed_work(system_wq, &g->timeout_work, msecs_to_jiffies(G4P_FAULT_POLL_MS));
+	if (expired || READ_ONCE(fault_poll_ms))
+		fctx = g4p_boot_mmu_fault(g);
+	if (!fctx && !expired) {
+		mod_delayed_work(system_wq, &g->timeout_work, g4p_poll_delay(g));
 		goto out;
 	}
 	g4p_boot_stall_dbg(g);
@@ -671,8 +720,14 @@ static void g4p_timeout_work(struct work_struct *w)
 		g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ]);
 		g4p_boot_job_dbg(g, g->fq_job[i % G4P_FQ] + 1);
 	}
-	g4p_fail_inflight(g, -ETIMEDOUT, -ECANCELED, fctx);
-	g4p_recover_locked(g);
+	if (g4p_recovery_on()) {
+		/* re/GPU-RECOVERY.md: the core stops first; only then may user space reuse the jobs' buffers */
+		g4p_recover_locked(g, fctx ? "compute job faulted" : "compute job timed out");
+		g4p_fail_inflight(g, -ETIMEDOUT, -ECANCELED, fctx);
+	} else {
+		g4p_fail_inflight(g, -ETIMEDOUT, -ECANCELED, fctx);
+		g4p_recover_locked(g, fctx ? "compute job faulted" : "compute job timed out");
+	}
 out:
 	mutex_unlock(&g->lock);
 }
@@ -833,7 +888,7 @@ static int g4p_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 				ret = g4p_flush_unmap_locked(g);
 			a->status = ret ? 1 : 0;
 			if (ret)
-				g4p_recover_locked(g);	/* the next submit boots the firmware again */
+				g4p_recover_locked(g, "compute job did not finish");	/* the next submit boots again */
 			ret = 0;
 		}
 	}
@@ -909,7 +964,7 @@ static int g4p_ioctl_submit_render(struct drm_device *drm, void *data, struct dr
 	if (!ret)
 		ret = g4p_render_submit(g, ctx, ta, td, timeout_ms, &a->status, &a->elapsed_us);
 	if (!ret && a->status)
-		g4p_recover_locked(g);	/* the next submit boots the firmware again */
+		g4p_recover_locked(g, a->status == 2 ? "render: 3D did not finish" : "render: TA did not finish");
 	if (idle_ms && g->boot)
 		mod_delayed_work(system_wq, &g->idle_work, msecs_to_jiffies(idle_ms));
 	mutex_unlock(&g->lock);
@@ -991,7 +1046,7 @@ static void g4p_drm_postclose(struct drm_device *drm, struct drm_file *file)
 		}
 	}
 	if (any && g->powered && g->boot && g4p_flush_ctx_locked(g, gf->ctx))
-		g4p_recover_locked(g);
+		g4p_recover_locked(g, "flush at a file's close");
 	g4p_boot_ctx_detach(g, gf->ctx);
 	clear_bit(gf->ctx, &g->ctx_used);
 	mutex_unlock(&g->lock);
@@ -1087,6 +1142,8 @@ void g4p_drm_unregister(struct g4p *g)
 /* only once the GPU is powered off: until then it may still access the pool */
 void g4p_drm_pool_free(struct g4p *g)
 {
+	if (g->wedged)	/* re/GPU-RECOVERY.md: the core may still use it: left allocated */
+		return;
 	WARN_ON(g->powered);
 	g4p_drm_reap(g);
 	if (g->pool.cpu)

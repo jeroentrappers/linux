@@ -64,6 +64,24 @@ static bool read_id = true;
 module_param(read_id, bool, 0644);
 MODULE_PARM_DESC(read_id, "read the Rogue core ID at power-up (needs the misc-acg range)");
 
+/* re/GPU-RECOVERY.md */
+static bool recovery = true;
+module_param(recovery, bool, 0644);
+MODULE_PARM_DESC(recovery, "hardened hang / fault recovery (default 1): IRQ off, Fender stop checked, GPU memory kept if the core does not stop; 0 = the old unconditional power-off");
+
+static unsigned int off_ms = 10;
+module_param(off_ms, uint, 0644);
+MODULE_PARM_DESC(off_ms, "minimum time the GPU stays powered off before the next power-up, in ms (default 10)");
+
+static unsigned int max_boot_failures = 3;
+module_param(max_boot_failures, uint, 0644);
+MODULE_PARM_DESC(max_boot_failures, "firmware boots without an alive event in a row before the GPU is given up (until debugfs recover; default 3)");
+
+bool g4p_recovery_on(void)
+{
+	return READ_ONCE(recovery);
+}
+
 /* ------------------------------------------------------------------------------------------------ */
 /* power layer */
 
@@ -123,16 +141,67 @@ static void g4p_read_id(struct g4p *g)
 		dev_warn(g->dev, "unexpected core revision\n");
 }
 
+/*
+ * The core to Fender state 0 (Apple's setGPCPerformanceState(0), 8.11): no request may be pending first (Apple
+ * waits up to 30 s; brkosebay 100 ms), then the request, then its acknowledge, and state 0 read back. One more try
+ * 10 ms later. Fender registers only: no RGX access, so a hung or crashed core stops the same way.
+ */
+static int g4p_fender_stop(struct g4p *g)
+{
+	int ret = -ETIMEDOUT;
+	u32 v;
+
+	for (unsigned int i = 0; i < 2 && ret; i++) {
+		if (i)
+			usleep_range(10000, 11000);
+		if (readl_poll_timeout(g->fender + FNDR_PERF_CTL, v, !(v & FNDR_PERF_CTL_BUSY), 10, FNDR_TIMEOUT_US))
+			continue;	/* an earlier request (the firmware's own) is still pending */
+		ret = g4p_fender_perf(g, FNDR_PERF_CTL_BUSY | 0);
+		v = readl(g->fender + FNDR_PERF_CTL);
+		if (!ret && (v & 0xf))
+			ret = -EIO;	/* acknowledged, but not in state 0 */
+	}
+	if (ret)
+		dev_err(g->dev, "Fender: state 0 not reached (perf ctl 0x%08x next 0x%08x ctrl 0x%08x)\n",
+			readl(g->fender + FNDR_PERF_CTL), readl(g->fender + FNDR_PERF_NEXT), readl(g->fender + FNDR_CTRL));
+	return ret;
+}
+
+/*
+ * re/GPU-RECOVERY.md: the core did not stop. As Apple (it panics: "GPC state transition is stuck") and brkosebay's
+ * t7000_stuck(): leave the GPU as it is. The META may still run and DMA into its page tables, image and job memory,
+ * so none of it is freed; ps_gfx keeps its reference (a pending transition left behind crashed the phone, 8.9); no
+ * kick reaches the firmware. Only debugfs "recover" (a new Fender stop) or a reboot ends it.
+ */
+static void g4p_wedge_locked(struct g4p *g, const char *why)
+{
+	if (g->wedged)
+		return;
+	g->wedged = true;
+	g4p_boot_quiesce(g);	/* the boot's alive flag off: every kick path refuses */
+	dev_err(g->dev, "%s: GPU left powered with its memory until debugfs recover or a reboot\n", why);
+}
+
 static void g4p_power_off_locked(struct g4p *g)
 {
-	if (!g->powered)
+	if (!g->powered || g->wedged)
 		return;
-	if (g4p_fender_perf(g, FNDR_PERF_CTL_BUSY | 0))
-		dev_warn(g->dev, "Fender: power-down request not acknowledged\n");
+	if (READ_ONCE(recovery)) {
+		/* the handler reads RGX: off before the core goes, and wait for one that runs */
+		g4p_boot_irq_off(g);
+		if (g4p_fender_stop(g)) {
+			g4p_wedge_locked(g, "power-off");
+			return;
+		}
+	} else {
+		if (g4p_fender_perf(g, FNDR_PERF_CTL_BUSY | 0))
+			dev_warn(g->dev, "Fender: power-down request not acknowledged\n");
+		g4p_boot_irq_off(g);	/* before the power goes: the handler reads RGX */
+	}
 	/* TODO (8.12): turn GFX DVFM off as gpuprobe "off" does; a stuck transition left on crashes the SoC */
-	g4p_boot_irq_off(g);	/* before the power goes: the handler reads RGX */
 	pm_runtime_put_sync(g->dev);
 	g->powered = false;
+	g->off_at = jiffies;
 	g4p_boot_free(g);	/* the GPU is off: its memory can go */
 	dev_info(g->dev, "powered down\n");
 }
@@ -143,6 +212,14 @@ static int g4p_power_on_locked(struct g4p *g)
 
 	if (g->powered)
 		return 0;
+	if (g->wedged)
+		return -EIO;
+	if (g->off_at && READ_ONCE(off_ms)) {	/* brkosebay: the domain stays off a while (gate_off_ms = 10) */
+		unsigned long until = g->off_at + msecs_to_jiffies(min(READ_ONCE(off_ms), 1000U));
+
+		if (time_before(jiffies, until))
+			msleep(jiffies_to_msecs(until - jiffies) + 1);
+	}
 	ret = pm_runtime_resume_and_get(g->dev);	/* ps_gfx: target 0xf, wait for actual (genpd) */
 	if (ret)
 		return ret;
@@ -170,7 +247,11 @@ static int g4p_power_on_locked(struct g4p *g)
 static irqreturn_t g4p_irq(int irq, void *data)
 {
 	struct g4p *g = data;
-	u32 st = readl(g->rgx + 0x0ac8);
+	u32 st;
+
+	if (!READ_ONCE(g->irq_on) || READ_ONCE(g->wedged))
+		return IRQ_NONE;	/* re/GPU-RECOVERY.md: no RGX read outside a running boot */
+	st = readl(g->rgx + 0x0ac8);
 
 	if (!(st & BIT(2)))
 		return IRQ_NONE;
@@ -217,6 +298,9 @@ static int g4p_status_show(struct seq_file *s, void *unused)
 
 	mutex_lock(&g->lock);
 	seq_printf(s, "powered %d experimental %d read_id %d\n", g->powered, experimental, read_id);
+	seq_printf(s, "recovery %d: %u recoveries (last: %s), wedged %d lost %d, boot failures %u, gpu-pll %s\n",
+		   READ_ONCE(recovery), g->recoveries, g->recoveries ? g->last_hang : "none", g->wedged, g->lost,
+		   g->boot_failures, g->gpu_pll ? "gated" : "not described");
 	if (g->misc_acg)
 		seq_printf(s, "pmgr misc-acg 0x%08x\n", readl(g->misc_acg));
 	if (g->powered) {	/* the Fender reads fine while ps_gfx is on (re/GPU-IOS-READS.md) */
@@ -291,6 +375,28 @@ static int g4p_boot_set(void *data, u64 val)
 }
 DEFINE_DEBUGFS_ATTRIBUTE(g4p_boot_fops, NULL, g4p_boot_set, "%llu\n");
 
+/*
+ * RGX access gates (re/GPU-RECOVERY.md). running: a boot's core in a non-zero Fender state with no request pending
+ * (kicks and the job paths, as before). diag: that, and the GPU PLL locked when the "gpu-pll" range is described
+ * (brkosebay: a read with PLL5 unlocked hung the SoC; Apple kicks without that check, so kicks do not take it).
+ */
+bool g4p_rgx_running(struct g4p *g)
+{
+	u32 perf;
+
+	if (!g->powered || g->wedged)
+		return false;
+	perf = readl(g->fender + FNDR_PERF_CTL);
+	return (perf & 0xf) && !(perf & FNDR_PERF_CTL_BUSY);
+}
+
+bool g4p_rgx_diag_ok(struct g4p *g)
+{
+	if (!g4p_rgx_running(g))
+		return false;
+	return !g->gpu_pll || (readl(g->gpu_pll) & PMGR_GPU_PLL_LOCKED);	/* 32-bit PMGR load only */
+}
+
 /* 8.67: the DRM path's idle power-off (only a boot the DRM path started; debugfs boots stay up) */
 void g4p_idle_off_locked(struct g4p *g)
 {
@@ -298,11 +404,34 @@ void g4p_idle_off_locked(struct g4p *g)
 		g4p_power_off_locked(g);
 }
 
-/* 8.65: after a job that did not complete (fault, hang): power off; the next submit boots again */
-void g4p_recover_locked(struct g4p *g)
+/*
+ * 8.65, re/GPU-RECOVERY.md: after a job that did not complete (fault, hang). Callers fail the job and anything
+ * still in flight after this returns (not before: their buffers are in use until the core has stopped).
+ * Order: one gated register snapshot, firmware IRQ off, Fender state 0 (checked; else the GPU is wedged and kept),
+ * ps_gfx off, the boot's memory freed; the next submit boots the firmware again, after off_ms.
+ */
+void g4p_recover_locked(struct g4p *g, const char *why)
 {
-	dev_warn(g->dev, "job did not complete: powering the GPU off for recovery\n");
+	if (g->wedged) {	/* nothing more to stop; jobs are refused */
+		dev_warn_ratelimited(g->dev, "%s: GPU wedged, no recovery\n", why);
+		return;
+	}
+	g->recoveries++;
+	strscpy(g->last_hang, why, sizeof(g->last_hang));
+	if (!READ_ONCE(recovery)) {
+		dev_warn(g->dev, "job did not complete (%s): powering the GPU off for recovery\n", why);
+		g4p_power_off_locked(g);
+		return;
+	}
+	dev_warn(g->dev, "GPU recovery %u (%s)\n", g->recoveries, why);
+	if (g->powered && !g->wedged)
+		g4p_boot_hang_report(g);	/* once, gated; before the core stops */
 	g4p_power_off_locked(g);
+	if (g->wedged)
+		dev_err(g->dev, "GPU recovery %u failed: the GPU is wedged\n", g->recoveries);
+	else
+		dev_info(g->dev, "GPU recovery %u done: GPU off, the next job boots the firmware again\n",
+			 g->recoveries);
 }
 
 /*
@@ -315,6 +444,8 @@ int g4p_ensure_booted_locked(struct g4p *g)
 
 	if (!experimental)
 		return -EPERM;
+	if (g->wedged || g->lost)
+		return -EIO;	/* re/GPU-RECOVERY.md: until debugfs recover */
 	if (g->boot)
 		return g4p_boot_uses_pool(g) ? 0 : -EBUSY;
 	ret = g4p_fw_load_locked(g);
@@ -325,8 +456,53 @@ int g4p_ensure_booted_locked(struct g4p *g)
 	if (!ret)
 		ret = g4p_boot_start(g);
 	g->drm_booted = !ret;
+	if (!ret && READ_ONCE(recovery) && !g4p_boot_fw_alive(g)) {
+		/* no alive event (Apple panics here): stop it now instead of at the idle power-off */
+		g->boot_failures++;
+		dev_err(g->dev, "firmware boot without an alive event (%u in a row)\n", g->boot_failures);
+		g4p_power_off_locked(g);
+		if (!g->wedged && g->boot_failures >= READ_ONCE(max_boot_failures)) {
+			g->lost = true;
+			dev_err(g->dev, "GPU given up after %u failed boots (debugfs recover to retry)\n",
+				g->boot_failures);
+		}
+		return -EIO;
+	}
+	if (!ret)
+		g->boot_failures = 0;
 	return ret;
 }
+
+/*
+ * re/GPU-RECOVERY.md: echo 1 > recover. Wedged: try the Fender stop again; if the core stops now, power off and
+ * free as usual. Lost: allow boots again. Otherwise: run a recovery now (a test of the path; jobs in flight are
+ * cancelled).
+ */
+static int g4p_recover_set(void *data, u64 val)
+{
+	struct g4p *g = data;
+
+	if (val != 1)
+		return -EINVAL;
+	mutex_lock(&g->lock);
+	if (g->wedged) {
+		if (g4p_fender_stop(g)) {
+			mutex_unlock(&g->lock);
+			return -EIO;
+		}
+		dev_warn(g->dev, "recover: the core stopped now; powering off\n");
+		g->wedged = false;
+		g4p_power_off_locked(g);
+		g4p_drm_cancel_inflight(g, -ECANCELED);
+	} else if (g->powered) {
+		g4p_recover_locked(g, "debugfs recover");
+	}
+	g->lost = false;
+	g->boot_failures = 0;
+	mutex_unlock(&g->lock);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(g4p_recover_fops, NULL, g4p_recover_set, "%llu\n");
 
 /* M5: echo 9 > devctl queues a device-control no-op (types 9..11 only) and waits for the firmware */
 static int g4p_devctl_set(void *data, u64 val)
@@ -429,6 +605,33 @@ static void __iomem *g4p_map(struct platform_device *pdev, const char *name)
 	return devm_platform_ioremap_resource_byname(pdev, name);
 }
 
+/*
+ * Project safety rules (re/GPU-RECOVERY.md): never read 0x20e01c300 or the fuse registers, never set "prep"
+ * (0x20e023000 [11:8], ps_debug). None of them may be inside a range this driver maps. PMGR registers are only
+ * read with 32-bit loads (readl) here.
+ */
+static const struct { phys_addr_t start, size; const char *what; } g4p_forbidden[] = {
+	{ 0x20e01c300, 0x4, "PMGR 0x20e01c300" },
+	{ 0x20e02a000, 0x1000, "the fuse registers" },
+	{ 0x20e023000, 0x4, "the prep / ps_debug register" },
+};
+
+static int g4p_check_ranges(struct platform_device *pdev)
+{
+	for (unsigned int i = 0; i < pdev->num_resources; i++) {
+		const struct resource *r = &pdev->resource[i];
+
+		if (resource_type(r) != IORESOURCE_MEM)
+			continue;
+		for (unsigned int k = 0; k < ARRAY_SIZE(g4p_forbidden); k++)
+			if (r->start < g4p_forbidden[k].start + g4p_forbidden[k].size &&
+			    g4p_forbidden[k].start <= r->end)
+				return dev_err_probe(&pdev->dev, -EINVAL, "range %pR covers %s: refused\n", r,
+						     g4p_forbidden[k].what);
+	}
+	return 0;
+}
+
 static int g4p_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -436,6 +639,9 @@ static int g4p_probe(struct platform_device *pdev)
 	struct g4p *g;
 	int ret;
 
+	ret = g4p_check_ranges(pdev);
+	if (ret)
+		return ret;
 	g = g4p_drm_alloc(dev);
 	if (IS_ERR(g))
 		return PTR_ERR(g);
@@ -453,6 +659,15 @@ static int g4p_probe(struct platform_device *pdev)
 	if (res) {
 		g->misc_acg = devm_ioremap(dev, res->start, resource_size(res));
 		if (!g->misc_acg)
+			return -ENOMEM;
+	}
+	/* optional (re/GPU-RECOVERY.md): PMGR PLL5 control, 0x20e005004, one word; gates diagnostic RGX reads */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpu-pll");
+	if (res) {
+		if (resource_size(res) != 4)
+			return dev_err_probe(dev, -EINVAL, "gpu-pll range must be one word\n");
+		g->gpu_pll = devm_ioremap(dev, res->start, 4);
+		if (!g->gpu_pll)
 			return -ENOMEM;
 	}
 
@@ -498,6 +713,7 @@ static int g4p_probe(struct platform_device *pdev)
 	debugfs_create_file("c8mem", 0400, g->debugfs, g, &g4p_c8mem_fops);
 	debugfs_create_file("gfx", 0200, g->debugfs, g, &g4p_gfx_fops);
 	debugfs_create_file("gfxout", 0400, g->debugfs, g, &g4p_gfxout_fops);
+	debugfs_create_file("recover", 0200, g->debugfs, g, &g4p_recover_fops);
 	ret = g4p_drm_register(g);
 	if (ret)
 		dev_warn(dev, "DRM device not registered: %d\n", ret);
@@ -513,6 +729,8 @@ static void g4p_remove(struct platform_device *pdev)
 	debugfs_remove_recursive(g->debugfs);
 	mutex_lock(&g->lock);
 	g4p_power_off_locked(g);
+	if (g->wedged)	/* its memory stays (the core may still use it): leaked until a reboot */
+		dev_err(g->dev, "unbound with the GPU wedged: its memory is left allocated\n");
 	g4p_drm_pool_free(g);
 	vfree(g->fw_image);
 	g4p_fw_release(&g->fw);

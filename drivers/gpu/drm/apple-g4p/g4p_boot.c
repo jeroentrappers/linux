@@ -359,8 +359,8 @@ unsigned int g4p_boot_vm_slot(struct g4p *g, unsigned int ctx)
 void g4p_boot_irq_off(struct g4p *g)
 {
 	if (g->irq_on) {
-		disable_irq(g->irq);
-		g->irq_on = false;
+		disable_irq(g->irq);	/* waits for a handler that runs */
+		WRITE_ONCE(g->irq_on, false);
 	}
 }
 
@@ -443,8 +443,8 @@ int g4p_boot_start(struct g4p *g)
 	wmb();	/* tables and image in memory before the GPU can fetch them */
 	if (g->irq >= 0 && !g->irq_on) {
 		atomic_set(&g->irq_count, 0);
+		WRITE_ONCE(g->irq_on, true);	/* before the enable: the handler checks it */
 		enable_irq(g->irq);
-		g->irq_on = true;
 	}
 
 	dev_info(g->dev, "META boot: image %pad (0x%zx), PC %pad, %u boot args\n", &b->image.dma, b->image.size,
@@ -641,7 +641,7 @@ int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, 
 	u32 rq = (thr << 12) | (reg << 4) | unit | 0x10000, v;
 	int ret;
 
-	if (!g->boot || !g->powered || !g4p_gpu_running(g))
+	if (!g->boot || !g->powered || !g4p_rgx_diag_ok(g))
 		return -ENODEV;
 	ret = g4p_meta_write(g, 0x0480fff8, rq);
 	for (unsigned int i = 0; !ret && i < 1000; i++) {
@@ -656,7 +656,7 @@ int g4p_boot_meta_core_read(struct g4p *g, unsigned int thr, unsigned int unit, 
 /* 8.90: RGX registers for C9 diagnostics: 64-bit reads, only while the GPU runs, offsets < 0x10000, 8-aligned */
 int g4p_boot_rgx_read(struct g4p *g, u32 off, u64 *val)
 {
-	if (!g->boot || !g->powered || !g4p_gpu_running(g) || off >= 0x10000 || (off & 7))
+	if (!g->boot || !g->powered || !g4p_rgx_diag_ok(g) || off >= 0x10000 || (off & 7))
 		return -ENODEV;
 	*val = readq(g->rgx + off);
 	return 0;
@@ -859,9 +859,7 @@ void g4p_boot_pool_unmap(struct g4p *g, unsigned int ctx, unsigned int first, un
  */
 static bool g4p_gpu_running(struct g4p *g)
 {
-	u32 perf = readl(g->fender + 0x1000);
-
-	return (perf & 0xf) && !(perf & BIT(4));
+	return g4p_rgx_running(g);	/* Fender state != 0, no request pending, not wedged (g4p_drv.c) */
 }
 
 /* channel state + channel ring as AGXChannel::init / resetChannelState; no submission */
@@ -1581,7 +1579,7 @@ int g4p_boot_cl_job(struct g4p *g, unsigned int which)
 		dev_info(g->dev, "C%u: word at GPU VA 0x%llx = 0x%08x (kernel stores 0x%x)\n", which,
 			 (u64)b->pds.gpuva + G4P_C5_OUT, READ_ONCE(*(u32 *)(b->pds.cpu + G4P_C5_OUT)), G4P_C5_VALUE);
 	j->irqs = atomic_read(&g->irq_count) - j->irq0;
-	if (g4p_gpu_running(g)) {
+	if (g4p_rgx_diag_ok(g)) {
 		j->fault[0] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
 		j->fault[1] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ);
 		j->fault[2] = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
@@ -1673,7 +1671,7 @@ void g4p_boot_stall_dbg(struct g4p *g)
 {
 	struct g4p_boot *b = g->boot;
 
-	if (!b || !g->powered || !g4p_gpu_running(g))
+	if (!b || !g->powered || !g4p_rgx_diag_ok(g))
 		return;
 	dev_warn(g->dev, "stall: %u events drained; BIF fault 0x%llx/0x%llx 0x%llx/0x%llx; ring 2 read %u; channel ctl +0x00 %u +0x10 %u +0x40 %u\n",
 		 b->events_seen,
@@ -1691,7 +1689,7 @@ int g4p_boot_mmu_fault(struct g4p *g)
 {
 	u64 v;
 
-	if (!g->boot || !g->powered || !g4p_gpu_running(g))
+	if (!g->boot || !g->powered || !g4p_rgx_diag_ok(g))
 		return 0;
 	v = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
 	if (!(v & 1))
@@ -1700,6 +1698,52 @@ int g4p_boot_mmu_fault(struct g4p *g)
 		return 0;
 	v = (v >> 12) & 0xf;	/* the hardware slot: its address space (8.84) */
 	return 1 + (v && v < G4P_NR_CTX ? g->boot->slot_vm[v] : 0);
+}
+
+/* re/GPU-RECOVERY.md: did the running boot post its alive event? (memory only) */
+bool g4p_boot_fw_alive(struct g4p *g)
+{
+	return g->boot && g->boot->alive;
+}
+
+/* re/GPU-RECOVERY.md: a wedged GPU takes no more commands: every kick path checks the boot's alive flag */
+void g4p_boot_quiesce(struct g4p *g)
+{
+	if (g->boot)
+		g->boot->alive = false;
+}
+
+/*
+ * re/GPU-RECOVERY.md: one register snapshot at a hang or fault, before the recovery stops the core. Memory first
+ * (stamps, ring indices, events), then EVENT_STATUS once and, only with its MMU page-fault bit (9) set or a fault
+ * latched in bank 0, the two BIF fault banks once each: brkosebay found single reads after an event or at a timeout
+ * safe and a tight poll of these registers during a job freezing the SoC. Gated (g4p_rgx_diag_ok).
+ */
+void g4p_boot_hang_report(struct g4p *g)
+{
+	struct g4p_boot *b = g->boot;
+	u64 ev, m0, r0, m1 = 0, r1 = 0;
+
+	if (!b)
+		return;
+	dev_warn(g->dev, "hang: %u jobs kicked, %u events drained, ring 2 read %u, devctl read %u; Fender perf 0x%08x next 0x%08x ctrl 0x%08x int 0x%08x\n",
+		 b->job_n, b->events_seen, g4p_fwinit_ring_read_index(&b->fi, 2), g4p_fwinit_ring_read_index(&b->fi, 3),
+		 readl(g->fender + FNDR_PERF_CTL), readl(g->fender + FNDR_PERF_NEXT), readl(g->fender + FNDR_CTRL),
+		 readl(g->fender + 0x14));
+	if (!g4p_rgx_diag_ok(g)) {
+		dev_warn(g->dev, "hang: core not in a running state: registers not read\n");
+		return;
+	}
+	ev = readq(g->rgx + RGX_CR_EVENT_STATUS);
+	m0 = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_MMU);
+	r0 = readq(g->rgx + RGX_CR_BIF_FAULT_BANK0_REQ);
+	if ((ev & BIT(9)) || (m0 & 1)) {
+		m1 = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_MMU);
+		r1 = readq(g->rgx + RGX_CR_BIF_FAULT_BANK1_REQ);
+	}
+	dev_warn(g->dev, "hang: EVENT_STATUS 0x%llx%s; BIF bank0 %016llx / %016llx (%s slot %llu, %s VA 0x%llx) bank1 %016llx / %016llx\n",
+		 ev, ev & BIT(9) ? " (MMU page fault)" : "", m0, r0, m0 & 1 ? "fault" : "no fault", (m0 >> 12) & 0xf,
+		 r0 & BIT_ULL(50) ? "read" : "write", r0 & GENMASK_ULL(39, 4), m1, r1);
 }
 
 /* diagnostics for a stuck fence entry: slot state of job n */

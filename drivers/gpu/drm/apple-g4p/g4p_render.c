@@ -441,18 +441,20 @@ int g4p_render_submit(struct g4p *g, unsigned int ctx, const void *ta, const voi
 		 install ? ", PB installed" : "", READ_ONCE(st[0]), READ_ONCE(st[1]), us);
 	if (*status) {	/* where the firmware is, and how far it read the channel rings */
 		u32 v[4] = { 0 };
+		int fault;
 
 		for (unsigned int t = 0; t < 2; t++) {
 			g4p_boot_meta_core_read(g, t, 5, 0, &v[2 * t]);
 			g4p_boot_meta_core_read(g, t, 5, 1, &v[2 * t + 1]);
 		}
+		fault = g4p_boot_mmu_fault(g);	/* once (re/GPU-RECOVERY.md: single gated reads only) */
 		dev_info(g->dev, "render: META T0 PC %08x PCX %08x, T1 PC %08x PCX %08x; TA ring %u %u %u %u / %u, 3D ring %u %u %u %u / %u; MMU fault ctx %d\n",
 			 v[0], v[1], v[2], v[3], READ_ONCE(*(u32 *)r->ring[0].cpu), READ_ONCE(*(u32 *)(r->ring[0].cpu + 0x10)),
 			 READ_ONCE(*(u32 *)(r->ring[0].cpu + 0x20)), READ_ONCE(*(u32 *)(r->ring[0].cpu + 0x30)), r->wr[0],
 			 READ_ONCE(*(u32 *)r->ring[1].cpu), READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x10)),
 			 READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x20)), READ_ONCE(*(u32 *)(r->ring[1].cpu + 0x30)), r->wr[1],
-			 g4p_boot_mmu_fault(g));
-		if (g4p_boot_mmu_fault(g))	/* 9.53: where (bank MMU status / request: the faulting address) */
+			 fault);
+		if (fault && g4p_rgx_diag_ok(g))	/* 9.53: where (bank MMU status / request: the faulting address) */
 			dev_info(g->dev, "render: BIF fault bank0 %016llx / %016llx bank1 %016llx / %016llx\n",
 				 readq(g->rgx + 0x12b0), readq(g->rgx + 0x12b8), readq(g->rgx + 0x12c0), readq(g->rgx + 0x12c8));
 	}
